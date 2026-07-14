@@ -229,18 +229,32 @@ class ModelPredictiveController:
         """
         self.time_offset = current_time_s - time.perf_counter()
 
-    def compute_one_horizon_action(self, obs_task, device):
-        # sample the data per down_sample_steps and horizon
+    def sample_sparse_obs(self, obs_task):
+        """Downsample observation buffers to sparse MPC/policy horizons."""
         obs_sampled = {}
         for key, attr in self.shape_meta["sample"]["obs"]["sparse"].items():
             data = obs_task[key]
             horizon = attr["horizon"]
             down_sample_steps = attr["down_sample_steps"]
-            # sample 'horizon' number of latest obs from the queue
             assert len(data) >= (horizon - 1) * down_sample_steps + 1
             obs_sampled[key] = data[
                 -(horizon - 1) * down_sample_steps - 1 :: down_sample_steps
             ]
+        return obs_sampled
+
+    def preprocess_policy_obs(self, obs_sampled, ignore_rgb=False):
+        """Convert sparse obs buffers into policy-network tensors."""
+        obs_policy, se3_w_base = umift_task.sparse_obs_to_obs_sample(
+            obs_sparse=obs_sampled,
+            shape_meta=self.shape_meta,
+            reshape_mode="reshape",
+            id_list=self.id_list,
+            ignore_rgb=ignore_rgb,
+        )
+        return obs_policy, se3_w_base
+
+    def compute_one_horizon_action(self, obs_task, device):
+        obs_sampled = self.sample_sparse_obs(obs_task)
 
         # # report latency
         # time_now = time.perf_counter() + self.time_offset
@@ -255,13 +269,10 @@ class ModelPredictiveController:
         with torch.no_grad():
             s = time.time()
             obs_sample_np = {}
-            obs_sample_np["sparse"], SE3_WBase = umift_task.sparse_obs_to_obs_sample(
-                obs_sparse=obs_sampled,
-                shape_meta=self.shape_meta,
-                reshape_mode="reshape",
-                id_list=self.id_list,
-                ignore_rgb=False,
+            obs_policy, SE3_WBase = self.preprocess_policy_obs(
+                obs_sampled, ignore_rgb=False
             )
+            obs_sample_np["sparse"] = obs_policy
             self.SE3_WBase = SE3_WBase
             # add batch dimension
             obs_sample_np = dict_apply(

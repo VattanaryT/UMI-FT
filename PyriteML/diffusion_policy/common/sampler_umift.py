@@ -254,6 +254,19 @@ class SequenceSamplerUmiFT:
                     replay_buffer["data"][episode]["obs"][f"robot_time_stamps_{id}"][-1]
                 )
 
+                ## II.2.1 wrench (optional)
+                if (
+                    f"robot{id}_eef_wrench_left"
+                    in shape_meta["sample"]["obs"]["sparse"]
+                ):
+                    wrench_end_time = np.squeeze(
+                        replay_buffer["data"][episode]["obs"][
+                            f"wrench_time_stamps_{id}"
+                        ][-1]
+                    )
+                else:
+                    wrench_end_time = np.inf
+
                 ## II.3 find min
                 if not action_padding:
                     # if no action padding, truncate the indices to query so the last query point
@@ -261,17 +274,20 @@ class SequenceSamplerUmiFT:
                     #  This is enforced by limiting sparse action queries alone.
                     #  It is assumed that the dense action is not affected.
                     end_time = (
-                        min(end_time, rgb_end_time, robot_end_time) - buffer_time_ms
+                        min(end_time, rgb_end_time, robot_end_time, wrench_end_time)
+                        - buffer_time_ms
                     )
                 else:
-                    end_time = min(end_time, rgb_end_time, robot_end_time)
+                    end_time = min(
+                        end_time, rgb_end_time, robot_end_time, wrench_end_time
+                    )
                 assert end_time > 0
                 if end_time < start_time:
                     print(
                         f"[SequenceSamplerUmiFT] Warning: end_time {end_time} is before start_time {start_time} for episode {episode}. Skipping this episode."
                     )
                     print(
-                        f"rgb_end_time: {rgb_end_time}, robot_end_time: {robot_end_time}, buffer_time_ms: {buffer_time_ms}"
+                        f"rgb_end_time: {rgb_end_time}, robot_end_time: {robot_end_time}, wrench_end_time: {wrench_end_time}, buffer_time_ms: {buffer_time_ms}"
                     )
                     print(
                         f"rgb_start_time: {rgb_start_time}, robot_start_time: {robot_start_time}, start_time: {start_time}"

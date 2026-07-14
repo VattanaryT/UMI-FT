@@ -118,8 +118,7 @@ class ManipServerEnv:
         pass
 
     def cleanup(self):
-        pass
-        # self.server.join_threads()
+        self.server.join_threads()
 
     def set_high_level_maintain_position(self):
         self.server.set_high_level_maintain_position()
@@ -151,7 +150,7 @@ class ManipServerEnv:
             self.server.schedule_waypoints(
                 pose7_cmd[id * 7 : (id + 1) * 7, :], timestamps, id
             )
-            if eoat_cmd is not None:
+            if eoat_cmd is not None and self.server.has_eoat():
                 self.server.schedule_eoat_waypoints(
                     eoat_cmd[id * 2 : (id + 1) * 2, :], timestamps, id
                 )

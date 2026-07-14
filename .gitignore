@@ -1,6 +1,7 @@
 # ignore data and output directories
 data/
 output/
+plots/
 submodules/umi_day*
 
 __pycache__

@@ -17,28 +17,53 @@ from tqdm import tqdm
 from PyriteUtility.planning_control import compliance_helpers as ch
 from PyriteUtility.plotting.matplotlib_helpers import set_axes_equal
 from PyriteUtility.spatial_math import spatial_utilities as su
+from PyriteUtility.data_pipeline.wrench_baseline_utils import (
+    check_virtual_target_push_direction,
+    subtract_wrench_baseline,
+    time_based_moving_average,
+)
 
 if "PYRITE_DATASET_FOLDERS" not in os.environ:
     raise ValueError("Please set the environment variable PYRITE_DATASET_FOLDERS")
 dataset_folder_path = os.environ.get("PYRITE_DATASET_FOLDERS")
 
 # Config for umift (single robot)
-dataset_path = "/store/real/hjchoi92/data/real_processed/umift/zucchini-wild-test-for-coderelease/acp_replay_buffer_gripper.zarr"  # IMPORTANT: Make sure to change the mute flags too! -HC
+dataset_path = os.environ.get(
+    "UMIFT_DATASET_PATH",
+    "/home/boeing/umi_ft_ws/straight_convex_data/acp_replay_buffer.zarr",
+)
 id_list = [0]
 
-wrench_moving_average_window_size = 200  # should be around 1s of data
+wrench_moving_average_window_duration_s = 1.0  # target temporal window (seconds)
+
+# Baseline removal: "first_n" for demos starting in free space; "session_tare" for contact-at-start
+baseline_mode = "first_n"  # "first_n" | "session_tare"
+baseline_duration_s = 0.3
+session_offset_path = None  # required when baseline_mode == "session_tare"
+# Set False (or UMIFT_SUBTRACT_WRENCH_BASELINE=0) to keep collection-time tare only
+flag_subtract_wrench_baseline = os.environ.get(
+    "UMIFT_SUBTRACT_WRENCH_BASELINE", "1"
+).lower() not in ("0", "false", "no", "off")
+
+# FT300-S sign: 1.0 = native sensor sign; set -1.0 only if validation shows inverted push direction
+wrench_sign_multiplier = 1.0
 
 # ‘r’ means read only (must exist); ‘r+’ means read/write (must exist); ‘a’ means read/write (create if doesn’t exist); ‘w’ means create (overwrite if exists); ‘w-’ means create (fail if exists).
 buffer = zarr.open(dataset_path, mode="r+")
 
+print(
+    "wrench baseline subtraction:",
+    "enabled" if flag_subtract_wrench_baseline else "disabled",
+)
 
-num_of_process = 1  # 5
+
+num_of_process = 3  # 5
 flag_plot = False
 fin_every_n = 25  # 50
 
 depth_clip = 0.5
 
-apply_mask = True
+apply_mask = False
 clip_depth = True
 convert_BGR_to_RGB = False
 flag_mute_gripper = False
@@ -78,7 +103,7 @@ stiffness_estimation_para = {
     "vel_tol": 999.002,  # vel larger than this will trigger stiffness adjustment
 }
 
-flag_real = False
+flag_real = True
 if "real" in dataset_path:
     flag_real = True
     print("flag_real set!")
@@ -88,6 +113,44 @@ if flag_plot:
 
 
 def process_episode(ep, ep_data, id_list):
+    def _write_corrected_wrench_to_episode(
+        ep_data,
+        robot_id,
+        wrench_corrected,
+        wrench_left_original,
+        wrench_right_original,
+    ):
+        """
+        Persist corrected wrench into episode keys used by policy observations.
+
+        The baseline/sign correction is computed on the summed wrench. For the
+        common single-FT setup (right wrench is zero), write the corrected sum to
+        left directly. If both sides are non-zero, split the correction delta
+        evenly to preserve left+right consistency without changing total wrench.
+        """
+        wrench_original_sum = wrench_left_original + wrench_right_original
+        correction_delta = wrench_corrected - wrench_original_sum
+
+        if np.allclose(wrench_right_original, 0.0):
+            wrench_left_corrected = wrench_corrected
+            wrench_right_corrected = wrench_right_original
+        else:
+            wrench_left_corrected = wrench_left_original + 0.5 * correction_delta
+            wrench_right_corrected = wrench_right_original + 0.5 * correction_delta
+
+        wrench_concat_corrected = np.hstack((wrench_left_corrected, wrench_right_corrected))
+
+        ep_data[f"wrench_left_{robot_id}"] = wrench_left_corrected
+        ep_data[f"wrench_right_{robot_id}"] = wrench_right_corrected
+        ep_data[f"wrench_concat_{robot_id}"] = wrench_concat_corrected
+
+        if f"wrench_left_coinft_{robot_id}" in ep_data:
+            ep_data[f"wrench_left_coinft_{robot_id}"] = wrench_left_corrected
+        if f"wrench_right_coinft_{robot_id}" in ep_data:
+            ep_data[f"wrench_right_coinft_{robot_id}"] = wrench_right_corrected
+        if f"wrench_concat_coinft_{robot_id}" in ep_data:
+            ep_data[f"wrench_concat_coinft_{robot_id}"] = wrench_concat_corrected
+
     for key in ep_data.keys():
         print(key)
 
@@ -173,26 +236,39 @@ def process_episode(ep, ep_data, id_list):
         # rgb_time_stamps = ep_data[f"rgb_time_stamps_{id}"]
         wrench_moving_average = np.zeros_like(wrench)
 
-        # remove wrench measurement offset
-        Noffset = 200
-        wrench_offset = np.mean(wrench[:Noffset], axis=0)
-        print("wrench offset: ", wrench_offset)
+        if flag_subtract_wrench_baseline:
+            wrench, wrench_offset = subtract_wrench_baseline(
+                wrench,
+                wrench_time_stamps,
+                baseline_mode=baseline_mode,
+                baseline_duration_s=baseline_duration_s,
+                session_offset_path=session_offset_path,
+            )
+            print("wrench baseline (subtracted): ", wrench_offset)
+        else:
+            wrench_offset = np.zeros(6, dtype=np.float64)
+            print("wrench baseline subtraction disabled; using collection-time tare only")
 
-        # # FT300 only: flip the sign of the wrench
-        # for i in range(6):
-        #     wrench[:, i] = -wrench[:, i]
+        if wrench_sign_multiplier != 1.0:
+            wrench = wrench * wrench_sign_multiplier
 
-        # filter wrench using moving average
-        N = wrench_moving_average_window_size
-        print("Computing moving average")
-        # fmt: off
-        wrench_moving_average[:, 0] = np.convolve(wrench[:, 0], np.ones(N) / N, mode="same")
-        wrench_moving_average[:, 1] = np.convolve(wrench[:, 1], np.ones(N) / N, mode="same")
-        wrench_moving_average[:, 2] = np.convolve(wrench[:, 2], np.ones(N) / N, mode="same")
-        wrench_moving_average[:, 3] = np.convolve(wrench[:, 3], np.ones(N) / N, mode="same")
-        wrench_moving_average[:, 4] = np.convolve(wrench[:, 4], np.ones(N) / N, mode="same")
-        wrench_moving_average[:, 5] = np.convolve(wrench[:, 5], np.ones(N) / N, mode="same")
-        # fmt: on
+        _write_corrected_wrench_to_episode(
+            ep_data=ep_data,
+            robot_id=id,
+            wrench_corrected=wrench,
+            wrench_left_original=wrench_left,
+            wrench_right_original=wrench_right,
+        )
+        print("wrench data overwritten with corrected baseline/sign values")
+
+        print(
+            f"Computing moving average (window={wrench_moving_average_window_duration_s}s)"
+        )
+        wrench_moving_average = time_based_moving_average(
+            wrench,
+            wrench_time_stamps,
+            window_duration_s=wrench_moving_average_window_duration_s,
+        )
 
         if not flag_real:  # for simulation data
             _ft_sensor_pose_fb = ep_data["ft_sensor_pose_fb"]
@@ -245,6 +321,11 @@ def process_episode(ep, ep_data, id_list):
         ep_data[f"ts_pose_virtual_target_{id}"] = ts_pose_virtual_target
         ep_data[f"stiffness_{id}"] = stiffness
         ep_data[f"wrench_time_stamps_{id}"] = wrench_time_stamps
+
+        push_check = check_virtual_target_push_direction(
+            ts_pose_fb, ts_pose_virtual_target, wrench_T
+        )
+        print(f"Virtual target push-direction check: {push_check}")
 
         if f"ts_pose_command_{id}" not in ep_data:
             ep_data[f"ts_pose_command_{id}"] = ts_pose_fb

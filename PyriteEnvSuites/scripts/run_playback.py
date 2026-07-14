@@ -1,8 +1,10 @@
 import os
 import time
 
+import matplotlib.cm as cm
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 import PyriteUtility.spatial_math.spatial_utilities as su
 import zarr
 from einops import rearrange
@@ -23,7 +25,159 @@ if "PYRITE_DATASET_FOLDERS" not in os.environ:
 
 ### PLOTTING FUNCTIONS ###
 # TODO (Chuer): reorg them in PyriteUtility
-def plot_camera_frame(ax, pose, axis_length=0.01):
+def flatten_timestamps(timestamps):
+    """Return a 1D float array from zarr timestamps (often shape N or Nx1)."""
+    return np.asarray(timestamps, dtype=float).reshape(-1)
+
+
+def plot_trajectory(ax, pose_SE3_WT, **plot_kwargs):
+    """Plot EE path as a single 3D line through waypoint positions."""
+    positions = pose_SE3_WT[:, :3, 3]
+    ax.plot(
+        positions[:, 0],
+        positions[:, 1],
+        positions[:, 2],
+        **plot_kwargs,
+    )
+
+
+def plot_trajectory_colored(
+    ax,
+    pose_SE3_WT,
+    end_idx,
+    timestamps=None,
+    cmap_name="viridis",
+    linewidth=2,
+    alpha=1.0,
+):
+    """Plot trajectory segments color-coded by time, visible up to end_idx."""
+    positions = pose_SE3_WT[:end_idx, :3, 3]
+    if len(positions) < 2:
+        return None
+
+    segments = np.stack([positions[:-1], positions[1:]], axis=1)
+    if timestamps is not None:
+        t = flatten_timestamps(timestamps)[:end_idx]
+        t_vals = 0.5 * (t[:-1] + t[1:])
+        t_norm = plt.Normalize(t[0], t[-1])
+    else:
+        t_vals = np.arange(len(segments))
+        t_norm = plt.Normalize(0, len(pose_SE3_WT) - 1)
+
+    colors = cm.get_cmap(cmap_name)(t_norm(t_vals))
+    colors[:, 3] = alpha
+    lc = Line3DCollection(segments, colors=colors, linewidths=linewidth)
+    ax.add_collection3d(lc)
+    return t_norm
+
+
+def plot_camera_frames_sparse(
+    ax, pose_SE3_WT, end_idx, step=25, axis_length=0.015, linewidth=1.5
+):
+    """Draw RGB axis triads at a fixed stride within the visible prefix."""
+    if end_idx <= 0:
+        return
+    frame_indices = list(range(0, end_idx, step))
+    if frame_indices[-1] != end_idx - 1:
+        frame_indices.append(end_idx - 1)
+    for idx in frame_indices:
+        plot_camera_frame(
+            ax, pose_SE3_WT[idx], axis_length=axis_length, linewidth=linewidth
+        )
+
+
+def show_interactive_trajectory(
+    pose_SE3_WT,
+    timestamps=None,
+    title="Playback EE Trajectory",
+    axis_frame_step=25,
+    initial_fraction=0.02,
+    reveal_fraction_step=0.02,
+):
+    """
+    Interactive 3D trajectory viewer.
+
+    Right/left arrow keys reveal or hide the trajectory over time.
+    """
+    n_points = len(pose_SE3_WT)
+    reveal_end_idx = max(2, int(n_points * initial_fraction))
+    reveal_step = max(1, int(n_points * reveal_fraction_step))
+
+    if timestamps is not None:
+        timestamps = flatten_timestamps(timestamps)
+
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    colorbar = None
+
+    if timestamps is not None:
+        t_norm = plt.Normalize(timestamps[0], timestamps[-1])
+        colorbar_label = "Time (s)"
+    else:
+        t_norm = plt.Normalize(0, n_points - 1)
+        colorbar_label = "Waypoint index"
+
+    def format_title():
+        if timestamps is not None and reveal_end_idx > 0:
+            t_end = timestamps[min(reveal_end_idx - 1, n_points - 1)]
+            t_start = timestamps[0]
+            progress = f"t={t_end - t_start:.2f}s / {timestamps[-1] - timestamps[0]:.2f}s"
+        else:
+            progress = f"{reveal_end_idx}/{n_points} waypoints"
+        return (
+            f"{title}\n{progress} "
+            "(→ reveal, ← hide, close window or Enter in terminal to continue)"
+        )
+
+    def redraw():
+        nonlocal colorbar
+        ax.cla()
+        ax.set_xlabel("X")
+        ax.set_ylabel("Y")
+        ax.set_zlabel("Z")
+        ax.set_title(format_title())
+
+        plot_trajectory_colored(
+            ax,
+            pose_SE3_WT,
+            reveal_end_idx,
+            timestamps=timestamps,
+            linewidth=2,
+        )
+        plot_camera_frames_sparse(
+            ax,
+            pose_SE3_WT,
+            reveal_end_idx,
+            step=axis_frame_step,
+            axis_length=0.015,
+        )
+        set_axes_equal(ax)
+
+        if colorbar is None:
+            sm = cm.ScalarMappable(cmap="viridis", norm=t_norm)
+            sm.set_array([])
+            colorbar = fig.colorbar(sm, ax=ax, shrink=0.6, pad=0.1)
+            colorbar.set_label(colorbar_label)
+        fig.canvas.draw_idle()
+
+    def on_key(event):
+        nonlocal reveal_end_idx
+        if event.key == "right":
+            reveal_end_idx = min(n_points, reveal_end_idx + reveal_step)
+        elif event.key == "left":
+            reveal_end_idx = max(2, reveal_end_idx - reveal_step)
+        else:
+            return
+        redraw()
+
+    redraw()
+    fig.canvas.mpl_connect("key_press_event", on_key)
+    plt.show(block=False)
+    input("Press Enter to continue...")
+    plt.close(fig)
+
+
+def plot_camera_frame(ax, pose, axis_length=0.01, linewidth=2):
     # Extract translation
     translation = pose[0:3, 3]
 
@@ -46,7 +200,7 @@ def plot_camera_frame(ax, pose, axis_length=0.01):
             [translation[1], end_point[1]],
             [translation[2], end_point[2]],
             color=color,
-            linewidth=2,
+            linewidth=linewidth,
         )
 
 
@@ -100,7 +254,7 @@ def plot_images(img_A, img_B, opacity_A=0.6):
 dataset_folder_path = os.environ.get("PYRITE_DATASET_FOLDERS")
 # (CHUER): TBCHANGED
 dataset_path = (
-    dataset_folder_path + "/umift/WBW_250217_batch0/acp_replay_buffer_gripper.zarr"
+    dataset_folder_path + "/straight_convex_data_v2/acp_replay_buffer.zarr"
 )
 id_list = [0]
 print("dataset_path:", dataset_path)
@@ -114,7 +268,7 @@ if "PYRITE_HARDWARE_CONFIG_FOLDERS" not in os.environ:
 config_folders = os.environ.get("PYRITE_HARDWARE_CONFIG_FOLDERS")
 
 reset_all_elgato_devices()
-hardware_config_path = config_folders + "/right_arm_coinft.yaml"
+hardware_config_path = config_folders + "/ur5e_wrist_ft.yaml"
 
 Tr = np.eye(6)
 n_af = 0
@@ -150,12 +304,12 @@ ep = "episode_0"
 data = buffer["data"][ep]
 
 # get initial rgb frame and align it with initial frame of data episode being played back
-query_size_sparse_rgb = 11
-obs_rgb_raw = server.get_camera_rgb(query_size_sparse_rgb, 0)
-obs_rgb_reshape = rearrange(
-    obs_rgb_raw, "(c h) (n w)->n h w c", c=3, n=query_size_sparse_rgb
-)
-plot_images(img_A=obs_rgb_reshape[0:1], img_B=data["rgb_0"][0:1])
+# query_size_sparse_rgb = 11
+# obs_rgb_raw = server.get_camera_rgb(query_size_sparse_rgb, 0)
+# obs_rgb_reshape = rearrange(
+#     obs_rgb_raw, "(c h) (n w)->n h w c", c=3, n=query_size_sparse_rgb
+# )
+# plot_images(img_A=obs_rgb_reshape[0:1], img_B=data["rgb_0"][0:1])
 input("Press ENTER to continue ... ")
 
 for key in data.keys():
@@ -192,23 +346,16 @@ print("[Main] Finished reading data. Now playing back...")
 
 # PLOTTING poses to play back
 plt.ion()
-fig = plt.figure()
-ax = plt.axes(projection="3d")
-x = np.linspace(-0.02, 0.2, 20)
-y = np.linspace(-0.1, 0.1, 20)
-z = np.linspace(-0.1, 0.1, 20)
-ax.set_title("Playback EE Trajectory")
-ax.set_xlabel("X")
-ax.set_ylabel("Y")
-ax.set_zlabel("Z")
-plt.show()
-
-for pose in pose_SE3_WT:
-    plot_camera_frame(ax, pose)
-
-plt.show()
-input("Press Enter to continue...")
-plt.close()
+robot_timestamps = flatten_timestamps(data["robot_time_stamps_0"])
+axis_frame_step = max(1, N // 30)
+show_interactive_trajectory(
+    pose_SE3_WT,
+    timestamps=robot_timestamps,
+    title="Playback EE Trajectory",
+    axis_frame_step=axis_frame_step,
+    initial_fraction=0.02,
+    reveal_fraction_step=0.02,
+)
 
 # plot gripper
 plt.ion()
@@ -222,9 +369,6 @@ plt.close()
 plt.ion()
 fig = plt.figure()
 ax = plt.axes(projection="3d")
-x = np.linspace(-0.02, 0.2, 20)
-y = np.linspace(-0.1, 0.1, 20)
-z = np.linspace(-0.1, 0.1, 20)
 ax.set_title("Playback EE Trajectory: Current Horizon")
 ax.set_xlabel("X")
 ax.set_ylabel("Y")
@@ -245,13 +389,19 @@ while i < N:
 
     # Plotting current window trajectory
     ax.cla()
-    for pose in pose_SE3_WT[i:end_id]:
-        plot_camera_frame(ax, pose)
+    ax.set_title("Playback EE Trajectory: Current Horizon")
+    plot_trajectory(
+        ax, pose_SE3_WT, color="lightgray", linewidth=0.5, alpha=0.4, label="full"
+    )
+    plot_trajectory(
+        ax, pose_SE3_WT[i:end_id], color="b", linewidth=2, label="horizon"
+    )
+    plot_camera_frame(ax, pose_SE3_WT[i], axis_length=0.02)
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     set_axes_equal(ax)
-    plt.draw()
+    plt.pause(0.001)
 
     i += dN
     pose_fb = np.squeeze(server.get_pose(1, 0))
@@ -259,7 +409,8 @@ while i < N:
 
     input("Press Enter to execute...")
     timenow_ms = server.get_timestamp_now_ms()
-    time_cmd = timenow_ms + 100 + np.arange(dN) * 30
+    time_cmd = timenow_ms + 100 + np.arange(dN) * 60
     server.schedule_waypoints(pose_cmd, time_cmd, 0)
-    server.schedule_eoat_waypoints(gp_cmd, time_cmd, 0)
+    if server.has_eoat():
+        server.schedule_eoat_waypoints(gp_cmd, time_cmd, 0)
     time.sleep(0.1)

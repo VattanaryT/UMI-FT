@@ -1,8 +1,9 @@
 import os
 import time
-from typing import Tuple
+from typing import Optional, Tuple
 
 import cv2
+import yaml
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -16,13 +17,22 @@ from PyriteUtility.plotting.matplotlib_helpers import set_axes_equal
 from PyriteUtility.pytorch_utils.model_io import load_policy
 from PyriteUtility.spatial_math import spatial_utilities as su
 
-from PyriteEnvSuites.envs.task.manip_server_umift_env import ManipServerUMIFTEnv
+from PyriteEnvSuites.envs.task.manip_server_layup_env import ManipServerLayupEnv
+# from PyriteEnvSuites.envs.task.manip_server_umift_env import ManipServerUMIFTEnv
 
 from PyriteEnvSuites.utils.env_utils import (
     pose9g1_to_traj,
     pose9pose9s1a2_to_traj,
     ts_to_js_traj,
 )
+
+
+def flush_matplotlib_figure(fig, pause_s: float = 0.1) -> None:
+    """Force a Matplotlib GUI backend to repaint before blocking on stdin."""
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+    plt.pause(pause_s)
+
 
 if "PYRITE_CHECKPOINT_FOLDERS" not in os.environ:
     raise ValueError("Please set the environment variable PYRITE_CHECKPOINT_FOLDERS")
@@ -39,9 +49,87 @@ hardware_config_folder_path = os.environ.get("PYRITE_HARDWARE_CONFIG_FOLDERS")
 control_log_folder_path = os.environ.get("PYRITE_CONTROL_LOG_FOLDERS")
 
 
+def resolve_realsense_serial(hardware_config_path: str) -> Optional[str]:
+    """Resolve D405 serial for pyrealsense2 (env var overrides yaml)."""
+    serial = os.environ.get("UMIFT_REALSENSE_SERIAL")
+    if serial:
+        return serial
+    with open(hardware_config_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    return cfg.get("realsense_serial")
+
+
+def log_horizon(
+    log,
+    horizon_count: int,
+    id_list: list,
+    exe_horizon: int,
+    outputs_ts_targets,
+    outputs_ts_nominal_targets,
+    outputs_ts_stiffnesses,
+    timestamps,
+    action_start_time_s: float,
+    obs_raw: dict,
+    env,
+    controller: ModelPredictiveController,
+    obs_task: dict,
+    shape_meta: dict,
+    log_policy_vision: bool,
+) -> None:
+    """Write one MPC horizon to the episode control log (executed slice only)."""
+    horizon_log = log.create_group(f"horizon_{horizon_count}")
+    exe = min(exe_horizon, outputs_ts_targets[0].shape[0])
+
+    meta = horizon_log.create_group("meta")
+    meta.attrs["hardware_time_s"] = float(env.current_hardware_time_s)
+    meta.attrs["horizon_index"] = int(horizon_count)
+    meta.attrs["exe_horizon"] = int(exe)
+
+    action_log = horizon_log.create_group("action")
+    for robot_id in id_list:
+        action_log.create_dataset(
+            f"ts_virtual_targets_{robot_id}",
+            data=outputs_ts_targets[robot_id][:exe],
+        )
+        action_log.create_dataset(
+            f"ts_nominal_targets_{robot_id}",
+            data=outputs_ts_nominal_targets[robot_id][:exe],
+        )
+        action_log.create_dataset(
+            f"ts_stiffnesses_{robot_id}",
+            data=outputs_ts_stiffnesses[robot_id][:, : 6 * exe],
+        )
+    action_log.create_dataset(
+        "timestamps_s",
+        data=timestamps[:exe] + action_start_time_s,
+    )
+
+    obs_policy_group = horizon_log.create_group("obs_policy")
+    obs_sampled = controller.sample_sparse_obs(obs_task["obs"])
+    obs_policy, _ = controller.preprocess_policy_obs(
+        obs_sampled, ignore_rgb=not log_policy_vision
+    )
+    vision_keys = {"rgb_0", "ultrawide_0", "depth_0"}
+    for key in shape_meta["sample"]["obs"]["sparse"]:
+        if key not in obs_policy:
+            continue
+        if not log_policy_vision and key in vision_keys:
+            continue
+        obs_policy_group.create_dataset(key, data=obs_policy[key])
+
+    obs_inference = horizon_log.create_group("obs_inference")
+    obs_inference.attrs["hardware_time_s"] = float(env.current_hardware_time_s)
+    for robot_id in id_list:
+        obs_inference.create_dataset(
+            f"ts_pose_fb_{robot_id}",
+            data=obs_raw[f"ts_pose_fb_{robot_id}"][-1],
+        )
+
+
 def main():
     control_para = {
-        "raw_time_step_s": 0.0167,  # dt of raw data collection. Used to compute time step from time_s such that the downsampling according to shape_meta works.
+        # D405 @ 15 Hz for layup stack; iPhone/GoPro legacy path uses 0.0167 (~60 Hz).
+        "raw_time_step_s": 1.0 / 15.0,
         "slow_down_factor": 5,  # slow down policy execution by this factor
         "sparse_execution_horizon": 4, # 
         "max_duration_s": 3500,
@@ -52,20 +140,36 @@ def main():
         "test_nominal_target": False,  # False to follow virtual target
         "test_nominal_target_stiffness": -1,  # -1, for a 'no force case'. 1500, for a quick test without force.
         "fix_orientation": False,
-        "pausing_mode": False, # set to True to pause before executing each horizon, for debugging
+        "enable_control_log": True,
+        "log_policy_vision": True,
+        "pausing_mode": False,  # matplotlib debug only; independent of logging
         "device": "cuda",
     }
     pipeline_para = {
+        # Layup: D405 rgb (manip_server) + depth (pyrealsense2) + UR5e wrist FT.
+        "use_layup_env": True,
         "iphone_params": {
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        "ckpt_path": "/2025.07.16_19.47.42_umift-audio_audio",
-        "hardware_config_path": hardware_config_folder_path + "/right_arm_coinft.yaml",
-        "control_log_path": control_log_folder_path + "/temp/",
+        "ckpt_path": "/2026.07.11_16.32.44_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI/checkpoints/epoch=0270-train_loss=0.019.ckpt",
+        "hardware_config_path": hardware_config_folder_path
+        + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
-        "depth_downsample_correction": 2,  # depth physically streams at 60Hz during data collection. Effectively downsampled to 30Hz (to match streaming) then effectively upsampled to 60Hz for ease of time-syncing with rgb. So the downsampling on streamed depth (30Hz) should be divided by 2, because this shape meta downsampling is on 60Hz.
+        # D405 depth @ 15 Hz (no iPhone 60 Hz / 30 Hz correction).
+        "depth_downsample_correction": 1,
+        # UR RTDE ~500 Hz at inference vs wild collection ~200 Hz pose / ~28 Hz wrench.
+        "robot_downsample_correction": 500.0 / 200.0,
+        "wrench_downsample_correction": 500.0 / 28.0,
     }
+    if not pipeline_para["use_layup_env"]:
+        control_para["raw_time_step_s"] = 0.0167
+        pipeline_para["hardware_config_path"] = (
+            hardware_config_folder_path + "/right_arm_coinft.yaml"
+        )
+        pipeline_para["depth_downsample_correction"] = 2
+        pipeline_para["robot_downsample_correction"] = 1
+        pipeline_para["wrench_downsample_correction"] = 1
     verbose = 1
     episode_id = 0
 
@@ -165,6 +269,43 @@ def main():
     else:
         depth_query_size = None
 
+    # Layup: scale down_sample_steps so MPC striding on ~500 Hz RTDE buffers
+    # matches wild-collection effective rates (~200 Hz pose, ~28 Hz wrench).
+    if pipeline_para["use_layup_env"]:
+        OmegaConf.set_struct(shape_meta["sample"]["obs"]["sparse"], False)
+        robot_corr = pipeline_para["robot_downsample_correction"]
+        for robot_key in ("robot0_eef_pos", "robot0_eef_rot_axis_angle"):
+            if robot_key in shape_meta["sample"]["obs"]["sparse"]:
+                ds = int(
+                    shape_meta["sample"]["obs"]["sparse"][robot_key][
+                        "down_sample_steps"
+                    ]
+                )
+                new_ds = max(1, round(ds * robot_corr))
+                shape_meta["sample"]["obs"]["sparse"][robot_key][
+                    "down_sample_steps"
+                ] = new_ds
+                print(
+                    f"[layup] {robot_key} down_sample_steps: {ds} -> {new_ds} "
+                    f"(x{robot_corr:.2f})"
+                )
+        wrench_corr = pipeline_para["wrench_downsample_correction"]
+        for wrench_key in ("robot0_eef_wrench_left", "robot0_eef_wrench_right"):
+            if wrench_key in shape_meta["sample"]["obs"]["sparse"]:
+                ds = int(
+                    shape_meta["sample"]["obs"]["sparse"][wrench_key][
+                        "down_sample_steps"
+                    ]
+                )
+                new_ds = max(1, round(ds * wrench_corr))
+                shape_meta["sample"]["obs"]["sparse"][wrench_key][
+                    "down_sample_steps"
+                ] = new_ds
+                print(
+                    f"[layup] {wrench_key} down_sample_steps: {ds} -> {new_ds} "
+                    f"(x{wrench_corr:.2f})"
+                )
+
     ts_pose_query_size = (
         shape_meta["sample"]["obs"]["sparse"]["robot0_eef_pos"]["horizon"] - 1
     ) * shape_meta["sample"]["obs"]["sparse"]["robot0_eef_pos"]["down_sample_steps"] + 1
@@ -220,15 +361,33 @@ def main():
             "audio_device_id": pipeline_para["audio_device_id"],
         }
 
-    env = ManipServerUMIFTEnv(
-        camera_res_hw=(image_height, image_width),
-        hardware_config_path=pipeline_para["hardware_config_path"],
-        query_sizes=query_sizes,
-        audio_params=audio_params,
-        compliant_dimensionality=n_af,
-        iphone_params=pipeline_para["iphone_params"],
-        vision_key=vision_key,
-    )
+    if pipeline_para["use_layup_env"]:
+        realsense_serial = resolve_realsense_serial(
+            pipeline_para["hardware_config_path"]
+        )
+        print(
+            f"[layup] pyrealsense2 D405 serial: "
+            f"{realsense_serial or '(first connected device)'}"
+        )
+        env = ManipServerLayupEnv(
+            camera_res_hw=(image_height, image_width),
+            hardware_config_path=pipeline_para["hardware_config_path"],
+            query_sizes=query_sizes,
+            compliant_dimensionality=n_af,
+            depth_clip=depth_clip if depth_query_size is not None else 0.5,
+            vision_key=vision_key,
+            realsense_serial=realsense_serial,
+        )
+    else:
+        env = ManipServerUMIFTEnv(
+            camera_res_hw=(image_height, image_width),
+            hardware_config_path=pipeline_para["hardware_config_path"],
+            query_sizes=query_sizes,
+            audio_params=audio_params,
+            compliant_dimensionality=n_af,
+            iphone_params=pipeline_para["iphone_params"],
+            vision_key=vision_key,
+        )
 
     env.reset()
 
@@ -291,9 +450,16 @@ def main():
     )
     printOrNot(vbs_h2, "Starting main loop.")
 
+    printOrNot(vbs_h2, "Calibrating robot wrench.")
+    env.calibrate_robot_wrench(NSamples=100)
+    time.sleep(2)
+    obs = env.get_observation_from_buffer()
+    w = np.mean(obs["wrench_left_0"][-100:], axis=0)  # or wrench_left_0 in layup
+    print("wrench: ", w)
+
     if control_para["pausing_mode"]:
         plt.ion()  # to run GUI event loop
-        _fig = plt.figure()
+        fig = plt.figure()
         ax = plt.axes(projection="3d")
         # x = np.linspace(-0.02, 0.2, 20)
         # y = np.linspace(-0.1, 0.1, 20)
@@ -303,12 +469,10 @@ def main():
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
         plt.show()
-
-    # log
-    log_store = zarr.DirectoryStore(path=pipeline_para["control_log_path"])
-    log = zarr.open(store=log_store, mode="w")  # w: overrite if exists
+        flush_matplotlib_figure(fig)
 
     horizon_count = 0
+    log = None
 
     # plot the rgb/depth stream, confirm it is correct
     time.sleep(2)
@@ -354,6 +518,25 @@ def main():
         # env.start_saving_data_for_a_new_episode(pipeline_para["episode_data_save_path"])
         env.start_saving_data_for_a_new_episode()
 
+        log = None
+        horizon_count = 0
+        if control_para["enable_control_log"]:
+            episode_log_path = os.path.join(
+                control_log_folder_path, f"episode_{int(time.time())}"
+            )
+            log_store = zarr.DirectoryStore(path=episode_log_path)
+            log = zarr.open(store=log_store, mode="w")
+            log.attrs["sparse_execution_horizon"] = int(
+                control_para["sparse_execution_horizon"]
+            )
+            log.attrs["episode_id"] = int(episode_id)
+            log.attrs["episode_data_folder"] = env.get_episode_folder()
+            log.attrs["ckpt_path"] = pipeline_para["ckpt_path"]
+            log.attrs["hardware_config_path"] = pipeline_para["hardware_config_path"]
+            log.attrs["log_policy_vision"] = bool(control_para["log_policy_vision"])
+            printOrNot(vbs_h1, "Control log:", episode_log_path)
+
+        episode_initial_time_s = env.current_hardware_time_s
         killer = GracefulKiller()
         while not killer.kill_now:
             horizon_initial_time_s = env.current_hardware_time_s
@@ -558,7 +741,9 @@ def main():
             if control_para["pausing_mode"]:
                 # plot the actions for this horizon using matplotlib
                 ax.cla()
-                for id in id_list:
+                for i, id in enumerate(id_list):
+                    # Label only the first robot to avoid duplicate legend entries.
+                    label = lambda name: name if i == 0 else None
                     ax.plot3D(
                         action_sparse_target_mats[id][..., 0, 3],
                         action_sparse_target_mats[id][..., 1, 3],
@@ -566,6 +751,7 @@ def main():
                         color="red",
                         marker="o",
                         markersize=3,
+                        label=label("Nominal target"),
                     )
 
                     ax.plot3D(
@@ -575,6 +761,7 @@ def main():
                         color="blue",
                         marker="o",
                         markersize=3,
+                        label=label("Virtual target"),
                     )
 
                     ax.plot3D(
@@ -591,6 +778,7 @@ def main():
                         linewidth=3,
                         marker="o",
                         markersize=4,
+                        label=label("Executed nominal"),
                     )
 
                     ax.plot3D(
@@ -607,6 +795,7 @@ def main():
                         linewidth=3,
                         marker="o",
                         markersize=4,
+                        label=label("Executed virtual"),
                     )
 
                     ax.plot3D(
@@ -616,56 +805,54 @@ def main():
                         color="black",
                         marker="o",
                         markersize=8,
+                        label=label("Current TCP"),
                     )
 
                 ax.set_xlabel("X")
                 ax.set_ylabel("Y")
                 ax.set_zlabel("Z")
+                ax.legend(loc="best")
 
                 set_axes_equal(ax)
 
-                plt.draw()
+                # Process the GUI event loop before input() blocks the main thread.
+                flush_matplotlib_figure(fig)
 
                 input("Press Enter to start executing the plotted actions.")
 
-                # logging
-                horizon_log = log.create_group(f"horizon_{horizon_count}")
-                # observation
-                obs_log = horizon_log.create_group("obs")
-                for key, value in obs_task["obs"].items():
-                    obs_log.create_dataset(key, data=value)
-
-                # action
-                action_log = horizon_log.create_group("action")
-                action_start_time_s = env.current_hardware_time_s
-                for id in id_list:
-                    action_log.create_dataset(
-                        f"ts_virtual_targets_{id}", data=outputs_ts_targets[id]
-                    )
-                    action_log.create_dataset(
-                        f"ts_nominal_targets_{id}", data=outputs_ts_nominal_targets[id]
-                    )
-                    action_log.create_dataset(
-                        f"ts_stiffnesses_{id}", data=outputs_ts_stiffnesses[id]
-                    )
-                action_log.create_dataset(
-                    "timestamps_s", data=timestamps + action_start_time_s
+            if control_para["enable_control_log"] and log is not None:
+                log_horizon(
+                    log=log,
+                    horizon_count=horizon_count,
+                    id_list=id_list,
+                    exe_horizon=control_para["sparse_execution_horizon"],
+                    outputs_ts_targets=outputs_ts_targets,
+                    outputs_ts_nominal_targets=outputs_ts_nominal_targets,
+                    outputs_ts_stiffnesses=outputs_ts_stiffnesses,
+                    timestamps=timestamps,
+                    action_start_time_s=action_start_time_s,
+                    obs_raw=obs_raw,
+                    env=env,
+                    controller=controller,
+                    obs_task=obs_task,
+                    shape_meta=shape_meta,
+                    log_policy_vision=control_para["log_policy_vision"],
                 )
 
-                # cut the action and only keep the execution horizon
-                for id in id_list:
-                    outputs_ts_targets[id] = outputs_ts_targets[id][
+            # cut the action and only keep the execution horizon
+            for id in id_list:
+                outputs_ts_targets[id] = outputs_ts_targets[id][
+                    : control_para["sparse_execution_horizon"], :
+                ]
+                outputs_ts_stiffnesses[id] = outputs_ts_stiffnesses[id][
+                    :, : 6 * control_para["sparse_execution_horizon"]
+                ]
+                if outputs_eoat is not None:
+                    outputs_eoat[id] = outputs_eoat[id][
                         : control_para["sparse_execution_horizon"], :
                     ]
-                    outputs_ts_stiffnesses[id] = outputs_ts_stiffnesses[id][
-                        :, : 6 * control_para["sparse_execution_horizon"]
-                    ]
-                    if outputs_eoat is not None:
-                        outputs_eoat[id] = outputs_eoat[id][
-                            : control_para["sparse_execution_horizon"], :
-                        ]
-                timestamps = timestamps[: control_para["sparse_execution_horizon"]]
-                action_start_time_s = env.current_hardware_time_s
+            timestamps = timestamps[: control_para["sparse_execution_horizon"]]
+            action_start_time_s = env.current_hardware_time_s
 
             if len(id_list) == 1:
                 outputs_ts_targets = outputs_ts_targets[0].T  # N x 7 to 7 x N
@@ -752,6 +939,9 @@ def main():
         else:
             print("Quitting the program.")
             break
+
+        if c == "r":
+            input("Press Enter to continue.")
 
         if c == "b":
             input("Press Enter to quit program.")

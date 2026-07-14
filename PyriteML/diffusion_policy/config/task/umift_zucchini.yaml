@@ -22,11 +22,11 @@ sparse_obs_low_dim_horizon: 2
 sparse_obs_gripper_down_sample_steps: 1
 sparse_obs_gripper_horizon: 1
 
-sparse_obs_wrench_down_sample_steps: 4
+sparse_obs_wrench_down_sample_steps: 1  # was 4; shortest episode has 69 wrench samples (needs horizon*ds+1 <= 69)
 sparse_obs_wrench_horizon: 32
 
-sparse_action_down_sample_steps: 10
-sparse_action_horizon: 20   # 12 (2s) / 20 (3.33s) / 32 (5.33s) / 48 (8s) / 54 (9s) / 58 (9.66s) / 64 (10.66) 
+sparse_action_down_sample_steps: 2
+sparse_action_horizon: 12   # 12 (2s) / 20 (3.33s) / 32 (5.33s) / 48 (8s) / 54 (9s) / 58 (9.66s) / 64 (10.66) 
 
 depth_clip: 0.5  # in [m]
 
@@ -179,15 +179,15 @@ shape_meta: &shape_meta
 
 task_name: &task_name
 
-dataset_path: /store/real/hjchoi92/data/real_processed/umift/zucchini-wild-test-for-coderelease/acp_replay_buffer_gripper.zarr
+dataset_path: /mnt/data/umidata/ft/straight_convex_data_v3/acp_replay_buffer.zarr
 
 dataset:
   _target_: diffusion_policy.dataset.umift_dataset.UmiFTDataset
   shape_meta: *shape_meta
   dataset_path: ${task.dataset_path}
-  sparse_query_frequency_down_sample_steps: 8
+  sparse_query_frequency_down_sample_steps: 2
   action_padding: True
   temporally_independent_normalization: False
   seed: 42
-  val_ratio: 0.05
+  val_ratio: 0.10
   normalize_wrench: True

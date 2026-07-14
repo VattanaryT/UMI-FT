@@ -494,8 +494,17 @@ class ManipServerUMIFTEnv:
                     self.query_sizes["sparse"]["wrench"], id
                 ).transpose()
                 self.sparse_wrench_left[id] = wrench_fb[:, :6]
-                # self.sparse_wrench_right[id] = np.zeros_like(self.sparse_wrench_left[id])
-                self.sparse_wrench_right[id] = wrench_fb[:, 6:]
+                if wrench_fb.shape[1] == 6:
+                    self.sparse_wrench_right[id] = np.zeros_like(
+                        self.sparse_wrench_left[id]
+                    )
+                elif wrench_fb.shape[1] >= 12:
+                    self.sparse_wrench_right[id] = wrench_fb[:, 6:12]
+                else:
+                    raise ValueError(
+                        f"Unexpected wrench width {wrench_fb.shape[1]}; "
+                        "expected 6 (single sensor) or 12 (dual CoinFT)."
+                    )
                 self.sparse_wrench_timestamp_s[id] = (
                     self.server.get_wrench_timestamps_ms(id) / 1000
                 )

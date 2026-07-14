@@ -1,21 +1,21 @@
+"""Plot inference control-log horizons: nominal vs virtual targets + observed wrench.
+
+Usage:
+  export PYRITE_CONTROL_LOG_FOLDERS=$HOME/data/control_log
+  python plot_control_log.py
+  python plot_control_log.py --log_subdir temp --robot_id 0
+"""
+
+import argparse
 import os
 
 import matplotlib.pyplot as plt
 import numpy as np
-
-# from mpl_toolkits import mplot3d
 import zarr
 
 
 def set_axes_equal(ax):
-    """
-    Make axes of 3D plot have equal scale so that spheres appear as spheres,
-    cubes as cubes, etc.
-
-    Input
-      ax: a matplotlib axis, e.g., as output from plt.gca().
-    """
-
+    """Make 3D axes equal scale so trajectories are not distorted."""
     x_limits = ax.get_xlim3d()
     y_limits = ax.get_ylim3d()
     z_limits = ax.get_zlim3d()
@@ -27,239 +27,171 @@ def set_axes_equal(ax):
     z_range = abs(z_limits[1] - z_limits[0])
     z_middle = np.mean(z_limits)
 
-    # The plot bounding box is a sphere in the sense of the infinity
-    # norm, hence I call half the max range the plot radius.
-    plot_radius = 0.5 * max([x_range, y_range, z_range])
+    plot_radius = 0.5 * max([x_range, y_range, z_range, 1e-3])
 
     ax.set_xlim3d([x_middle - plot_radius, x_middle + plot_radius])
     ax.set_ylim3d([y_middle - plot_radius, y_middle + plot_radius])
     ax.set_zlim3d([z_middle - plot_radius, z_middle + plot_radius])
 
 
+def sorted_horizon_keys(log):
+    keys = [k for k in log.keys() if k.startswith("horizon_")]
+    return sorted(keys, key=lambda k: int(k.split("_", 1)[1]))
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--log_subdir",
+        default="temp",
+        help="Subfolder under PYRITE_CONTROL_LOG_FOLDERS (default: temp)",
+    )
+    parser.add_argument("--robot_id", type=int, default=0)
+    parser.add_argument(
+        "--exe_horizon",
+        type=int,
+        default=None,
+        help="Executed steps to highlight (default: all steps in the logged action)",
+    )
+    parser.add_argument("--downsample", type=int, default=1)
+    parser.add_argument(
+        "--save_dir",
+        default=None,
+        help="If set, save each horizon figure here instead of only showing",
+    )
+    args = parser.parse_args()
+
     if "PYRITE_CONTROL_LOG_FOLDERS" not in os.environ:
         raise ValueError(
             "Please set the environment variable PYRITE_CONTROL_LOG_FOLDERS"
         )
 
-    control_log_folder_path = os.environ.get("PYRITE_CONTROL_LOG_FOLDERS")
-    control_log_path = control_log_folder_path + "/feb24_nogripper_nowrench_rollout/"
+    control_log_path = os.path.join(
+        os.environ["PYRITE_CONTROL_LOG_FOLDERS"], args.log_subdir
+    )
+    robot_id = args.robot_id
+    downsample = max(1, args.downsample)
 
-    # robot_id = 0  # robot front is +Y
-    robot_id = 1  # robot front is -Y
-
-    # view_angle = [0, 90, 0] # viewing from +Y to -Y
-    view_angle = [0, -90, 0]  # viewing from -Y to +Y
-
-    # umift
-    horizon = 16
-    exe_horizon = 12
-    downsample = 2
-    scale = 0.6
-
-    # # wiping
-    # horizon = 32
-    # exe_horizon = 24
-    # downsample = 4
-    # scale = 1.2
-
-    save_figure_no_show = False
-
-    # log
     print(f"Loading control log from {control_log_path}")
-    log_store = zarr.DirectoryStore(path=control_log_path)
-    log = zarr.open(store=log_store, mode="r")  # r: read only, must exist
+    log = zarr.open(store=zarr.DirectoryStore(path=control_log_path), mode="r")
+    horizon_keys = sorted_horizon_keys(log)
+    if not horizon_keys:
+        raise RuntimeError(f"No horizon_* groups found in {control_log_path}")
 
-    num_horizons = len(log.keys())
+    plt.ion()
+    fig = plt.figure(figsize=(12, 5))
+    ax3d = fig.add_subplot(1, 2, 1, projection="3d")
+    ax_f = fig.add_subplot(1, 2, 2)
+    fig.suptitle("Control log: virtual targets + wrench")
 
-    episode_ts_virtual_targets = []
-    episode_ts_nominal_targets = []
-    episode_ts_stiffnesses = []
+    for horizon_key in horizon_keys:
+        horizon_log = log[horizon_key]
+        # Current umift_env_runner layout: action/ + obs/
+        if "action" in horizon_log:
+            action_log = horizon_log["action"]
+            obs_log = horizon_log["obs"] if "obs" in horizon_log else {}
+        else:
+            action_log = horizon_log
+            obs_log = horizon_log
 
-    plt.ion()  # to run GUI event loop
-    _fig = plt.figure()
-    ax = plt.axes(projection="3d")
-    ax.view_init(elev=view_angle[0], azim=view_angle[1], roll=view_angle[2])
-    x = np.linspace(-0.02, 0.2, 20)
-    y = np.linspace(-0.1, 0.8, 20)
-    z = np.linspace(-0.1, 0.1, 20)
-    ax.plot3D(x, y, z, color="blue", marker="o", markersize=3)
-    ax.plot3D(x, y, z, color="red", marker="o", markersize=3)
-    ax.set_title("Target and virtual target")
-    ax.set_xlabel("X")
-    ax.set_ylabel("Y")
-    ax.set_zlabel("Z")
-    plt.show()
-    ax.cla()
+        ts_virtual = action_log[f"ts_virtual_targets_{robot_id}"][:]
+        ts_nominal = action_log[f"ts_nominal_targets_{robot_id}"][:]
+        horizon = ts_virtual.shape[0]
+        exe_horizon = args.exe_horizon if args.exe_horizon is not None else horizon
+        exe_horizon = min(exe_horizon, horizon)
 
-    for horizon_count in range(num_horizons):
-        # read the log
-        print(f"Horizon {horizon_count}")
-        horizon_log = log[f"horizon_{horizon_count}"]
-        action_log = horizon_log["action"]
-        obs_log = horizon_log["obs"]
-
-        # plot obs
-        # obs_log_rgb = obs_log["rgb_0"]
-        # obs_log_eef_pos = obs_log["robot0_eef_pos"]
-        # obs_log_eef_rot_axis_angle = obs_log["robot0_eef_rot_axis_angle"]
-        # obs_log_gripper = obs_log["robot0_gripper"]
-        # obs_log_eef_wrench_left = obs_log["robot0_eef_wrench_left"]
-        for key, value in obs_log.items():
-            print(f"key: {key}, value: {value.shape}")
-            if len(value.shape) == 2:
-                print(value[:])
-        exit()
-
-        # # plot rgb
-        # for i in range(len(obs_log_rgb)):
-        #     rgb = obs_log_rgb[i]
-        #     rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-        #     plt.imshow(rgb)
-        #     plt.show()
-        #     input("Press Enter to continue...")
-
-        # plot action
-        for key, value in action_log.items():
-            print(f"key: {key}, value: {value.shape}")
-            # if len(value.shape) == 2:
-            #     print(value[:])
-        exit()
-
-        ts_virtual_targets = action_log[f"ts_virtual_targets_{robot_id}"][:]  # 16x7
-        ts_nominal_targets = action_log[f"ts_nominal_targets_{robot_id}"][:]  # 16x7
-        ts_stiffnesses = action_log[f"ts_stiffnesses_{robot_id}"][:]  # 6x96
-        timestamps = action_log["timestamps_s"][:]
-        timestamps = timestamps - timestamps[0]
-
-        # SE3_virtual_targets = su.pose7_to_SE3(ts_virtual_targets)  # 16x4x4
-        # SE3_nominal_targets = su.pose7_to_SE3(ts_nominal_targets)  # 16x4x4
-
-        episode_ts_virtual_targets.append(ts_virtual_targets)
-        episode_ts_nominal_targets.append(ts_nominal_targets)
-        episode_ts_stiffnesses.append(ts_stiffnesses)
-
-        # plot a horizon
-
-        # plot the whole horizon
-        ax.plot3D(
-            ts_nominal_targets[::downsample, 0],
-            ts_nominal_targets[::downsample, 1],
-            ts_nominal_targets[::downsample, 2],
-            color="gold",
-            marker="o",
-            markersize=8 * scale,
-            linewidth=3 * scale,
+        print(
+            f"{horizon_key}: action_len={horizon}, exe={exe_horizon}, "
+            f"vt-nom mean |dx|={np.linalg.norm(ts_virtual[:, :3] - ts_nominal[:, :3], axis=1).mean():.4f} m"
         )
 
-        # # plot the executed part
-        # ax.plot3D(
-        #     ts_virtual_targets[:exe_horizon, 0],
-        #     ts_virtual_targets[:exe_horizon, 1],
-        #     ts_virtual_targets[:exe_horizon, 2],
-        #     color="royalblue",
-        #     marker="o",
-        #     markersize=8,
-        #     linewidth=5,
-        # )
-        # ax.plot3D(
-        #     ts_nominal_targets[:exe_horizon, 0],
-        #     ts_nominal_targets[:exe_horizon, 1],
-        #     ts_nominal_targets[:exe_horizon, 2],
-        #     color="dimgrey",
-        #     marker="o",
-        #     markersize=8,
-        #     linewidth=5,
-        # )
-        # # plot the unexecuted part
-        # ax.plot3D(
-        #     ts_virtual_targets[exe_horizon - 1 :, 0],
-        #     ts_virtual_targets[exe_horizon - 1 :, 1],
-        #     ts_virtual_targets[exe_horizon - 1 :, 2],
-        #     color="teal",
-        #     marker="o",
-        #     markersize=8,
-        #     linewidth=5,
-        # )
-        # ax.plot3D(
-        #     ts_nominal_targets[exe_horizon - 1 :, 0],
-        #     ts_nominal_targets[exe_horizon - 1 :, 1],
-        #     ts_nominal_targets[exe_horizon - 1 :, 2],
-        #     color="sienna",
-        #     marker="o",
-        #     markersize=8,
-        #     linewidth=5,
-        # )
-
-        # fin
-        for i in np.arange(0, exe_horizon, downsample):
-            ax.plot3D(
-                [ts_nominal_targets[i][0], ts_virtual_targets[i][0]],
-                [ts_nominal_targets[i][1], ts_virtual_targets[i][1]],
-                [ts_nominal_targets[i][2], ts_virtual_targets[i][2]],
-                color="gold",
-                marker="o",
-                markersize=1 * scale,
-                linewidth=2 * scale,
-            )
-        for i in np.arange(exe_horizon, horizon, downsample):
-            ax.plot3D(
-                [ts_nominal_targets[i][0], ts_virtual_targets[i][0]],
-                [ts_nominal_targets[i][1], ts_virtual_targets[i][1]],
-                [ts_nominal_targets[i][2], ts_virtual_targets[i][2]],
-                color="gold",
-                # color="sienna",
-                marker="o",
-                markersize=1 * scale,
-                linewidth=2 * scale,
-            )
-
-        # virtual target
-        ax.plot3D(
-            ts_virtual_targets[::downsample, 0],
-            ts_virtual_targets[::downsample, 1],
-            ts_virtual_targets[::downsample, 2],
+        # --- 3D nominal / virtual targets ---
+        ax3d.cla()
+        ax3d.plot3D(
+            ts_nominal[::downsample, 0],
+            ts_nominal[::downsample, 1],
+            ts_nominal[::downsample, 2],
+            color="gold",
+            marker="o",
+            markersize=5,
+            linewidth=2,
+            label="nominal",
+        )
+        ax3d.plot3D(
+            ts_virtual[::downsample, 0],
+            ts_virtual[::downsample, 1],
+            ts_virtual[::downsample, 2],
             color="orangered",
             marker="o",
-            markersize=8 * scale,
-            linewidth=3 * scale,
+            markersize=5,
+            linewidth=2,
+            label="virtual",
         )
+        for i in range(0, exe_horizon, downsample):
+            ax3d.plot3D(
+                [ts_nominal[i, 0], ts_virtual[i, 0]],
+                [ts_nominal[i, 1], ts_virtual[i, 1]],
+                [ts_nominal[i, 2], ts_virtual[i, 2]],
+                color="0.5",
+                linewidth=1,
+            )
+        # current eef from obs, if present
+        eef_key = f"robot{robot_id}_eef_pos"
+        if eef_key in obs_log:
+            eef = np.asarray(obs_log[eef_key][-1]).reshape(-1)
+            ax3d.plot3D(
+                [eef[0]], [eef[1]], [eef[2]],
+                color="black",
+                marker="o",
+                markersize=8,
+                label="eef",
+            )
 
-        # initial point
-        ax.plot3D(
-            ts_nominal_targets[0, 0],
-            ts_nominal_targets[0, 1],
-            ts_nominal_targets[0, 2],
-            color="gold",
-            marker="o",
-            markersize=8 * scale,
-        )
+        ax3d.set_title(f"{horizon_key}")
+        ax3d.set_xlabel("X")
+        ax3d.set_ylabel("Y")
+        ax3d.set_zlabel("Z")
+        ax3d.legend(loc="upper left", fontsize=8)
+        set_axes_equal(ax3d)
 
-        ## Plot for a horizon
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("Z")
-
-        if robot_id == 1:
-            ax.axes.set_xlim3d(left=0.15, right=0.4)
-            ax.axes.set_ylim3d(bottom=-0.55, top=-0.3)
-            ax.axes.set_zlim3d(bottom=0.4, top=0.65)
+        # --- wrench / force ---
+        ax_f.cla()
+        wrench_key = f"robot{robot_id}_eef_wrench_left"
+        if wrench_key in obs_log:
+            wrench = np.asarray(obs_log[wrench_key][:])
+            ts_key = f"wrench_time_stamps_{robot_id}"
+            if ts_key in obs_log:
+                t = np.asarray(obs_log[ts_key][:]).reshape(-1)
+                t = t - t[0]
+                xlabel = "time (s)"
+            else:
+                t = np.arange(wrench.shape[0])
+                xlabel = "sample"
+            for i, label in enumerate(("fx", "fy", "fz")):
+                ax_f.plot(t, wrench[:, i], linewidth=1.2, label=label)
+            ax_f.set_ylabel("force (N)")
+            ax_f.set_xlabel(xlabel)
+            ax_f.legend(loc="upper right", fontsize=8)
+            ax_f.grid(True, alpha=0.3)
+            ax_f.set_title(f"{wrench_key}")
         else:
-            ax.axes.set_xlim3d(left=0, right=0.3)
-            ax.axes.set_ylim3d(bottom=0.3, top=0.6)
-            ax.axes.set_zlim3d(bottom=0.2, top=0.5)
+            ax_f.text(0.5, 0.5, f"no {wrench_key}", ha="center", va="center")
+            ax_f.set_axis_off()
 
-        set_axes_equal(ax)
-        ax.grid(False)
-        if not save_figure_no_show:
-            plt.draw()
-            input("Done. Press Enter to quit...")
-        ax.set_axis_off()
-        plt.savefig(
-            f"/home/yifanhou/git/PyriteEnvSuites/scripts/outputs/demo_r{robot_id}_{horizon_count}.png",
-            transparent=True,
-        )
-        ax.cla()
+        fig.canvas.draw()
+        plt.pause(0.001)
+
+        if args.save_dir:
+            os.makedirs(args.save_dir, exist_ok=True)
+            out = os.path.join(args.save_dir, f"{horizon_key}_r{robot_id}.png")
+            fig.savefig(out, dpi=120, bbox_inches="tight")
+            print(f"  saved {out}")
+
+        c = input("Enter=next horizon, q=quit: ").strip().lower()
+        if c == "q":
+            break
+
+    print("Done.")
 
 
 if __name__ == "__main__":
