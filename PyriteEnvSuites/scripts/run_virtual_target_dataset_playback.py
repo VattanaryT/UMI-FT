@@ -109,6 +109,25 @@ def compute_stiffness_matrices(
     return ts_stiffnesses
 
 
+def effective_commanded_stiffness(
+    ts_stiffness: np.ndarray,
+    nominal_target_stiffness_override: float = -1.0,
+) -> np.ndarray:
+    """
+    Scalar translational stiffness actually scheduled to the controller.
+
+    When --test_nominal_target_stiffness > 0, compute_stiffness_matrices replaces
+    the full 3x3 translational block with that isotropic value; otherwise the
+    dataset compliance-direction stiffness is used.
+    """
+    ts_stiffness = np.asarray(ts_stiffness, dtype=np.float64).reshape(-1)
+    if nominal_target_stiffness_override > 0:
+        return np.full_like(
+            ts_stiffness, float(nominal_target_stiffness_override), dtype=np.float64
+        )
+    return ts_stiffness.copy()
+
+
 def _load_episode(dataset_path: str, episode: str) -> Dict[str, np.ndarray]:
     root = zarr.open(dataset_path, mode="r")
     if "data" not in root or episode not in root["data"]:
@@ -278,6 +297,9 @@ class ReplayLog:
         self.pose_cmd: List[np.ndarray] = []
         self.pose_fb: List[np.ndarray] = []
         self.wrench: List[np.ndarray] = []
+        self.stiffness_dataset: List[float] = []
+        self.stiffness_cmd: List[float] = []
+        self.stiffness_override: float = -1.0
 
     def append(
         self,
@@ -285,20 +307,32 @@ class ReplayLog:
         pose_cmd: np.ndarray,
         pose_fb: np.ndarray,
         wrench: np.ndarray,
+        stiffness_dataset: float,
+        stiffness_cmd: float,
     ) -> None:
         self.time_s.append(float(time_s))
         self.pose_cmd.append(np.asarray(pose_cmd, dtype=np.float64).reshape(7))
         self.pose_fb.append(np.asarray(pose_fb, dtype=np.float64).reshape(7))
         self.wrench.append(np.asarray(wrench, dtype=np.float64).reshape(6))
+        self.stiffness_dataset.append(float(stiffness_dataset))
+        self.stiffness_cmd.append(float(stiffness_cmd))
 
     def to_arrays(self) -> Dict[str, np.ndarray]:
         if not self.time_s:
             return {}
+        stiffness_cmd = np.asarray(self.stiffness_cmd, dtype=np.float64)
         return {
             "time_s": np.asarray(self.time_s, dtype=np.float64),
             "pose_cmd": np.stack(self.pose_cmd, axis=0),
             "pose_fb": np.stack(self.pose_fb, axis=0),
             "wrench": np.stack(self.wrench, axis=0),
+            # stiffness_cmd: value actually scheduled to the controller
+            "stiffness": stiffness_cmd,
+            "stiffness_cmd": stiffness_cmd,
+            "stiffness_dataset": np.asarray(self.stiffness_dataset, dtype=np.float64),
+            "stiffness_override": np.asarray(
+                [self.stiffness_override], dtype=np.float64
+            ),
         }
 
 
@@ -307,9 +341,21 @@ def _sample_during_chunk(
     replay_log: ReplayLog,
     replay_t0_s: float,
     target_chunk: np.ndarray,
+    stiffness_dataset_chunk: np.ndarray,
+    stiffness_cmd_chunk: np.ndarray,
     step_dt_s: float,
 ) -> None:
     n_steps = target_chunk.shape[0]
+    if stiffness_dataset_chunk.shape[0] != n_steps:
+        raise ValueError(
+            f"stiffness_dataset_chunk length {stiffness_dataset_chunk.shape[0]} != "
+            f"target_chunk length {n_steps}"
+        )
+    if stiffness_cmd_chunk.shape[0] != n_steps:
+        raise ValueError(
+            f"stiffness_cmd_chunk length {stiffness_cmd_chunk.shape[0]} != "
+            f"target_chunk length {n_steps}"
+        )
     for step_i in range(n_steps):
         if step_i > 0:
             time.sleep(step_dt_s)
@@ -318,6 +364,8 @@ def _sample_during_chunk(
             pose_cmd=target_chunk[step_i],
             pose_fb=env.get_current_pose7(),
             wrench=env.get_current_wrench6(),
+            stiffness_dataset=float(stiffness_dataset_chunk[step_i]),
+            stiffness_cmd=float(stiffness_cmd_chunk[step_i]),
         )
 
 
@@ -337,16 +385,23 @@ def save_replay_log_plot(
     pose_cmd = data["pose_cmd"]
     pose_fb = data["pose_fb"]
     wrench = data["wrench"]
+    stiffness_cmd = data["stiffness_cmd"]
+    stiffness_dataset = data["stiffness_dataset"]
+    override = float(data["stiffness_override"][0])
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
-    fig = plt.figure(figsize=(12, 14))
-    gs = fig.add_gridspec(4, 1, height_ratios=[1.0, 1.0, 1.0, 1.2])
+    fig = plt.figure(figsize=(12, 16))
+    gs = fig.add_gridspec(5, 1, height_ratios=[1.0, 1.0, 0.7, 1.0, 1.2])
     ax_pos = fig.add_subplot(gs[0])
     ax_force = fig.add_subplot(gs[1], sharex=ax_pos)
-    ax_torque = fig.add_subplot(gs[2], sharex=ax_pos)
-    ax3d = fig.add_subplot(gs[3], projection="3d")
-    fig.suptitle(f"Replay log: {episode}", fontsize=14)
+    ax_stiff = fig.add_subplot(gs[2], sharex=ax_pos)
+    ax_torque = fig.add_subplot(gs[3], sharex=ax_pos)
+    ax3d = fig.add_subplot(gs[4], projection="3d")
+    title = f"Replay log: {episode}"
+    if override > 0:
+        title += f"  (stiffness override={override:g} N/m)"
+    fig.suptitle(title, fontsize=14)
 
     pos_labels = ("x", "y", "z")
     for i, label in enumerate(pos_labels):
@@ -362,6 +417,26 @@ def save_replay_log_plot(
     ax_force.set_ylabel("force (N)")
     ax_force.legend(loc="upper right", fontsize=8)
     ax_force.grid(True, alpha=0.3)
+
+    ax_stiff.plot(
+        time_s,
+        stiffness_dataset,
+        "--",
+        color="tab:gray",
+        linewidth=1.2,
+        label="k dataset",
+    )
+    ax_stiff.plot(
+        time_s,
+        stiffness_cmd,
+        "-",
+        color="tab:purple",
+        linewidth=1.4,
+        label="k cmd (scheduled)",
+    )
+    ax_stiff.set_ylabel("stiffness (N/m)")
+    ax_stiff.legend(loc="upper right", fontsize=8)
+    ax_stiff.grid(True, alpha=0.3)
 
     torque_labels = ("mx", "my", "mz")
     for i, label in enumerate(torque_labels):
@@ -457,6 +532,18 @@ def main() -> int:
     parser.add_argument("--default_stiffness_rot", default=100.0, type=float)
     parser.add_argument("--test_nominal_target", action="store_true")
     parser.add_argument("--test_nominal_target_stiffness", default=-1.0, type=float)
+    parser.add_argument(
+        "--min_stiffness",
+        default=-1.0,
+        type=float,
+        help=(
+            "If > 0, clamp the scheduled compliance-direction stiffness to this "
+            "floor (N/m) without touching the dataset. Use to test whether "
+            "avoiding low-k operating points (e.g. dataset k_min~200) reduces "
+            "contact oscillation, without reprocessing the dataset. The raw "
+            "dataset value is still logged separately as stiffness_dataset."
+        ),
+    )
     parser.add_argument("--gripper_action_scale", default=1000.0, type=float)
     parser.add_argument("--pausing_mode", action="store_true")
     parser.add_argument("--plot_trajectory", action="store_true")
@@ -487,7 +574,17 @@ def main() -> int:
     ts_pose_virtual_target = np.asarray(
         episode_data["ts_pose_virtual_target_0"], dtype=np.float64
     )
-    ts_stiffness = np.asarray(episode_data["stiffness_0"], dtype=np.float64).reshape(-1)
+    ts_stiffness_dataset = np.asarray(
+        episode_data["stiffness_0"], dtype=np.float64
+    ).reshape(-1)
+    if args.min_stiffness > 0:
+        ts_stiffness = np.maximum(ts_stiffness_dataset, args.min_stiffness)
+        print(
+            f"[replay] Flooring scheduled stiffness at {args.min_stiffness:g} N/m "
+            f"(dataset min was {float(np.min(ts_stiffness_dataset)):g} N/m)"
+        )
+    else:
+        ts_stiffness = ts_stiffness_dataset
     robot_time_stamps = np.asarray(
         episode_data["robot_time_stamps_0"], dtype=np.float64
     ).reshape(-1)
@@ -572,8 +669,21 @@ def main() -> int:
         )
 
     replay_log = ReplayLog()
+    replay_log.stiffness_override = float(args.test_nominal_target_stiffness)
     replay_t0_s = env.current_hardware_time_s
     step_dt_s = replay_dt * args.slow_down_factor
+    stiffness_cmd_full = effective_commanded_stiffness(
+        ts_stiffness,
+        nominal_target_stiffness_override=args.test_nominal_target_stiffness,
+    )
+    if args.test_nominal_target_stiffness > 0:
+        print(
+            f"[replay] Stiffness override active: "
+            f"{args.test_nominal_target_stiffness:g} N/m "
+            f"(dataset k ignored for scheduling)"
+        )
+    else:
+        print("[replay] Stiffness override inactive; scheduling dataset stiffness")
 
     for start in range(0, n, args.execution_horizon):
         end = min(start + args.execution_horizon, n)
@@ -582,6 +692,8 @@ def main() -> int:
         cmd_chunk = ts_pose_command[start:end]
         vt_chunk = ts_pose_virtual_target[start:end]
         k_chunk = ts_stiffness[start:end]
+        k_dataset_chunk = ts_stiffness_dataset[start:end]
+        k_cmd_chunk = stiffness_cmd_full[start:end]
 
         stiffness_mats = compute_stiffness_matrices(
             current_pose7=current_pose7,
@@ -627,6 +739,8 @@ def main() -> int:
                 replay_log=replay_log,
                 replay_t0_s=replay_t0_s,
                 target_chunk=target_chunk,
+                stiffness_dataset_chunk=k_dataset_chunk,
+                stiffness_cmd_chunk=k_cmd_chunk,
                 step_dt_s=step_dt_s,
             )
         elif not args.pausing_mode:

@@ -5,6 +5,9 @@ Open-loop policy evaluation on validation episodes.
 Runs MPC-style open-loop inference on recorded val observations, decodes
 actions into virtual-target trajectories, and writes a replay-compatible zarr
 that can be consumed by run_virtual_target_dataset_playback.py.
+
+Also writes ``policy_open_loop_val_queries.json`` with per-query base poses /
+expert times / open-loop index slices for plot_open_loop_vs_expert_3d.py.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ from omegaconf import OmegaConf
 from PyriteConfig.tasks.umift import umift_type_conversions as umift_task
 from PyriteML.diffusion_policy.common.pytorch_util import dict_apply
 from PyriteML.diffusion_policy.workspace.base_workspace import BaseWorkspace
+from PyriteUtility.planning_control.temporal_ensemble import PoseChunkEnsembler
 from PyriteUtility.spatial_math import spatial_utilities as su
 
 REQUIRED_KEYS = (
@@ -144,29 +148,53 @@ def decode_horizon_actions(
     raise RuntimeError(f"Unsupported action dim for decode: {action_dim}")
 
 
-def get_base_se3_for_sample(
+def get_query_base_info(
     sampler,
     sample_idx: int,
     id_list: Sequence[int],
-) -> List[np.ndarray]:
-    """Absolute SE3 at the query pose (same convention as sparse_obs_to_obs_sample)."""
+) -> Dict[str, Any]:
+    """Absolute SE3 / timing at the query pose (same convention as obs sampling)."""
     epi_id, rgb_id = sampler.indices[sample_idx]
     episode = f"episode_{epi_id}"
     data_episode = sampler.replay_buffer["data"][episode]
-    query_time = np.squeeze(data_episode["obs"]["rgb_time_stamps_0"][rgb_id])
+    query_time = float(np.squeeze(data_episode["obs"]["rgb_time_stamps_0"][rgb_id]))
 
     base_se3: List[np.ndarray] = []
+    expert_pose_index = 0
+    expert_robot_time_s = query_time
     for robot_id in id_list:
         robot_times = np.squeeze(data_episode["obs"][f"robot_time_stamps_{robot_id}"])
         query_id = int(np.searchsorted(robot_times, query_time))
         query_id = min(max(query_id, 0), len(robot_times) - 1)
+        if robot_id == id_list[0]:
+            expert_pose_index = query_id
+            expert_robot_time_s = float(robot_times[query_id])
         pos = np.asarray(data_episode["obs"][f"robot{robot_id}_eef_pos"][query_id])
         rot = np.asarray(
             data_episode["obs"][f"robot{robot_id}_eef_rot_axis_angle"][query_id]
         )
         pose9 = np.concatenate([pos, rot], axis=-1)
         base_se3.append(su.pose9_to_SE3(pose9))
-    return base_se3
+
+    base_pose7 = su.SE3_to_pose7(base_se3[0].reshape(1, 4, 4))[0]
+    return {
+        "epi_id": int(epi_id),
+        "rgb_id": int(rgb_id),
+        "base_se3": base_se3,
+        "expert_pose_index": int(expert_pose_index),
+        "expert_robot_time_s": float(expert_robot_time_s),
+        "rgb_query_time_s": float(query_time),
+        "base_pose7": np.asarray(base_pose7, dtype=np.float64).reshape(-1).tolist(),
+    }
+
+
+def get_base_se3_for_sample(
+    sampler,
+    sample_idx: int,
+    id_list: Sequence[int],
+) -> List[np.ndarray]:
+    """Absolute SE3 at the query pose (same convention as sparse_obs_to_obs_sample)."""
+    return get_query_base_info(sampler, sample_idx, id_list)["base_se3"]
 
 
 def group_sampler_indices_by_episode(
@@ -315,6 +343,9 @@ def compute_action_field_errors(
             grip_err.append(_mae(pred[:, o + 19], gt[:, o + 19]))
             force_err.append(_mae(pred[:, o + 20], gt[:, o + 20]))
 
+    print(pred[:, :3])
+    print(gt[:, :3])
+    print(np.linalg.norm(pred[:, :3] - gt[:, :3], axis=-1))
     metrics["pos_rmse"] = float(np.mean(pos_err))
     metrics["rot_rmse"] = float(np.mean(rot_err))
     if vt_pos_err:
@@ -368,11 +399,21 @@ def rollout_episode_open_loop(
     sampler_stride: int,
     raw_time_step_s: float,
     device: torch.device,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, float]]:
+    enable_ensemble_chunking: bool = True,
+    ensemble_decay_m: float = 0.0,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, float], List[Dict[str, Any]]]:
     """
     MPC-style open-loop rollout over one val episode's sampler indices.
 
     episode_sample_entries: list of (global_sample_idx, rgb_id)
+
+    When ``enable_ensemble_chunking`` is True, each full predicted horizon is
+    pushed into a PoseChunkEnsembler and only the blended first
+    ``sparse_execution_horizon`` steps are retained (zero-added-latency
+    temporal ensembling, matching live umift_env_runner).
+
+    Returns episode_data, aggregate metrics, and per-query metadata records for
+    expert/open-loop alignment plots.
     """
     action_dim = int(shape_meta["action"]["shape"][0])
     sparse_action_horizon = int(shape_meta["sample"]["action"]["sparse"]["horizon"])
@@ -391,6 +432,11 @@ def rollout_episode_open_loop(
     stiff_chunks: List[np.ndarray] = []
     grip_chunks: List[np.ndarray] = []
     time_chunks: List[np.ndarray] = []
+    # Raw (pre-ensemble) decoded poses — what the policy actually predicted.
+    raw_cmd_chunks: List[np.ndarray] = []
+    raw_vt_chunks: List[np.ndarray] = []
+    raw_stiff_chunks: List[np.ndarray] = []
+    query_records: List[Dict[str, Any]] = []
     field_metric_lists: Dict[str, List[float]] = {
         "action_mse": [],
         "naction_mse": [],
@@ -403,12 +449,24 @@ def rollout_episode_open_loop(
         "force_mae": [],
     }
 
+    ensembler: Optional[PoseChunkEnsembler] = None
+    if enable_ensemble_chunking:
+        ensembler = PoseChunkEnsembler(
+            pose_keys=("cmd", "vt"),
+            linear_keys=("stiffness", "gripper"),
+            weight_mode="exp",
+            decay_m=float(ensemble_decay_m),
+        )
+
     t0 = 0.0
     pos = 0
+    absolute_step = 0
+    query_idx = 0
     while pos < len(episode_sample_entries):
         global_idx, _rgb_id = episode_sample_entries[pos]
         obs_sample, action_sample = val_dataset.sampler.sample_sequence(global_idx)
-        base_se3 = get_base_se3_for_sample(val_dataset.sampler, global_idx, id_list)
+        query_info = get_query_base_info(val_dataset.sampler, global_idx, id_list)
+        base_se3 = query_info["base_se3"]
 
         raw_action = predict_sparse_action(policy, obs_sample, device)
         exec_h = min(sparse_execution_horizon, raw_action.shape[0])
@@ -419,15 +477,36 @@ def rollout_episode_open_loop(
             id_list=id_list,
             action_dim=action_dim,
         )
+        # Always keep the raw decoded executed slice (pre-ensemble).
+        raw_cmd_chunks.append(ts_cmd[:exec_h].copy())
+        raw_vt_chunks.append(ts_vt[:exec_h].copy())
+        raw_stiff_chunks.append(ts_stiff[:exec_h].copy())
 
-        cmd_chunks.append(ts_cmd[:exec_h])
-        vt_chunks.append(ts_vt[:exec_h])
-        stiff_chunks.append(ts_stiff[:exec_h])
-        if ts_grip is not None:
-            grip_chunks.append(ts_grip[:exec_h])
+        open_loop_start_idx = absolute_step
+        if ensembler is not None:
+            fields = {
+                "cmd": ts_cmd,
+                "vt": ts_vt,
+                "stiffness": ts_stiff,
+                "gripper": ts_grip,
+            }
+            ensembler.push(start_step=absolute_step, fields=fields)
+            blended = ensembler.pop(exec_h)
+            cmd_chunks.append(blended["cmd"])
+            vt_chunks.append(blended["vt"])
+            stiff_chunks.append(blended["stiffness"].reshape(-1))
+            if "gripper" in blended:
+                grip_chunks.append(blended["gripper"].reshape(-1))
+        else:
+            cmd_chunks.append(ts_cmd[:exec_h])
+            vt_chunks.append(ts_vt[:exec_h])
+            stiff_chunks.append(ts_stiff[:exec_h])
+            if ts_grip is not None:
+                grip_chunks.append(ts_grip[:exec_h])
 
         chunk_times = t0 + action_timesteps_s[:exec_h]
         time_chunks.append(chunk_times)
+        action_offsets_s = action_timesteps_s[:exec_h].astype(np.float64)
         if exec_h > 0:
             # Next chunk starts after the last executed sparse step interval.
             dt = (
@@ -436,6 +515,46 @@ def rollout_episode_open_loop(
                 else float(action_timesteps_s[1] - action_timesteps_s[0])
             )
             t0 = float(chunk_times[-1] + dt)
+
+        open_loop_end_idx = absolute_step + exec_h
+        query_records.append(
+            {
+                "query_idx": int(query_idx),
+                "episode_id": int(query_info["epi_id"]),
+                "global_sample_idx": int(global_idx),
+                "rgb_id": int(query_info["rgb_id"]),
+                "expert_pose_index": int(query_info["expert_pose_index"]),
+                "expert_robot_time_s": float(query_info["expert_robot_time_s"]),
+                "rgb_query_time_s": float(query_info["rgb_query_time_s"]),
+                "base_pose7": query_info["base_pose7"],
+                "open_loop_start_idx": int(open_loop_start_idx),
+                "open_loop_end_idx": int(open_loop_end_idx),
+                "exec_horizon": int(exec_h),
+                "action_offsets_s": action_offsets_s.tolist(),
+                "open_loop_times_s": np.asarray(chunk_times, dtype=np.float64).tolist(),
+                # Raw policy outputs (pre-ensemble): relative action + decoded world poses.
+                "raw_action": np.asarray(raw_action[:exec_h], dtype=np.float64).tolist(),
+                "raw_action_full_horizon": np.asarray(
+                    raw_action, dtype=np.float64
+                ).tolist(),
+                "policy_pose_command_raw": np.asarray(
+                    ts_cmd[:exec_h], dtype=np.float64
+                ).tolist(),
+                "policy_pose_virtual_target_raw": np.asarray(
+                    ts_vt[:exec_h], dtype=np.float64
+                ).tolist(),
+                "policy_pose_command_raw_full_horizon": np.asarray(
+                    ts_cmd, dtype=np.float64
+                ).tolist(),
+                "policy_pose_virtual_target_raw_full_horizon": np.asarray(
+                    ts_vt, dtype=np.float64
+                ).tolist(),
+                "policy_stiffness_raw": np.asarray(
+                    ts_stiff[:exec_h], dtype=np.float64
+                ).reshape(-1).tolist(),
+            }
+        )
+        query_idx += 1
 
         gt_sparse = np.asarray(action_sample["sparse"], dtype=np.float64)
         pred_sparse = np.asarray(raw_action, dtype=np.float64)
@@ -449,18 +568,28 @@ def rollout_episode_open_loop(
             for key, value in field_errs.items():
                 field_metric_lists[key].append(value)
 
+        absolute_step += exec_h
         pos += sampler_stride
 
     if not cmd_chunks:
         raise RuntimeError("No actions generated for episode (empty sampler entries).")
 
     episode_data: Dict[str, np.ndarray] = {
+        # Playback / live-matched stream (may be temporally ensembled).
         "ts_pose_command_0": np.concatenate(cmd_chunks, axis=0).astype(np.float64),
         "ts_pose_virtual_target_0": np.concatenate(vt_chunks, axis=0).astype(np.float64),
         "stiffness_0": np.concatenate(stiff_chunks, axis=0).astype(np.float64),
         "robot_time_stamps_0": np.concatenate(time_chunks, axis=0)
         .astype(np.float64)
         .reshape(-1, 1),
+        # Raw policy decode (never ensembled) — preferred for open-loop vs expert plots.
+        "ts_pose_command_raw_0": np.concatenate(raw_cmd_chunks, axis=0).astype(
+            np.float64
+        ),
+        "ts_pose_virtual_target_raw_0": np.concatenate(raw_vt_chunks, axis=0).astype(
+            np.float64
+        ),
+        "stiffness_raw_0": np.concatenate(raw_stiff_chunks, axis=0).astype(np.float64),
     }
     if grip_chunks:
         episode_data["gripper_0"] = np.concatenate(grip_chunks, axis=0).astype(
@@ -477,7 +606,7 @@ def rollout_episode_open_loop(
         "action_mse_mean": field_means.get("action_mse", float("nan")),
         **{k: v for k, v in field_means.items() if k != "action_mse"},
     }
-    return episode_data, metrics
+    return episode_data, metrics, query_records
 
 
 def write_episode_to_zarr(
@@ -560,6 +689,25 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--raw_time_step_s", default=0.0167, type=float)
     parser.add_argument(
+        "--enable_ensemble_chunking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Temporally ensemble overlapping full-horizon predictions before "
+            "keeping the executed slice (default: on). Use "
+            "--no-enable_ensemble_chunking for the legacy hard-cut export."
+        ),
+    )
+    parser.add_argument(
+        "--ensemble_decay_m",
+        default=0.0,
+        type=float,
+        help=(
+            "Exponential decay for per-horizon-position ensemble weights "
+            "(w[i]=exp(-m*i)). 0 = uniform averaging across overlapping queries."
+        ),
+    )
+    parser.add_argument(
         "--dry_run_export",
         action="store_true",
         help="Validate export without writing zarr.",
@@ -586,6 +734,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default="",
         type=str,
         help="Optional JSON path for per-episode metrics (default: next to output zarr).",
+    )
+    parser.add_argument(
+        "--queries_path",
+        default="",
+        type=str,
+        help=(
+            "Optional JSON path for per-query alignment metadata "
+            "(default: next to output zarr as policy_open_loop_val_queries.json)."
+        ),
     )
     return parser.parse_args(argv)
 
@@ -634,7 +791,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     print(
         f"[export] MPC sparse_execution_horizon={args.sparse_execution_horizon}, "
-        f"sampler_stride={sampler_stride}"
+        f"sampler_stride={sampler_stride}, "
+        f"enable_ensemble_chunking={args.enable_ensemble_chunking}, "
+        f"ensemble_decay_m={args.ensemble_decay_m}"
     )
 
     grouped = group_sampler_indices_by_episode(val_dataset.sampler.indices)
@@ -644,6 +803,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     requested = set(args.episodes) if args.episodes else None
     exported_episode_names: List[str] = []
     all_metrics: Dict[str, Dict[str, float]] = {}
+    all_queries: Dict[str, List[Dict[str, Any]]] = {}
 
     for epi_id in sorted(grouped.keys()):
         source_name = f"episode_{epi_id}"
@@ -657,7 +817,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         out_name = f"{source_name}_policy"
         print(f"[export] Rolling out {source_name} -> {out_name}")
-        episode_data, metrics = rollout_episode_open_loop(
+        episode_data, metrics, query_records = rollout_episode_open_loop(
             policy=policy,
             val_dataset=val_dataset,
             episode_sample_entries=grouped[epi_id],
@@ -667,8 +827,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             sampler_stride=sampler_stride,
             raw_time_step_s=args.raw_time_step_s,
             device=device,
+            enable_ensemble_chunking=bool(args.enable_ensemble_chunking),
+            ensemble_decay_m=float(args.ensemble_decay_m),
         )
         all_metrics[out_name] = metrics
+        all_queries[out_name] = query_records
         print(
             f"[export] {out_name}: steps={int(metrics['num_steps'])}, "
             f"queries={int(metrics['num_queries'])}, "
@@ -695,6 +858,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             os.path.dirname(output_path.rstrip("/")),
             "policy_open_loop_val_metrics.json",
         )
+    queries_path = args.queries_path
+    if not queries_path:
+        queries_path = os.path.join(
+            os.path.dirname(output_path.rstrip("/")),
+            "policy_open_loop_val_queries.json",
+        )
     if not args.dry_run_export:
         with open(metrics_path, "w") as f:
             json.dump(
@@ -707,12 +876,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "val_episodes": val_episode_names,
                     "sparse_execution_horizon": args.sparse_execution_horizon,
                     "sampler_stride": sampler_stride,
+                    "enable_ensemble_chunking": bool(args.enable_ensemble_chunking),
+                    "ensemble_decay_m": float(args.ensemble_decay_m),
+                    "raw_time_step_s": float(args.raw_time_step_s),
+                    "queries_path": queries_path,
                     "episodes": all_metrics,
                 },
                 f,
                 indent=2,
             )
+        with open(queries_path, "w") as f:
+            json.dump(
+                {
+                    "checkpoint": ckpt_path,
+                    "dataset_path": dataset_path,
+                    "output_path": output_path,
+                    "sparse_execution_horizon": args.sparse_execution_horizon,
+                    "sampler_stride": sampler_stride,
+                    "raw_time_step_s": float(args.raw_time_step_s),
+                    "enable_ensemble_chunking": bool(args.enable_ensemble_chunking),
+                    "ensemble_decay_m": float(args.ensemble_decay_m),
+                    "episodes": all_queries,
+                },
+                f,
+                indent=2,
+            )
         print(f"[export] Wrote metrics: {metrics_path}")
+        print(f"[export] Wrote query metadata: {queries_path}")
         print(f"[export] Wrote zarr: {output_path}")
     else:
         print("[export] dry_run_export complete (no zarr/metrics written).")

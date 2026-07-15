@@ -71,6 +71,17 @@ def test_compute_stiffness_matrices_has_expected_shape_and_diagonal():
     assert np.isclose(step0[3, 3], 100.0, atol=1e-6)
 
 
+def test_effective_commanded_stiffness_respects_override():
+    dataset_k = np.array([3000.0, 200.0, 500.0])
+    assert np.allclose(
+        MODULE.effective_commanded_stiffness(dataset_k, -1.0), dataset_k
+    )
+    assert np.allclose(
+        MODULE.effective_commanded_stiffness(dataset_k, 200.0),
+        np.full(3, 200.0),
+    )
+
+
 def test_compute_replay_timestamps_applies_slowdown():
     timestamps = MODULE.compute_replay_timestamps_s(
         count=4, raw_time_step_s=0.02, slow_down_factor=2.0

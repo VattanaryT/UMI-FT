@@ -65,6 +65,7 @@ depth_clip = 0.5
 
 apply_mask = False
 clip_depth = True
+zero_depth = False  # fully zero depth (ablation; overrides clip_depth)
 convert_BGR_to_RGB = False
 flag_mute_gripper = False
 flag_mute_wrench = False
@@ -195,7 +196,10 @@ def process_episode(ep, ep_data, id_list):
 
             ep_data["ultrawide_0"] = images
 
-        if clip_depth:
+        if zero_depth:
+            depth_images = np.array(ep_data["depth_0"])
+            ep_data["depth_0"] = np.zeros_like(depth_images)
+        elif clip_depth:
             depth_images = np.array(ep_data["depth_0"])
             depth_images_clipped = np.clip(depth_images, a_min=0.0, a_max=depth_clip)
             ep_data["depth_0"] = depth_images_clipped

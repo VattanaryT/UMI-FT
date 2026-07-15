@@ -13,6 +13,7 @@ import zarr
 from PyriteConfig.tasks.umift.umift_type_conversions import raw_to_obs_inference
 from PyriteUtility.common import GracefulKiller
 from PyriteUtility.planning_control.mpc import ModelPredictiveController
+from PyriteUtility.planning_control.temporal_ensemble import PoseChunkEnsembler
 from PyriteUtility.plotting.matplotlib_helpers import set_axes_equal
 from PyriteUtility.pytorch_utils.model_io import load_policy
 from PyriteUtility.spatial_math import spatial_utilities as su
@@ -32,6 +33,34 @@ def flush_matplotlib_figure(fig, pause_s: float = 0.1) -> None:
     fig.canvas.draw()
     fig.canvas.flush_events()
     plt.pause(pause_s)
+
+
+def _stiffness_6x6n_to_per_step(stiffness_6x6n: np.ndarray) -> np.ndarray:
+    """Convert (6, 6*N) packed stiffness to (N, 6, 6)."""
+    n = stiffness_6x6n.shape[1] // 6
+    return stiffness_6x6n.reshape(6, n, 6).transpose(1, 0, 2).copy()
+
+
+def _stiffness_per_step_to_6x6n(stiffness_per_step: np.ndarray) -> np.ndarray:
+    """Convert (N, 6, 6) stiffness back to (6, 6*N)."""
+    n = stiffness_per_step.shape[0]
+    return stiffness_per_step.transpose(1, 0, 2).reshape(6, 6 * n).copy()
+
+
+def make_action_chunk_ensemblers(
+    id_list: list,
+    decay_m: float = 0.0,
+) -> dict:
+    """One PoseChunkEnsembler per robot for live MPC temporal ensembling."""
+    return {
+        rid: PoseChunkEnsembler(
+            pose_keys=("pose7", "nominal_pose7"),
+            linear_keys=("stiffness", "eoat"),
+            weight_mode="exp",
+            decay_m=decay_m,
+        )
+        for rid in id_list
+    }
 
 
 if "PYRITE_CHECKPOINT_FOLDERS" not in os.environ:
@@ -130,8 +159,12 @@ def main():
     control_para = {
         # D405 @ 15 Hz for layup stack; iPhone/GoPro legacy path uses 0.0167 (~60 Hz).
         "raw_time_step_s": 1.0 / 15.0,
-        "slow_down_factor": 5,  # slow down policy execution by this factor
+        "slow_down_factor": 2,  # slow down policy execution by this factor
         "sparse_execution_horizon": 4, # 
+        # Zero-added-latency temporal ensembling of overlapping action chunks.
+        # Lower sparse_execution_horizon with this on increases overlap/smoothing.
+        "enable_ensemble_chunking": True,
+        "ensemble_decay_m": 0.0,  # 0 = uniform; >0 trusts near-term steps more (exp)
         "max_duration_s": 3500,
         "gripper_action_scale": 1000,
         "use_audio": False,
@@ -152,7 +185,7 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        "ckpt_path": "/2026.07.11_16.32.44_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI/checkpoints/epoch=0270-train_loss=0.019.ckpt",
+        "ckpt_path": "/2026.07.14_18.53.32_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI/checkpoints/epoch=0280-train_loss=0.022.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
@@ -529,12 +562,31 @@ def main():
             log.attrs["sparse_execution_horizon"] = int(
                 control_para["sparse_execution_horizon"]
             )
+            log.attrs["enable_ensemble_chunking"] = bool(
+                control_para.get("enable_ensemble_chunking", False)
+            )
+            log.attrs["ensemble_decay_m"] = float(
+                control_para.get("ensemble_decay_m", 0.0)
+            )
             log.attrs["episode_id"] = int(episode_id)
             log.attrs["episode_data_folder"] = env.get_episode_folder()
             log.attrs["ckpt_path"] = pipeline_para["ckpt_path"]
             log.attrs["hardware_config_path"] = pipeline_para["hardware_config_path"]
             log.attrs["log_policy_vision"] = bool(control_para["log_policy_vision"])
             printOrNot(vbs_h1, "Control log:", episode_log_path)
+
+        # Fresh temporal ensemblers for each episode (zero-added-latency blending).
+        action_ensemblers = None
+        if control_para.get("enable_ensemble_chunking", False):
+            action_ensemblers = make_action_chunk_ensemblers(
+                id_list=id_list,
+                decay_m=float(control_para.get("ensemble_decay_m", 0.0)),
+            )
+            printOrNot(
+                vbs_h1,
+                "Ensemble action chunking ENABLED "
+                f"(decay_m={control_para.get('ensemble_decay_m', 0.0)})",
+            )
 
         episode_initial_time_s = env.current_hardware_time_s
         killer = GracefulKiller()
@@ -820,12 +872,49 @@ def main():
 
                 input("Press Enter to start executing the plotted actions.")
 
+            # Blend overlapping chunk predictions (or hard-cut) down to execution horizon.
+            exec_h = int(control_para["sparse_execution_horizon"])
+            if action_ensemblers is not None:
+                start_step = horizon_count * exec_h
+                for id in id_list:
+                    fields = {
+                        "pose7": outputs_ts_targets[id],
+                        "nominal_pose7": outputs_ts_nominal_targets[id],
+                        "stiffness": _stiffness_6x6n_to_per_step(
+                            outputs_ts_stiffnesses[id]
+                        ),
+                        "eoat": (
+                            outputs_eoat[id] if outputs_eoat is not None else None
+                        ),
+                    }
+                    action_ensemblers[id].push(start_step=start_step, fields=fields)
+                    blended = action_ensemblers[id].pop(exec_h)
+                    outputs_ts_targets[id] = blended["pose7"]
+                    outputs_ts_nominal_targets[id] = blended["nominal_pose7"]
+                    outputs_ts_stiffnesses[id] = _stiffness_per_step_to_6x6n(
+                        blended["stiffness"]
+                    )
+                    if outputs_eoat is not None and "eoat" in blended:
+                        outputs_eoat[id] = blended["eoat"]
+            else:
+                for id in id_list:
+                    outputs_ts_targets[id] = outputs_ts_targets[id][:exec_h, :]
+                    outputs_ts_nominal_targets[id] = outputs_ts_nominal_targets[id][
+                        :exec_h, :
+                    ]
+                    outputs_ts_stiffnesses[id] = outputs_ts_stiffnesses[id][
+                        :, : 6 * exec_h
+                    ]
+                    if outputs_eoat is not None:
+                        outputs_eoat[id] = outputs_eoat[id][:exec_h, :]
+            timestamps = timestamps[:exec_h]
+
             if control_para["enable_control_log"] and log is not None:
                 log_horizon(
                     log=log,
                     horizon_count=horizon_count,
                     id_list=id_list,
-                    exe_horizon=control_para["sparse_execution_horizon"],
+                    exe_horizon=exec_h,
                     outputs_ts_targets=outputs_ts_targets,
                     outputs_ts_nominal_targets=outputs_ts_nominal_targets,
                     outputs_ts_stiffnesses=outputs_ts_stiffnesses,
@@ -839,19 +928,6 @@ def main():
                     log_policy_vision=control_para["log_policy_vision"],
                 )
 
-            # cut the action and only keep the execution horizon
-            for id in id_list:
-                outputs_ts_targets[id] = outputs_ts_targets[id][
-                    : control_para["sparse_execution_horizon"], :
-                ]
-                outputs_ts_stiffnesses[id] = outputs_ts_stiffnesses[id][
-                    :, : 6 * control_para["sparse_execution_horizon"]
-                ]
-                if outputs_eoat is not None:
-                    outputs_eoat[id] = outputs_eoat[id][
-                        : control_para["sparse_execution_horizon"], :
-                    ]
-            timestamps = timestamps[: control_para["sparse_execution_horizon"]]
             action_start_time_s = env.current_hardware_time_s
 
             if len(id_list) == 1:

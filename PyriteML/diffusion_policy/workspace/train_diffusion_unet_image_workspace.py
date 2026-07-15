@@ -91,6 +91,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         accelerator = Accelerator(log_with="wandb")
         wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
         wandb_cfg.pop("project")
+        wandb_cfg.pop("log_every", None)  # train-loop knob, not a wandb.init arg
         accelerator.init_trackers(
             project_name=cfg.logging.project,
             config=OmegaConf.to_container(cfg, resolve=True),
@@ -354,33 +355,35 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         if cfg.training.use_ema:
                             ema.step(accelerator.unwrap_model(self.model))
 
-                        # logging
-                        model_unwrapped = accelerator.unwrap_model(self.model)
-                        raw_loss_cpu = raw_loss.item()
-                        sparse_loss, smoothness_loss, dense_loss = (
-                            model_unwrapped.get_loss_components()
-                        )
-                        tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
-                        train_losses.append(raw_loss_cpu)
-                        step_log = {
-                            "sparse_loss": sparse_loss,
-                            "smoothness_loss": smoothness_loss,
-                            "global_step": self.global_step,
-                            "epoch": self.epoch,
-                            "lr": lr_scheduler.get_last_lr()[0],
-                        }
-                        if self.flag_has_dense:
-                            step_log["dense_loss"] = dense_loss
-                        if cfg.training.log_gradient_norm:
-                            step_log["sparse_gradient_norm"] = sparse_norm
+                        if (self.global_step % cfg.logging.log_every) == 0:
+                            # logging
+                            model_unwrapped = accelerator.unwrap_model(self.model)
+                            raw_loss_cpu = raw_loss.item()
+                            sparse_loss, smoothness_loss, dense_loss = (
+                                model_unwrapped.get_loss_components()
+                            )
+                            tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
+                            train_losses.append(raw_loss_cpu)
+                            step_log = {
+                                "sparse_loss": sparse_loss,
+                                "smoothness_loss": smoothness_loss,
+                                "global_step": self.global_step,
+                                "epoch": self.epoch,
+                                "lr": lr_scheduler.get_last_lr()[0],
+                            }
                             if self.flag_has_dense:
-                                step_log["dense_gradient_norm"] = dense_norm
-
-                        is_last_batch = batch_idx == (len(train_dataloader) - 1)
-                        if not is_last_batch:
+                                step_log["dense_loss"] = dense_loss
+                            if cfg.training.log_gradient_norm:
+                                step_log["sparse_gradient_norm"] = sparse_norm
+                                if self.flag_has_dense:
+                                    step_log["dense_gradient_norm"] = dense_norm
+                            
                             # log of last step is combined with validation and rollout
                             accelerator.log(step_log, step=self.global_step)
                             json_logger.log(step_log)
+
+                        is_last_batch = batch_idx == (len(train_dataloader) - 1)
+                        if not is_last_batch:
                             self.global_step += 1
 
                         if (cfg.training.max_train_steps is not None) and batch_idx >= (

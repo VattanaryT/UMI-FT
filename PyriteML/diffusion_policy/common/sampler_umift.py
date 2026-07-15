@@ -7,6 +7,44 @@ from PyriteUtility.data_pipeline.indexing import (
 )
 
 
+def sparse_action_indices_from_rgb_timestamps(
+    action_times: np.ndarray,
+    rgb_times: np.ndarray,
+    rgb_id: int,
+    action_horizon: int,
+    rgb_frame_stride: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Select future action labels on the RGB-frame time grid.
+
+    ``rgb_frame_stride`` is a number of RGB frames, not an index stride into the
+    higher-rate robot/action array. For target frames beyond the end of the RGB
+    recording, use the episode's median RGB period; callers retain the existing
+    action-padding behavior after the last available action label.
+    """
+    action_times = np.asarray(action_times, dtype=np.float64).reshape(-1)
+    rgb_times = np.asarray(rgb_times, dtype=np.float64).reshape(-1)
+    if len(action_times) == 0 or len(rgb_times) < 2:
+        raise ValueError("Action and RGB timestamps must contain at least one and two entries.")
+    if not 0 <= rgb_id < len(rgb_times):
+        raise IndexError(f"rgb_id {rgb_id} is outside [0, {len(rgb_times) - 1}].")
+    if action_horizon < 1 or rgb_frame_stride < 1:
+        raise ValueError("action_horizon and rgb_frame_stride must be positive.")
+
+    rgb_dt_s = float(np.median(np.diff(rgb_times)))
+    if not np.isfinite(rgb_dt_s) or rgb_dt_s <= 0:
+        raise ValueError("RGB timestamps must be strictly increasing.")
+
+    frame_offsets = np.arange(action_horizon) * rgb_frame_stride
+    target_rgb_ids = rgb_id + frame_offsets
+    target_times = rgb_times[rgb_id] + frame_offsets * rgb_dt_s
+    in_recording = target_rgb_ids < len(rgb_times)
+    target_times[in_recording] = rgb_times[target_rgb_ids[in_recording]]
+
+    action_indices = np.searchsorted(action_times, target_times)
+    valid = action_indices < len(action_times)
+    return action_indices[valid], target_times[valid]
+
+
 def get_val_mask(n_episodes, val_ratio, seed=0):
     val_mask = np.zeros(n_episodes, dtype=bool)
     if val_ratio <= 0:
@@ -581,16 +619,19 @@ class SequenceSamplerUmiFT:
         if "sparse" in self.shape_meta["sample"]["action"]:
             input_arr = data_episode["action"]
             action_horizon = self.shape_meta["sample"]["action"]["sparse"]["horizon"]
-            action_down_sample_steps = self.shape_meta["sample"]["action"]["sparse"][
+            action_rgb_frame_stride = self.shape_meta["sample"]["action"]["sparse"][
                 "down_sample_steps"
             ]
-            slice_end = min(
-                len(input_arr) - 1,
-                action_id + (action_horizon - 1) * action_down_sample_steps + 1,
+            action_times = np.squeeze(data_episode["action_time_stamps"])
+            rgb_times = np.squeeze(data_episode["obs"]["rgb_time_stamps_0"])
+            action_indices, target_times = sparse_action_indices_from_rgb_timestamps(
+                action_times=action_times,
+                rgb_times=rgb_times,
+                rgb_id=rgb_id,
+                action_horizon=action_horizon,
+                rgb_frame_stride=action_rgb_frame_stride,
             )
-            sparse_action_unprocessed = input_arr[
-                action_id:slice_end:action_down_sample_steps
-            ].astype(np.float32)
+            sparse_action_unprocessed = input_arr[action_indices].astype(np.float32)
             # if sparse_action_unprocessed.shape[0] != 16:
             #     import pdb; pdb.set_trace()
 
@@ -599,7 +640,10 @@ class SequenceSamplerUmiFT:
                 if sparse_action_unprocessed.shape[0] != action_horizon:
                     print(sparse_action_unprocessed.shape[0], action_horizon)
                     print(
-                        action_id, slice_end, action_horizon, action_down_sample_steps
+                        action_id,
+                        action_indices[-1] if len(action_indices) else None,
+                        action_horizon,
+                        action_rgb_frame_stride,
                     )
                     # sparse_action_unprocessed = sparse_action_unprocessed[
                     #     :action_horizon
