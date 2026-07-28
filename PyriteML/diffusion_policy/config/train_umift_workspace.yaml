@@ -126,7 +126,7 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 128 # 128 seems to work fine.
+  batch_size: 32 # 128 seems to work fine.
   num_workers: 32 # debug 32
   prefetch_factor: 8
   shuffle: True

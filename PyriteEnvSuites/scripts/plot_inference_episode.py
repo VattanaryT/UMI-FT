@@ -10,16 +10,20 @@ Usage:
   export PYRITE_CONTROL_LOG_FOLDERS=$HOME/data/control_log
   python plot_inference_episode.py --log_subdir episode_1783810767
   python plot_inference_episode.py --log_path /path/to/episode_log --html /tmp/view.html
+
+Also writes a side-by-side RGB+depth MP4 at 15 FPS next to the HTML output.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import re
 from typing import Dict, List, Optional, Tuple
 
+import cv2
 import numpy as np
 import plotly.graph_objects as go
 import yaml
@@ -249,9 +253,177 @@ def tensor_to_image(arr: np.ndarray) -> np.ndarray:
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
+def rgb_buffer_frame_to_image(frame: np.ndarray) -> np.ndarray:
+    """Convert one RGB buffer frame (HWC uint8 or CHW float) to display RGB."""
+    frame = np.asarray(frame)
+    if frame.ndim == 3 and frame.shape[-1] == 3 and frame.dtype == np.uint8:
+        return frame
+    return tensor_to_image(frame)
+
+
+def depth_buffer_frame_to_image(frame: np.ndarray, depth_clip: float = 0.5) -> np.ndarray:
+    """Convert one depth buffer frame to grayscale RGB uint8."""
+    depth = np.asarray(frame, dtype=np.float32)
+    if depth.ndim == 3 and depth.shape[0] in (1, 3):
+        return tensor_to_image(depth)
+    if depth.ndim == 3 and depth.shape[-1] == 3:
+        depth = depth[..., 0]
+    depth_norm = np.clip(depth / depth_clip, 0.0, 1.0)
+    gray = (depth_norm * 255.0).astype(np.uint8)
+    return np.repeat(gray[:, :, np.newaxis], 3, axis=2)
+
+
+def _dedupe_vision_timeline(
+    images: List[np.ndarray], times_s: List[float], eps: float = 1e-4
+) -> Tuple[List[np.ndarray], np.ndarray]:
+    if not images:
+        return [], np.zeros(0, dtype=np.float64)
+    order = np.argsort(times_s, kind="stable")
+    out_images: List[np.ndarray] = []
+    out_times: List[float] = []
+    for idx in order:
+        t = float(times_s[idx])
+        if out_times and abs(t - out_times[-1]) < eps:
+            out_images[-1] = images[idx]
+            out_times[-1] = t
+            continue
+        out_images.append(images[idx])
+        out_times.append(t)
+    return out_images, np.asarray(out_times, dtype=np.float64)
+
+
+def _append_horizon_policy_vision_fallback(
+    obs_policy,
+    horizon_time_s: float,
+    episode_action_t0: float,
+    rgb_images: List[np.ndarray],
+    rgb_times: List[float],
+    depth_images: List[np.ndarray],
+    depth_times: List[float],
+    depth_clip: float,
+) -> None:
+    t_rel = float(horizon_time_s - episode_action_t0)
+    if "rgb_0" in obs_policy:
+        arr = np.asarray(obs_policy["rgb_0"][:])
+        rgb_images.append(tensor_to_image(arr))
+        rgb_times.append(t_rel)
+    elif "ultrawide_0" in obs_policy:
+        arr = np.asarray(obs_policy["ultrawide_0"][:])
+        rgb_images.append(tensor_to_image(arr))
+        rgb_times.append(t_rel)
+    if "depth_0" in obs_policy:
+        arr = np.asarray(obs_policy["depth_0"][:])
+        depth_images.append(depth_buffer_frame_to_image(arr[-1] if arr.ndim == 4 else arr, depth_clip))
+        depth_times.append(t_rel)
+
+
+def _append_horizon_raw_vision(
+    obs_inference,
+    robot_id: int,
+    episode_action_t0: float,
+    rgb_images: List[np.ndarray],
+    rgb_times: List[float],
+    depth_images: List[np.ndarray],
+    depth_times: List[float],
+    depth_clip: float,
+) -> None:
+    rgb_key = f"rgb_{robot_id}"
+    ultrawide_key = f"ultrawide_{robot_id}"
+    depth_key = f"depth_{robot_id}"
+
+    image_key = (
+        rgb_key
+        if rgb_key in obs_inference
+        else ultrawide_key
+        if ultrawide_key in obs_inference
+        else None
+    )
+    if image_key is not None:
+        frames = np.asarray(obs_inference[image_key][:])
+        ts_key = (
+            f"rgb_time_stamps_{robot_id}"
+            if image_key == rgb_key
+            else f"ultrawide_time_stamps_{robot_id}"
+        )
+        if ts_key in obs_inference:
+            stamps = np.asarray(obs_inference[ts_key][:], dtype=np.float64).reshape(-1)
+            n = min(frames.shape[0], stamps.size)
+            for i in range(n):
+                rgb_images.append(rgb_buffer_frame_to_image(frames[i]))
+                rgb_times.append(float(stamps[i] - episode_action_t0))
+
+    if depth_key in obs_inference:
+        frames = np.asarray(obs_inference[depth_key][:])
+        ts_key = f"depth_time_stamps_{robot_id}"
+        if ts_key in obs_inference:
+            stamps = np.asarray(obs_inference[ts_key][:], dtype=np.float64).reshape(-1)
+            n = min(frames.shape[0], stamps.size)
+            for i in range(n):
+                depth_images.append(depth_buffer_frame_to_image(frames[i], depth_clip))
+                depth_times.append(float(stamps[i] - episode_action_t0))
+
+
+def collect_vision_timeline(
+    log,
+    horizon_keys: List[str],
+    robot_id: int,
+    max_horizons: int,
+    episode_action_t0: float,
+    depth_clip: float = 0.5,
+) -> Tuple[List[np.ndarray], np.ndarray, List[np.ndarray], np.ndarray]:
+    """Flatten deduped RGB/depth frames across horizons with episode-relative times."""
+    rgb_images: List[np.ndarray] = []
+    rgb_times: List[float] = []
+    depth_images: List[np.ndarray] = []
+    depth_times: List[float] = []
+
+    for horizon_key in horizon_keys[:max_horizons]:
+        horizon = log[horizon_key]
+        horizon_time_s = float(horizon["action"]["timestamps_s"][0])
+        used_raw = False
+        before_rgb = len(rgb_images)
+        before_depth = len(depth_images)
+        if "obs_inference" in horizon:
+            oi = horizon["obs_inference"]
+            _append_horizon_raw_vision(
+                oi,
+                robot_id,
+                episode_action_t0,
+                rgb_images,
+                rgb_times,
+                depth_images,
+                depth_times,
+                depth_clip,
+            )
+            used_raw = (len(rgb_images) > before_rgb) or (len(depth_images) > before_depth)
+        if not used_raw and "obs_policy" in horizon:
+            _append_horizon_policy_vision_fallback(
+                horizon["obs_policy"],
+                horizon_time_s,
+                episode_action_t0,
+                rgb_images,
+                rgb_times,
+                depth_images,
+                depth_times,
+                depth_clip,
+            )
+
+    rgb_images, rgb_times = _dedupe_vision_timeline(rgb_images, rgb_times)
+    depth_images, depth_times = _dedupe_vision_timeline(depth_images, depth_times)
+    # Camera frame timestamps can use a different clock domain (for example,
+    # Unix time) than action timestamps. The viewer/video only need elapsed
+    # episode time, so rebase each vision stream to its first available frame.
+    if rgb_times.size:
+        rgb_times = rgb_times - rgb_times[0]
+    if depth_times.size:
+        depth_times = depth_times - depth_times[0]
+    return rgb_images, rgb_times, depth_images, depth_times
+
+
 def collect_vision_frames(
     log, horizon_keys: List[str], max_horizons: int
 ) -> Tuple[List[Optional[np.ndarray]], List[Optional[np.ndarray]]]:
+    """Backward-compatible one-image-per-horizon collector (last sparse policy frame)."""
     rgb_frames: List[Optional[np.ndarray]] = []
     depth_frames: List[Optional[np.ndarray]] = []
 
@@ -350,10 +522,192 @@ def horizon_index_for_time(t: float, horizon_times: np.ndarray) -> int:
     return int(valid[-1])
 
 
+def vision_index_for_time(t: float, vision_times: np.ndarray) -> int:
+    """Latest vision frame with timestamp <= t."""
+    return horizon_index_for_time(t, vision_times)
+
+
+DEFAULT_VISION_VIDEO_FPS = 15.0
+
+
+def episode_video_duration_s(
+    rgb_times: np.ndarray, depth_times: np.ndarray
+) -> float:
+    ends = [float(arr[-1]) for arr in (rgb_times, depth_times) if arr.size > 0]
+    return max(ends) if ends else 0.0
+
+
+def _to_bgr_uint8(image: np.ndarray) -> np.ndarray:
+    """Convert RGB/RGBA uint8 or float image to BGR uint8 for OpenCV."""
+    img = np.asarray(image)
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    if img.ndim == 2:
+        img = np.repeat(img[:, :, np.newaxis], 3, axis=2)
+    if img.shape[-1] == 4:
+        img = img[:, :, :3]
+    return cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+
+def image_to_data_uri(
+    image: np.ndarray,
+    jpeg_quality: int = 60,
+    max_dimension: int = 128,
+) -> str:
+    """Downsample and JPEG-compress an image for a compact Plotly payload."""
+    bgr = _to_bgr_uint8(image)
+    height, width = bgr.shape[:2]
+    scale = min(1.0, float(max_dimension) / max(height, width))
+    if scale < 1.0:
+        bgr = cv2.resize(
+            bgr,
+            (max(1, int(round(width * scale))), max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+    ok, encoded = cv2.imencode(
+        ".jpg",
+        bgr,
+        [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)],
+    )
+    if not ok:
+        raise RuntimeError("Failed to JPEG-encode Plotly image")
+    payload = base64.b64encode(encoded).decode("ascii")
+    return f"data:image/jpeg;base64,{payload}"
+
+
+def composite_rgb_depth_side_by_side(
+    rgb_image: np.ndarray, depth_image: np.ndarray
+) -> np.ndarray:
+    """Stack RGB (left) and depth (right) with matched height."""
+    rgb_bgr = _to_bgr_uint8(rgb_image)
+    depth_bgr = _to_bgr_uint8(depth_image)
+    target_h, target_w = rgb_bgr.shape[:2]
+    if depth_bgr.shape[:2] != (target_h, target_w):
+        depth_bgr = cv2.resize(
+            depth_bgr, (target_w, target_h), interpolation=cv2.INTER_NEAREST
+        )
+    return np.hstack([rgb_bgr, depth_bgr])
+
+
+def build_vision_video_frames(
+    rgb_images: List[np.ndarray],
+    rgb_times: np.ndarray,
+    depth_images: List[np.ndarray],
+    depth_times: np.ndarray,
+    fps: float = DEFAULT_VISION_VIDEO_FPS,
+) -> List[np.ndarray]:
+    """Sample side-by-side frames at fixed fps over the episode vision timeline."""
+    if not rgb_images:
+        raise ValueError("No RGB frames available for video export")
+    duration_s = episode_video_duration_s(rgb_times, depth_times)
+    fps = max(float(fps), 1e-3)
+    n_frames = max(1, int(np.floor(duration_s * fps + 1e-9)) + 1)
+    blank_depth = depth_images[0] if depth_images else np.zeros_like(rgb_images[0])
+
+    frames: List[np.ndarray] = []
+    for i in range(n_frames):
+        t = i / fps
+        rgb_idx = vision_index_for_time(t, rgb_times)
+        if depth_times.size and depth_images:
+            depth_idx = vision_index_for_time(t, depth_times)
+            depth_frame = depth_images[depth_idx]
+        else:
+            depth_frame = blank_depth
+        frames.append(composite_rgb_depth_side_by_side(rgb_images[rgb_idx], depth_frame))
+    return frames
+
+
+def write_mp4_video(path: str, frames: List[np.ndarray], fps: float) -> None:
+    """Write BGR uint8 frames to an MP4 file."""
+    if not frames:
+        raise ValueError("Cannot write video with zero frames")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    height, width = frames[0].shape[:2]
+    writer = cv2.VideoWriter(
+        path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {path}")
+    try:
+        for frame in frames:
+            if frame.shape[:2] != (height, width):
+                frame = cv2.resize(
+                    frame, (width, height), interpolation=cv2.INTER_NEAREST
+                )
+            writer.write(frame)
+    finally:
+        writer.release()
+
+
+def export_episode_vision_video(
+    rgb_images: List[np.ndarray],
+    rgb_times: np.ndarray,
+    depth_images: List[np.ndarray],
+    depth_times: np.ndarray,
+    video_path: str,
+    fps: float = DEFAULT_VISION_VIDEO_FPS,
+) -> str:
+    """Stream sampled frames directly to MP4 without buffering the whole video."""
+    if not rgb_images:
+        raise ValueError("No RGB frames available for video export")
+    fps = max(float(fps), 1e-3)
+    duration_s = episode_video_duration_s(rgb_times, depth_times)
+    n_frames = max(1, int(np.floor(duration_s * fps + 1e-9)) + 1)
+    blank_depth = depth_images[0] if depth_images else np.zeros_like(rgb_images[0])
+    first_depth = (
+        depth_images[vision_index_for_time(0.0, depth_times)]
+        if depth_images and depth_times.size
+        else blank_depth
+    )
+    first = composite_rgb_depth_side_by_side(rgb_images[0], first_depth)
+
+    os.makedirs(os.path.dirname(video_path) or ".", exist_ok=True)
+    height, width = first.shape[:2]
+    writer = cv2.VideoWriter(
+        video_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open video writer for {video_path}")
+    try:
+        for i in range(n_frames):
+            t = i / fps
+            rgb = rgb_images[vision_index_for_time(t, rgb_times)]
+            depth = (
+                depth_images[vision_index_for_time(t, depth_times)]
+                if depth_images and depth_times.size
+                else blank_depth
+            )
+            writer.write(composite_rgb_depth_side_by_side(rgb, depth))
+    finally:
+        writer.release()
+    return video_path
+
+
 def feedback_prefix_len(t: float, feedback_times: np.ndarray) -> int:
     if feedback_times.size == 0:
         return 0
     return int(np.searchsorted(feedback_times, t, side="right"))
+
+
+def downsample_timed_series(
+    times: np.ndarray,
+    values: np.ndarray,
+    max_points: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Uniformly bound an animated series while retaining its endpoints."""
+    n = min(len(times), len(values))
+    if n == 0:
+        return np.asarray(times)[:0], np.asarray(values)[:0]
+    if n <= max_points:
+        return np.asarray(times)[:n], np.asarray(values)[:n]
+    idx = sample_slider_indices(n, max_points)
+    return np.asarray(times)[idx], np.asarray(values)[idx]
 
 
 def plot_episode(
@@ -361,9 +715,12 @@ def plot_episode(
     robot_id: int = 0,
     save_dir: Optional[str] = None,
     html_path: Optional[str] = None,
+    video_path: Optional[str] = None,
     max_vision_horizons: int = 64,
     max_slider_steps: int = 300,
-    show: bool = True,
+    video_fps: float = DEFAULT_VISION_VIDEO_FPS,
+    save_video: bool = True,
+    show: bool = False,
 ) -> str:
     log = zarr.open(store=zarr.DirectoryStore(path=log_path), mode="r")
     horizon_keys = sorted_horizon_keys(log)
@@ -375,7 +732,16 @@ def plot_episode(
     episode_folder = log.attrs.get("episode_data_folder", "")
     se3_tc = load_pose7_offset_tc(log.attrs.get("hardware_config_path"))
     episode_data = load_robot_episode_json(episode_folder, robot_id, se3_tc=se3_tc)
-    rgb_frames, depth_frames = collect_vision_frames(log, vision_keys, len(vision_keys))
+    episode_action_t0 = float(
+        np.asarray(log[horizon_keys[0]]["action"]["timestamps_s"][:], dtype=np.float64)[0]
+    )
+    rgb_images, rgb_times, depth_images, depth_times = collect_vision_timeline(
+        log,
+        vision_keys,
+        robot_id=robot_id,
+        max_horizons=len(vision_keys),
+        episode_action_t0=episode_action_t0,
+    )
 
     t_cmd = chained["timestamps_s"]
     nom = chained["nominal"]
@@ -384,12 +750,16 @@ def plot_episode(
     h_times = chained["horizon_times_s"][: len(vision_keys)]
 
     # Fallback blank images if missing
-    sample_rgb = next((im for im in rgb_frames if im is not None), _blank_rgb())
-    sample_depth = next((im for im in depth_frames if im is not None), _blank_rgb())
-    rgb_frames = [im if im is not None else np.zeros_like(sample_rgb) for im in rgb_frames]
-    depth_frames = [
-        im if im is not None else np.zeros_like(sample_depth) for im in depth_frames
-    ]
+    sample_rgb = next((im for im in rgb_images if im is not None), _blank_rgb())
+    sample_depth = next((im for im in depth_images if im is not None), _blank_rgb())
+    if not rgb_images:
+        rgb_images = [sample_rgb]
+        rgb_times = np.asarray([0.0], dtype=np.float64)
+    if not depth_images:
+        depth_images = [sample_depth]
+        depth_times = np.asarray([0.0], dtype=np.float64)
+    rgb_sources = [image_to_data_uri(image) for image in rgb_images]
+    depth_sources = [image_to_data_uri(image) for image in depth_images]
 
     slider_idx = sample_slider_indices(len(t_cmd), max_slider_steps)
     if slider_idx.size == 0:
@@ -397,12 +767,20 @@ def plot_episode(
 
     k0 = int(slider_idx[0])
     t0 = float(t_cmd[k0])
-    h0 = horizon_index_for_time(t0, h_times)
+    v0_rgb = vision_index_for_time(t0, rgb_times)
+    v0_depth = vision_index_for_time(t0, depth_times)
     fb_times = (
         episode_data["time_s"] if episode_data is not None else np.zeros(0, dtype=np.float64)
     )
     fb_pose = episode_data["pose_fb"] if episode_data is not None else None
-    fb0 = feedback_prefix_len(t0, fb_times)
+    if fb_pose is not None:
+        fb_3d_times, fb_3d_pose = downsample_timed_series(
+            fb_times, fb_pose, max_points=1000
+        )
+    else:
+        fb_3d_times = np.zeros(0, dtype=np.float64)
+        fb_3d_pose = None
+    fb0 = feedback_prefix_len(t0, fb_3d_times)
 
     fig = make_subplots(
         rows=6,
@@ -432,8 +810,10 @@ def plot_episode(
     )
 
     # --- Images (left column) ---
-    fig.add_trace(go.Image(z=rgb_frames[h0], name="rgb"), row=1, col=1)
-    fig.add_trace(go.Image(z=depth_frames[h0], name="depth"), row=2, col=1)
+    fig.add_trace(go.Image(source=rgb_sources[v0_rgb], name="rgb"), row=1, col=1)
+    fig.add_trace(
+        go.Image(source=depth_sources[v0_depth], name="depth"), row=2, col=1
+    )
 
     # --- Pose (row 3, full width): full history always visible in 2D ---
     pose_colors = {"x": "#1f77b4", "y": "#ff7f0e", "z": "#2ca02c"}
@@ -607,13 +987,13 @@ def plot_episode(
         row=1,
         col=2,
     )
-    has_feedback_3d = fb_pose is not None
+    has_feedback_3d = fb_3d_pose is not None
     if has_feedback_3d:
         fig.add_trace(
             go.Scatter3d(
-                x=fb_pose[:fb0, 0],
-                y=fb_pose[:fb0, 1],
-                z=fb_pose[:fb0, 2],
+                x=fb_3d_pose[:fb0, 0],
+                y=fb_3d_pose[:fb0, 1],
+                z=fb_3d_pose[:fb0, 2],
                 mode="lines",
                 name="feedback 3d",
                 line=dict(color="royalblue", width=3),
@@ -660,10 +1040,11 @@ def plot_episode(
     for step_i, k in enumerate(slider_idx):
         k = int(k)
         t_i = float(t_cmd[k])
-        h_i = horizon_index_for_time(t_i, h_times)
+        v_rgb = vision_index_for_time(t_i, rgb_times)
+        v_depth = vision_index_for_time(t_i, depth_times)
         frame_data = [
-            go.Image(z=rgb_frames[h_i]),
-            go.Image(z=depth_frames[h_i]),
+            go.Image(source=rgb_sources[v_rgb]),
+            go.Image(source=depth_sources[v_depth]),
             time_marker_scatter(t_i, pose_y0, pose_y1),
             time_marker_scatter(t_i, force_y0, force_y1),
             time_marker_scatter(t_i, stiff_y0, stiff_y1),
@@ -680,12 +1061,12 @@ def plot_episode(
             ),
         ]
         if has_feedback_3d:
-            fb_n = feedback_prefix_len(t_i, fb_times)
+            fb_n = feedback_prefix_len(t_i, fb_3d_times)
             frame_data.append(
                 go.Scatter3d(
-                    x=fb_pose[:fb_n, 0].tolist(),
-                    y=fb_pose[:fb_n, 1].tolist(),
-                    z=fb_pose[:fb_n, 2].tolist(),
+                    x=fb_3d_pose[:fb_n, 0].tolist(),
+                    y=fb_3d_pose[:fb_n, 1].tolist(),
+                    z=fb_3d_pose[:fb_n, 2].tolist(),
                 )
             )
         frames.append(
@@ -841,6 +1222,29 @@ def plot_episode(
 
     fig.write_html(html_path, include_plotlyjs="cdn", auto_open=False)
     print(f"Saved: {html_path}")
+
+    if save_video:
+        if video_path is None:
+            video_path = os.path.splitext(html_path)[0] + "_rgb_depth.mp4"
+        export_episode_vision_video(
+            rgb_images,
+            rgb_times,
+            depth_images,
+            depth_times,
+            video_path=video_path,
+            fps=video_fps,
+        )
+        duration_s = episode_video_duration_s(rgb_times, depth_times)
+        n_video_frames = max(1, int(np.floor(duration_s * video_fps + 1e-9)) + 1)
+        print(
+            f"Saved: {video_path} "
+            f"({n_video_frames} frames @ {video_fps:g} fps, duration={duration_s:.2f}s)"
+        )
+
+    print(
+        f"Vision frames: rgb={len(rgb_images)} depth={len(depth_images)} "
+        f"(horizons loaded={len(vision_keys)})"
+    )
     print(
         f"Slider steps: {len(slider_idx)} "
         f"(action samples={len(t_cmd)}, max_slider_steps={max_slider_steps})"
@@ -879,7 +1283,32 @@ def main():
         default=300,
         help="Max scrubber frames over action timestamps (default: 300)",
     )
-    parser.add_argument("--no_show", action="store_true")
+    parser.add_argument(
+        "--video",
+        default=None,
+        help="Explicit MP4 output path (default: alongside HTML as *_rgb_depth.mp4)",
+    )
+    parser.add_argument(
+        "--video_fps",
+        type=float,
+        default=DEFAULT_VISION_VIDEO_FPS,
+        help="FPS for exported RGB+depth video (default: 15)",
+    )
+    parser.add_argument(
+        "--no_video",
+        action="store_true",
+        help="Skip writing the side-by-side RGB+depth MP4",
+    )
+    parser.add_argument(
+        "--show",
+        action="store_true",
+        help="Open the interactive figure after saving (disabled by default)",
+    )
+    parser.add_argument(
+        "--no_show",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args()
 
     if not args.log_path and not args.log_subdir:
@@ -892,9 +1321,12 @@ def main():
         robot_id=args.robot_id,
         save_dir=args.save_dir,
         html_path=args.html,
+        video_path=args.video,
         max_vision_horizons=args.max_vision_horizons,
         max_slider_steps=args.max_slider_steps,
-        show=not args.no_show,
+        video_fps=args.video_fps,
+        save_video=not args.no_video,
+        show=args.show and not args.no_show,
     )
 
 

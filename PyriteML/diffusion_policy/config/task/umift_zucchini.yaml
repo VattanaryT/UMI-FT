@@ -179,7 +179,7 @@ shape_meta: &shape_meta
 
 task_name: &task_name
 
-dataset_path: /mnt/data/umidata/ft/straight_convex_data_v3/acp_replay_buffer.zarr
+dataset_path: /mnt/data/umidata/ft/stringer_data_v2_full/acp_replay_buffer.zarr
 
 dataset:
   _target_: diffusion_policy.dataset.umift_dataset.UmiFTDataset
@@ -191,3 +191,4 @@ dataset:
   seed: 42
   val_ratio: 0.10
   normalize_wrench: True
+  action_gap_threshold_mult: 5.0

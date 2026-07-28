@@ -2,6 +2,7 @@
 data/
 output/
 plots/
+runs/
 submodules/umi_day*
 
 __pycache__

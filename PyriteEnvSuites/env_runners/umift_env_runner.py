@@ -88,6 +88,40 @@ def resolve_realsense_serial(hardware_config_path: str) -> Optional[str]:
     return cfg.get("realsense_serial")
 
 
+def log_raw_vision_to_obs_inference(obs_inference, obs_raw: dict, robot_id: int) -> None:
+    """Persist all buffered RGB/depth frames and timestamps for one horizon."""
+    rgb_key = f"rgb_{robot_id}"
+    ultrawide_key = f"ultrawide_{robot_id}"
+    depth_key = f"depth_{robot_id}"
+
+    image_key = rgb_key if rgb_key in obs_raw else ultrawide_key if ultrawide_key in obs_raw else None
+    if image_key is not None:
+        frames = np.asarray(obs_raw[image_key])
+        if frames.ndim >= 3 and frames.shape[0] > 0:
+            obs_inference.create_dataset(image_key, data=frames)
+            ts_key = (
+                f"rgb_time_stamps_{robot_id}"
+                if image_key == rgb_key
+                else f"ultrawide_time_stamps_{robot_id}"
+            )
+            if ts_key in obs_raw:
+                obs_inference.create_dataset(
+                    ts_key,
+                    data=np.asarray(obs_raw[ts_key], dtype=np.float64).reshape(-1),
+                )
+
+    if depth_key in obs_raw:
+        depth_frames = np.asarray(obs_raw[depth_key])
+        if depth_frames.ndim >= 3 and depth_frames.shape[0] > 0:
+            obs_inference.create_dataset(depth_key, data=depth_frames)
+            depth_ts_key = f"depth_time_stamps_{robot_id}"
+            if depth_ts_key in obs_raw:
+                obs_inference.create_dataset(
+                    depth_ts_key,
+                    data=np.asarray(obs_raw[depth_ts_key], dtype=np.float64).reshape(-1),
+                )
+
+
 def log_horizon(
     log,
     horizon_count: int,
@@ -153,14 +187,16 @@ def log_horizon(
             f"ts_pose_fb_{robot_id}",
             data=obs_raw[f"ts_pose_fb_{robot_id}"][-1],
         )
+        if log_policy_vision:
+            log_raw_vision_to_obs_inference(obs_inference, obs_raw, robot_id)
 
 
 def main():
     control_para = {
         # D405 @ 15 Hz for layup stack; iPhone/GoPro legacy path uses 0.0167 (~60 Hz).
         "raw_time_step_s": 1.0 / 15.0,
-        "slow_down_factor": 2,  # slow down policy execution by this factor
-        "sparse_execution_horizon": 4, # 
+        "slow_down_factor": 4,  # slow down policy execution by this factor
+        "sparse_execution_horizon": 2, # first step is at t=0, so this should be >1
         # Zero-added-latency temporal ensembling of overlapping action chunks.
         # Lower sparse_execution_horizon with this on increases overlap/smoothing.
         "enable_ensemble_chunking": True,
@@ -479,7 +515,10 @@ def main():
     # stiffness = None
     episode_initial_time_s = env.current_hardware_time_s
     execution_duration_s = (
-        sparse_execution_horizon * p_timestep_s * control_para["slow_down_factor"]
+        (control_para["sparse_execution_horizon"] - 1)
+        * sparse_action_down_sample_steps
+        * p_timestep_s
+        * control_para["slow_down_factor"]
     )
     printOrNot(vbs_h2, "Starting main loop.")
 

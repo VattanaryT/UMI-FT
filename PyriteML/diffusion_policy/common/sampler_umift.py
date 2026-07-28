@@ -45,6 +45,59 @@ def sparse_action_indices_from_rgb_timestamps(
     return action_indices[valid], target_times[valid]
 
 
+def action_targets_have_timestamp_gap(
+    target_times: np.ndarray,
+    expected_dt: float,
+    mult: float,
+) -> bool:
+    """Return True if any consecutive action-target dt exceeds mult * expected_dt."""
+    if mult <= 0:
+        return False
+    target_times = np.asarray(target_times, dtype=np.float64).reshape(-1)
+    if target_times.size < 2:
+        return False
+    if not np.isfinite(expected_dt) or expected_dt <= 0:
+        raise ValueError("expected_dt must be a positive finite float.")
+    return bool(np.any(np.diff(target_times) > mult * expected_dt))
+
+
+def filter_rgb_ids_without_action_gaps(
+    rgb_ids: np.ndarray,
+    action_times: np.ndarray,
+    rgb_times: np.ndarray,
+    action_horizon: int,
+    rgb_frame_stride: int,
+    mult: float,
+) -> tuple[np.ndarray, int]:
+    """Keep rgb query ids whose sparse action target times have no large gap.
+
+    Returns (kept_rgb_ids, n_discarded).
+    """
+    rgb_ids = np.asarray(rgb_ids, dtype=np.int64).reshape(-1)
+    if mult <= 0 or rgb_ids.size == 0:
+        return rgb_ids.copy(), 0
+
+    rgb_times = np.asarray(rgb_times, dtype=np.float64).reshape(-1)
+    action_times = np.asarray(action_times, dtype=np.float64).reshape(-1)
+    expected_dt = float(np.median(np.diff(rgb_times))) * float(rgb_frame_stride)
+
+    kept = []
+    n_discarded = 0
+    for rgb_id in rgb_ids:
+        _, target_times = sparse_action_indices_from_rgb_timestamps(
+            action_times=action_times,
+            rgb_times=rgb_times,
+            rgb_id=int(rgb_id),
+            action_horizon=action_horizon,
+            rgb_frame_stride=rgb_frame_stride,
+        )
+        if action_targets_have_timestamp_gap(target_times, expected_dt, mult):
+            n_discarded += 1
+        else:
+            kept.append(int(rgb_id))
+    return np.asarray(kept, dtype=np.int64), n_discarded
+
+
 def get_val_mask(n_episodes, val_ratio, seed=0):
     val_mask = np.zeros(n_episodes, dtype=bool)
     if val_ratio <= 0:
@@ -85,7 +138,9 @@ class SequenceSamplerUmiFT:
         action_padding: bool = False,
         weighted_sampling: int = 1,  # if > 1, duplicate the correction sample's ids weighted_sampling times
         correction_horizon: int = 1,  # the times of action horizon to be counted as "start of correction"
+        action_gap_threshold_mult: float = 3.0,
     ):
+        self.action_gap_threshold_mult = float(action_gap_threshold_mult)
         self.flag_has_dense = "dense" in shape_meta["sample"]["obs"]
         self.flag_has_gripper = (
             "robot0_gripper" in shape_meta["sample"]["obs"]["sparse"]
@@ -358,6 +413,13 @@ class SequenceSamplerUmiFT:
         epi_id = []
         ids = []
         episode_count = -1
+        gap_discard_total = 0
+        gap_candidate_total = 0
+        gap_discard_by_episode = {}
+        action_horizon = shape_meta["sample"]["action"]["sparse"]["horizon"]
+        action_rgb_frame_stride = shape_meta["sample"]["action"]["sparse"][
+            "down_sample_steps"
+        ]
         for key in episode_keys:
             episode_count += 1
             episode_index = int(key.split("_")[-1])
@@ -371,32 +433,52 @@ class SequenceSamplerUmiFT:
                 if np.any(masks):
                     has_mask = True
 
+            action_times = np.squeeze(
+                replay_buffer["data"][key]["action_time_stamps"]
+            )
+            rgb_times = np.squeeze(
+                replay_buffer["data"][key]["obs"]["rgb_time_stamps_0"]
+            )
+
             if not has_mask:
                 # normal processing
                 array_length = episodes_length_for_query[episode_count]
-                ep_id_to_be_added = [episode_index] * array_length
                 ids_to_be_added = episodes_start[episode_count] + np.arange(
                     array_length
                 )
                 # Down sample the query indices to make the dataset smaller
-                epi_id.extend(
-                    ep_id_to_be_added[::sparse_query_frequency_down_sample_steps]
+                candidate_rgb_ids = ids_to_be_added[
+                    ::sparse_query_frequency_down_sample_steps
+                ]
+                kept_rgb_ids, n_discarded = filter_rgb_ids_without_action_gaps(
+                    rgb_ids=candidate_rgb_ids,
+                    action_times=action_times,
+                    rgb_times=rgb_times,
+                    action_horizon=action_horizon,
+                    rgb_frame_stride=action_rgb_frame_stride,
+                    mult=self.action_gap_threshold_mult,
                 )
-                ids.extend(ids_to_be_added[::sparse_query_frequency_down_sample_steps])
+                gap_discard_total += n_discarded
+                gap_candidate_total += len(candidate_rgb_ids)
+                if n_discarded > 0:
+                    gap_discard_by_episode[episode_index] = (
+                        n_discarded,
+                        len(candidate_rgb_ids),
+                    )
+
+                epi_id.extend([episode_index] * len(kept_rgb_ids))
+                ids.extend(kept_rgb_ids.tolist())
                 if weighted_sampling > 1:
                     actions = replay_buffer["data"][key]["action"]
                     # detect correction occurance: if the first action is close to zero, and any of the other actions are not close to zero
                     reference_action = np.array(
                         [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
                     )
-                    action_horizon = shape_meta["sample"]["action"]["sparse"]["horizon"]
-                    action_down_sample_steps = shape_meta["sample"]["action"]["sparse"][
-                        "down_sample_steps"
-                    ]
+                    action_down_sample_steps = action_rgb_frame_stride
                     sample_ids = np.searchsorted(
                         replay_buffer["data"][key]["action_time_stamps"],
                         replay_buffer["data"][key]["obs"]["rgb_time_stamps_0"][
-                            ids_to_be_added[::sparse_query_frequency_down_sample_steps]
+                            kept_rgb_ids
                         ],
                     )
 
@@ -433,17 +515,15 @@ class SequenceSamplerUmiFT:
                     is_correction_sample = (
                         flag_not_in_correction & flag_before_correction
                     )
-                    correction_ids = ids_to_be_added[
-                        ::sparse_query_frequency_down_sample_steps
-                    ][is_correction_sample]
+                    correction_ids = kept_rgb_ids[is_correction_sample]
 
                     # duplicate the correction sample's ids weighted_sampling times
                     for _ in range(weighted_sampling):
-                        ids.extend(correction_ids)
-                        epi_id.extend([episode_index] * np.sum(is_correction_sample))
+                        ids.extend(correction_ids.tolist())
+                        epi_id.extend([episode_index] * len(correction_ids))
 
                     # sample more (correction horizon) before and after correction
-                    if correction_horizon > 0:
+                    if correction_horizon > 0 and len(correction_ids) > 0:
                         addition_horizon = np.arange(
                             -correction_horizon,
                             correction_horizon + 1,
@@ -461,9 +541,27 @@ class SequenceSamplerUmiFT:
                         additional_sample_ids = additional_sample_ids[
                             ~np.isin(additional_sample_ids, correction_ids)
                         ]  # filter out the additional sample ids that are already in the list
+                        additional_kept, add_discarded = (
+                            filter_rgb_ids_without_action_gaps(
+                                rgb_ids=additional_sample_ids,
+                                action_times=action_times,
+                                rgb_times=rgb_times,
+                                action_horizon=action_horizon,
+                                rgb_frame_stride=action_rgb_frame_stride,
+                                mult=self.action_gap_threshold_mult,
+                            )
+                        )
+                        gap_discard_total += add_discarded
+                        gap_candidate_total += len(additional_sample_ids)
+                        if add_discarded > 0:
+                            prev = gap_discard_by_episode.get(episode_index, (0, 0))
+                            gap_discard_by_episode[episode_index] = (
+                                prev[0] + add_discarded,
+                                prev[1] + len(additional_sample_ids),
+                            )
                         for _ in range(weighted_sampling):
-                            ids.extend(additional_sample_ids)
-                            epi_id.extend([episode_index] * len(additional_sample_ids))
+                            ids.extend(additional_kept.tolist())
+                            epi_id.extend([episode_index] * len(additional_kept))
             else:
                 # now we have an episode with masks.
                 # we need to find the end id of each continuous segment of ones in the mask array.
@@ -479,11 +577,41 @@ class SequenceSamplerUmiFT:
                     robot_time_at_mask_start,
                 )
 
-                array_length = len(rgb_id_at_mask_start)
-                epi_id.extend([episode_index] * array_length)
-                ids.extend(rgb_id_at_mask_start)
+                kept_rgb_ids, n_discarded = filter_rgb_ids_without_action_gaps(
+                    rgb_ids=np.asarray(rgb_id_at_mask_start).reshape(-1),
+                    action_times=action_times,
+                    rgb_times=rgb_times,
+                    action_horizon=action_horizon,
+                    rgb_frame_stride=action_rgb_frame_stride,
+                    mult=self.action_gap_threshold_mult,
+                )
+                gap_discard_total += n_discarded
+                gap_candidate_total += len(np.asarray(rgb_id_at_mask_start).reshape(-1))
+                if n_discarded > 0:
+                    gap_discard_by_episode[episode_index] = (
+                        n_discarded,
+                        len(np.asarray(rgb_id_at_mask_start).reshape(-1)),
+                    )
+
+                epi_id.extend([episode_index] * len(kept_rgb_ids))
+                ids.extend(kept_rgb_ids.tolist())
 
         indices = list(zip(epi_id, ids))
+
+        if self.action_gap_threshold_mult > 0:
+            pct = (
+                100.0 * gap_discard_total / gap_candidate_total
+                if gap_candidate_total > 0
+                else 0.0
+            )
+            print(
+                f"[SequenceSamplerUmiFT] action-gap filter "
+                f"(mult={self.action_gap_threshold_mult}): "
+                f"discarded {gap_discard_total}/{gap_candidate_total} queries "
+                f"({pct:.1f}%)"
+            )
+            for ep_idx, (n_disc, n_cand) in sorted(gap_discard_by_episode.items()):
+                print(f"  episode_{ep_idx}: {n_disc}/{n_cand}")
 
         self.shape_meta = shape_meta
         self.replay_buffer = replay_buffer

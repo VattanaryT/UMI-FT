@@ -55,6 +55,7 @@ class UmiFTDataset(BaseImageDataset):
         normalize_wrench: bool = False,
         weighted_sampling: int = 1,
         correction_horizon: int = 1,
+        action_gap_threshold_mult: float = 3.0,
     ):
         # load into memory store
         print("[UmiFTDataset] loading data into store from", dataset_path)
@@ -128,6 +129,7 @@ class UmiFTDataset(BaseImageDataset):
             id_list=self.id_list,
             weighted_sampling=weighted_sampling,
             correction_horizon=correction_horizon,
+            action_gap_threshold_mult=action_gap_threshold_mult,
         )
 
         self.shape_meta = shape_meta
@@ -138,6 +140,7 @@ class UmiFTDataset(BaseImageDataset):
         self.val_mask = val_mask
         self.action_padding = action_padding
         self.sampler = sampler
+        self.action_gap_threshold_mult = action_gap_threshold_mult
         self.temporally_independent_normalization = temporally_independent_normalization
         self.threadpool_limits_is_applied = False
         self.hack_linear_interpolated_dense_action = (
@@ -216,6 +219,7 @@ class UmiFTDataset(BaseImageDataset):
             obs_to_obs_sample=obs_to_obs_sample,
             action_to_action_sample=action_to_action_sample,
             id_list=self.id_list,
+            action_gap_threshold_mult=self.action_gap_threshold_mult,
         )
         val_set.val_mask = ~self.val_mask
         return val_set
