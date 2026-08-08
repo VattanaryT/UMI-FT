@@ -1,0 +1,7 @@
+# Extra pip pins only if you need to layer on top of a running container.
+# The Dockerfile already installs the README pip extras.
+vit-pytorch>=1.7.12
+imagecodecs>=2023.9.18
+toppra
+atomics
+v4l2py

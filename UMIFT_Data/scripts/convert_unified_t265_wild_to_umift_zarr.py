@@ -69,6 +69,57 @@ def build_ts_pose_fb(
     )
 
 
+def resolve_tag_traj_path(unified_path: Path) -> Path | None:
+    """<folder>/tag_traj/<prefix>_ee_master.npz for <folder>/zarr/<prefix>_unified.zarr."""
+    unified_path = Path(unified_path)
+    prefix = unified_path.name.replace("_unified.zarr", "").replace(".zarr", "")
+    parent = unified_path.parent
+    candidates = []
+    if parent.name == "zarr":
+        candidates.append(parent.parent / "tag_traj" / f"{prefix}_ee_master.npz")
+    candidates.append(parent / "tag_traj" / f"{prefix}_ee_master.npz")
+    for c in candidates:
+        if c.is_file():
+            return c
+    return None
+
+
+def _resample_pose7(
+    src_t: np.ndarray,
+    pose7: np.ndarray,
+    query_t: np.ndarray,
+) -> np.ndarray:
+    """Linear pos + SLERP quat onto query times. pose7 is [x,y,z,qw,qx,qy,qz]."""
+    from scipy.spatial.transform import Rotation, Slerp
+
+    src_t = np.asarray(src_t, dtype=np.float64).reshape(-1)
+    query_t = np.asarray(query_t, dtype=np.float64).reshape(-1)
+    pose7 = np.asarray(pose7, dtype=np.float64)
+    out = np.zeros((len(query_t), 7), dtype=np.float64)
+    for j in range(3):
+        out[:, j] = np.interp(query_t, src_t, pose7[:, j])
+    # scipy Rotation uses xyzw
+    quat_xyzw = np.column_stack([pose7[:, 4], pose7[:, 5], pose7[:, 6], pose7[:, 3]])
+    rots = Rotation.from_quat(quat_xyzw)
+    t0, t1 = float(src_t[0]), float(src_t[-1])
+    t_clip = np.clip(query_t, t0, t1)
+    slerp = Slerp(src_t, rots)
+    q = slerp(t_clip).as_quat()  # xyzw
+    out[:, 3] = q[:, 3]
+    out[:, 4] = q[:, 0]
+    out[:, 5] = q[:, 1]
+    out[:, 6] = q[:, 2]
+    return out
+
+
+def load_tag_traj_pose7(sidecar: Path, query_t_unified: np.ndarray) -> np.ndarray:
+    """Load already-TCP pose7 from ee_tag_traj sidecar; resample to query times."""
+    data = np.load(sidecar)
+    src_t = np.asarray(data["timestamp_sec_unified"], dtype=np.float64).reshape(-1)
+    pose7 = np.asarray(data["pose7"], dtype=np.float64)
+    return _resample_pose7(src_t, pose7, query_t_unified)
+
+
 def _apply_wrench_point_offset(
     wrench: np.ndarray, sensor_offset_xyz_m: np.ndarray
 ) -> np.ndarray:
@@ -165,7 +216,15 @@ def _open_unified_root(path: Path):
 def _read_episode_from_unified(
     path: Path,
     sensor_offset_xyz_m: np.ndarray = np.zeros(3),
-) -> Dict[str, np.ndarray]:
+    pose_source: str = "auto",
+) -> tuple[Dict[str, np.ndarray], str]:
+    """
+    Returns (episode_dict, pose_source_used).
+
+    pose_source: 'auto' | 't265' | 'tag'
+      auto = tag sidecar if present else t265
+      tag poses are already TCP body in master-tag world — do not run ft_poses_to_tcp_poses.
+    """
     root = _open_unified_root(path)
 
     color_group = root["camera"]["color"]
@@ -192,7 +251,27 @@ def _read_episode_from_unified(
         "orient_z",
         "orient_w",
     ]}
-    pose = build_ts_pose_fb(odom, sensor_offset_xyz_m=sensor_offset_xyz_m)
+
+    sidecar = resolve_tag_traj_path(path)
+    use_tag = pose_source == "tag" or (pose_source == "auto" and sidecar is not None)
+    if pose_source == "tag" and sidecar is None:
+        raise FileNotFoundError(f"--pose-source tag but no sidecar for {path}")
+    if use_tag:
+        if "timestamp_sec_unified" in odom_group:
+            odom_unified = _read_ts(odom_group, "timestamp_sec_unified").reshape(-1)
+        else:
+            # Fall back: align relative streams by assuming same clock span as RGB unified if present
+            odom_unified = _read_ts(odom_group, "timestamp_sec_relative").reshape(-1)
+            if "timestamp_sec_unified" in color_group:
+                rgb_u = np.asarray(color_group["timestamp_sec_unified"], dtype=np.float64).reshape(-1)
+                odom_unified = odom_unified - odom_unified[0] + rgb_u[0]
+        pose = load_tag_traj_pose7(sidecar, odom_unified)
+        pose_source_used = "tag_master_tcp"
+        print(f"[convert] Using tag traj sidecar {sidecar.name} for {path.name}")
+    else:
+        pose = build_ts_pose_fb(odom, sensor_offset_xyz_m=sensor_offset_xyz_m)
+        pose_source_used = "t265_odom_ft_to_tcp"
+
     consistency = check_tcp_pose_consistency(pose)
     print(f"[convert] TCP pose consistency ({path.name}): {consistency}")
 
@@ -237,7 +316,7 @@ def _read_episode_from_unified(
         "wrench_time_stamps_left_0": _as_col(ts_norm["wrench_time_stamps_left_0"]),
         "wrench_time_stamps_right_0": _as_col(ts_norm["wrench_time_stamps_right_0"]),
         **wrench_keys,
-    }
+    }, pose_source_used
 
 
 def _episode_len(cumulative: List[int], this_len: int) -> None:
@@ -258,6 +337,7 @@ def convert(
     input_path: Path,
     output_path: Path,
     sensor_offset_xyz_m: np.ndarray = np.zeros(3),
+    pose_source: str = "auto",
 ) -> None:
     _ensure_zarr_v2()
 
@@ -279,12 +359,15 @@ def convert(
     episode_robot_len = []
     episode_gripper_len = []
     episode_wrench_len = []
+    pose_sources_used: List[str] = []
 
     for ep_idx, unified_path in enumerate(unified_paths):
-        ep_data = _read_episode_from_unified(
+        ep_data, pose_used = _read_episode_from_unified(
             unified_path,
             sensor_offset_xyz_m=sensor_offset_xyz_m,
+            pose_source=pose_source,
         )
+        pose_sources_used.append(pose_used)
         ep_group = data_group.create_group(f"episode_{ep_idx}")
 
         for key, value in ep_data.items():
@@ -305,7 +388,7 @@ def convert(
         _episode_len(episode_gripper_len, ep_data["gripper_0"].shape[0])
         _episode_len(episode_wrench_len, ep_data["wrench_left_0"].shape[0])
 
-        print(f"[convert] episode_{ep_idx} <- {unified_path.name}")
+        print(f"[convert] episode_{ep_idx} <- {unified_path.name} (pose={pose_used})")
 
     meta_group.create_dataset(
         "episode_rgb0_len",
@@ -338,10 +421,27 @@ def convert(
         compressor=numeric_compressor,
     )
 
+    dominant_pose = (
+        "tag_master_tcp"
+        if pose_sources_used and all(p == "tag_master_tcp" for p in pose_sources_used)
+        else (
+            "mixed"
+            if len(set(pose_sources_used)) > 1
+            else (pose_sources_used[0] if pose_sources_used else "t265_odom_ft_to_tcp")
+        )
+    )
+    world_frame = (
+        "master_apriltag"
+        if dominant_pose == "tag_master_tcp"
+        else "+Y up (T265/ARKit native)"
+    )
+
     root.attrs["conversion_info"] = conversion_info_json(
         extra={
             "source_type": "unified_t265_wild",
-            "pose_source": "t265_odom_ft_to_tcp",
+            "pose_source": dominant_pose,
+            "pose_sources_per_episode": pose_sources_used,
+            "world_frame_override": world_frame,
             "gripper_source": "synthetic_zero",
             "wrench_source": "single_wrist_ft_mapped_to_left_tcp_frame",
             "sensor_offset_xyz_m": np.asarray(sensor_offset_xyz_m, dtype=np.float64).tolist(),
@@ -381,6 +481,12 @@ def main() -> int:
         metavar=("X", "Y", "Z"),
         help="Full sensor offset vector in meters. Overrides --sensor_offset_z_m.",
     )
+    parser.add_argument(
+        "--pose-source",
+        choices=("auto", "t265", "tag"),
+        default="auto",
+        help="Pose for ts_pose_fb: auto prefers tag_traj sidecar when present.",
+    )
     args = parser.parse_args()
 
     if args.sensor_offset_xyz_m is not None:
@@ -392,6 +498,7 @@ def main() -> int:
         Path(args.input),
         Path(args.output),
         sensor_offset_xyz_m=sensor_offset_xyz_m,
+        pose_source=args.pose_source,
     )
     return 0
 

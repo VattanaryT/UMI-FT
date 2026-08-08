@@ -255,10 +255,19 @@ def build_val_dataset(cfg, dataset_path: Optional[str] = None):
     return dataset, val_dataset
 
 
+# Ablation: zero depth before policy. Flip to False (or comment out the block below) to restore.
+ZERO_DEPTH = True
+
+
 def predict_sparse_action(policy, obs_sample: Dict[str, Any], device: torch.device) -> np.ndarray:
     def _to_batched_tensor(x):
         t = torch.as_tensor(np.asarray(x)).to(device)
         return rearrange(t, "... -> 1 ...")
+
+    if ZERO_DEPTH:
+        sparse = obs_sample.get("sparse", obs_sample)
+        if "depth_0" in sparse:
+            sparse["depth_0"] = np.zeros_like(np.asarray(sparse["depth_0"]))
 
     obs_batched = dict_apply(obs_sample, _to_batched_tensor)
     with torch.no_grad():

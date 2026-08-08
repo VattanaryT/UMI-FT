@@ -93,7 +93,28 @@ def test_build_wrench_keys_applies_point_offset_to_torque():
     assert np.allclose(keys["wrench_left_0"], expected_left)
 
 
-def test_convert_depth_to_umift_format_clips_and_expands_channels():
+def test_resolve_tag_traj_path_and_resample(tmp_path):
+    folder = tmp_path / "data"
+    zarr_dir = folder / "zarr"
+    tag_dir = folder / "tag_traj"
+    zarr_dir.mkdir(parents=True)
+    tag_dir.mkdir(parents=True)
+    unified = zarr_dir / "demo_unified.zarr"
+    unified.mkdir()
+    sidecar = tag_dir / "demo_ee_master.npz"
+    ts = np.array([0.0, 1.0, 2.0])
+    pose7 = np.zeros((3, 7))
+    pose7[:, 0] = [0.0, 1.0, 2.0]
+    pose7[:, 3] = 1.0  # qw
+    np.savez(sidecar, timestamp_sec_unified=ts, pose7=pose7)
+
+    assert MODULE.resolve_tag_traj_path(unified) == sidecar
+    query = np.array([0.5, 1.5])
+    out = MODULE.load_tag_traj_pose7(sidecar, query)
+    assert out.shape == (2, 7)
+    assert np.isclose(out[0, 0], 0.5)
+    assert np.isclose(out[1, 0], 1.5)
+
     depth_mm = np.array([[[0, 500], [2000, 7000]]], dtype=np.uint16)
     depth = MODULE.convert_depth_to_umift_depth(depth_mm, depth_scale=0.001, depth_clip=0.5)
 

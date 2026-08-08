@@ -126,9 +126,9 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 32 # 128 seems to work fine.
-  num_workers: 32 # debug 32
-  prefetch_factor: 8
+  batch_size: 16 # 128 seems to work fine.
+  num_workers: 8 # debug 32
+  prefetch_factor: 4
   shuffle: True
   pin_memory: True
   persistent_workers: True # debug: True
@@ -137,8 +137,8 @@ dataloader:
   #   _target_: torch.utils.data.Sampler
 
 val_dataloader:
-  batch_size: 128 # 128 seems to work fine.
-  num_workers: 8 # debug 32
+  batch_size: 16 # 128 seems to work fine.
+  num_workers: 16 # debug 32
   shuffle: False
   pin_memory: True
   persistent_workers: True # debug: True
@@ -154,13 +154,13 @@ training:
   device: "cuda:0"
   seed: 42
   debug: False
-  resume: False
+  resume: True
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 2000 # debug 2000
-  num_epochs: 300 # debug 80
+  num_epochs: 50 # debug 80
   gt_traj_num_epochs: 80 # debug train dense with gt traj for the first few epochs
-  dense_training_start_epochs: 60 # debug start train dense after this number of epochs
+  dense_training_start_epochs: 20 # debug start train dense after this number of epochs
   
   # gradient clipping, set to negative to disable
   dense_gradient_norm_limit: 0.2
@@ -180,8 +180,8 @@ training:
   # in epochs
   rollout_every: 10
   checkpoint_every: 10
-  val_every: 20
-  sample_every: 10 # debug 5
+  val_every: 5
+  sample_every: 5 # debug 5
   # steps per epoch
   max_train_steps: null
   max_val_steps: null
@@ -216,7 +216,7 @@ hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: ${output_dir}/${now:%Y.%m.%d}_${now:%H.%M.%S}_${task_name}_${name}
+    dir: ${output_dir}/2026.08.06_00.32.20_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI
   sweep:
-    dir: ${output_dir}/${now:%Y.%m.%d}_${now:%H.%M.%S}_${task_name}_${name}
+    dir: ${output_dir}/2026.08.06_00.32.20_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI # ${now:%Y.%m.%d}_${now:%H.%M.%S}_${task_name}_${name}
     subdir: ${hydra.job.num}

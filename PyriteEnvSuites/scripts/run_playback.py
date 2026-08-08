@@ -254,7 +254,7 @@ def plot_images(img_A, img_B, opacity_A=0.6):
 dataset_folder_path = os.environ.get("PYRITE_DATASET_FOLDERS")
 # (CHUER): TBCHANGED
 dataset_path = (
-    dataset_folder_path + "/straight_convex_data_v2/acp_replay_buffer.zarr"
+    dataset_folder_path + "/stringer_data_v2_full/acp_replay_buffer.zarr"
 )
 id_list = [0]
 print("dataset_path:", dataset_path)
@@ -300,7 +300,7 @@ while not server.is_ready():
 print("[Main] Hardware server is ready. Now reading data...")
 
 # read data
-ep = "episode_0"
+ep = "episode_34"
 data = buffer["data"][ep]
 
 # get initial rgb frame and align it with initial frame of data episode being played back

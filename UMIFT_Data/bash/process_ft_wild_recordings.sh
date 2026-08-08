@@ -182,7 +182,6 @@ if [[ ! -d "${UNIFIED_ZARR_DIR}" ]] || [[ -z "$(ls -A "${UNIFIED_ZARR_DIR}" 2>/d
     exit 1
 fi
 
-# --- 3. convert unified zarr -> UMIFT episode zarr (host conda env, zarr v2) ---
 activate_conda() {
     if [[ -n "${CONDA_PREFIX:-}" ]] && [[ "$(basename "${CONDA_PREFIX}")" == "${CONDA_ENV}" ]]; then
         return 0
@@ -207,13 +206,33 @@ activate_conda() {
     exit 1
 }
 
+# --- 2b. optional master-tag EE trajectories (lightweight npz sidecars) ---
+TAG_TRAJ_SCRIPT="${WS_ROOT}/ee_tag_traj/scripts/run_trajectory.py"
+TAG_TRAJ_CONFIG="${TAG_TRAJ_CONFIG:-${WS_ROOT}/ee_tag_traj/configs/example_stringer.yaml}"
+TAG_TRAJ_DIR="${LOCAL_DIR}/tag_traj"
+if [[ -f "${TAG_TRAJ_SCRIPT}" && -f "${TAG_TRAJ_CONFIG}" ]]; then
+    log "Computing master-tag TCP trajectories -> ${TAG_TRAJ_DIR}/ ..."
+    activate_conda
+    export PYTHONPATH="${WS_ROOT}/ee_tag_traj:${PYTHONPATH:-}"
+    python "${TAG_TRAJ_SCRIPT}" \
+        --zarr-dir "${UNIFIED_ZARR_DIR}" \
+        --config "${TAG_TRAJ_CONFIG}" \
+        --output-dir "${TAG_TRAJ_DIR}" \
+        --skip-existing \
+        || log "ee_tag_traj failed for some demos; convert will fall back to T265 where sidecars are missing"
+else
+    log "Skipping ee_tag_traj (script/config missing); convert will use T265 poses"
+fi
+
+# --- 3. convert unified zarr -> UMIFT episode zarr (host conda env, zarr v2) ---
 log "Converting unified zarr -> UMIFT schema (conda env: ${CONDA_ENV}) ..."
 activate_conda
 export PYTHONPATH="${WS_ROOT}/UMI-FT/PyriteUtility:${PYTHONPATH:-}"
 
 python "${CONVERT_UMIFT_SCRIPT}" \
     --input "${UNIFIED_ZARR_DIR}" \
-    --output "${UMIFT_ZARR}"
+    --output "${UMIFT_ZARR}" \
+    --pose-source auto
 
 # --- 4. virtual target postprocessing ---
 log "Running virtual-target postprocessing on ${UMIFT_ZARR} ..."
@@ -225,4 +244,5 @@ python "${POSTPROCESS_SCRIPT}"
 log "Done."
 log "  Raw bags:       ${LOCAL_DIR}/bags/ (if moved by batch converter)"
 log "  Unified zarr:   ${UNIFIED_ZARR_DIR}/"
+log "  Tag traj:       ${TAG_TRAJ_DIR}/"
 log "  UMIFT zarr:     ${UMIFT_ZARR}"

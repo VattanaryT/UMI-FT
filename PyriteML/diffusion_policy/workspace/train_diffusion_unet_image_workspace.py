@@ -141,6 +141,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             self.ema_model.set_normalizer(sparse_normalizer, dense_normalizer)
 
         # configure lr scheduler
+        # When resuming with last_epoch >= 0, PyTorch requires initial_lr on each
+        # param group. Older checkpoints may omit the optimizer entirely
+        # (exclude_keys when training.resume was False at save time).
+        for group in self.optimizer.param_groups:
+            group.setdefault("initial_lr", group["lr"])
         lr_scheduler = get_scheduler(
             cfg.training.lr_scheduler,
             optimizer=self.optimizer,

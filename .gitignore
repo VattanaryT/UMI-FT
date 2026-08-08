@@ -22,3 +22,5 @@ figs/
 # miscellaneous
 output.log
 scripts/profile_data_loader.py 
+*.sif
+wandb/

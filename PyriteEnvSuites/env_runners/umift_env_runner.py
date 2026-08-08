@@ -195,17 +195,18 @@ def main():
     control_para = {
         # D405 @ 15 Hz for layup stack; iPhone/GoPro legacy path uses 0.0167 (~60 Hz).
         "raw_time_step_s": 1.0 / 15.0,
-        "slow_down_factor": 4,  # slow down policy execution by this factor
-        "sparse_execution_horizon": 2, # first step is at t=0, so this should be >1
+        "slow_down_factor": 2,  # slow down policy execution by this factor
+        "sparse_execution_horizon": 14, # first step is at t=0, so this should be >1
         # Zero-added-latency temporal ensembling of overlapping action chunks.
         # Lower sparse_execution_horizon with this on increases overlap/smoothing.
         "enable_ensemble_chunking": True,
-        "ensemble_decay_m": 0.0,  # 0 = uniform; >0 trusts near-term steps more (exp)
+        "ensemble_decay_m": 0.01,  # 0 = uniform; >0 trusts near-term steps more (exp)
         "max_duration_s": 3500,
         "gripper_action_scale": 1000,
         "use_audio": False,
         "gripper_lookahead_steps": 0,  # how many steps to look ahead for gripper action
         "set_wrench_fb_to_zero": False,
+        "set_depth_to_zero": True,  # ablation: feed all-zero depth to policy
         "test_nominal_target": False,  # False to follow virtual target
         "test_nominal_target_stiffness": -1,  # -1, for a 'no force case'. 1500, for a quick test without force.
         "fix_orientation": False,
@@ -221,7 +222,7 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        "ckpt_path": "/2026.07.14_18.53.32_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI/checkpoints/epoch=0280-train_loss=0.022.ckpt",
+        "ckpt_path": "/2026.07.30_22.08.36_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI/checkpoints/epoch=0040-train_loss=0.019.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
@@ -696,6 +697,9 @@ def main():
                         obs_task["obs"][f"robot{id}_eef_wrench_right"] = np.zeros_like(
                             obs_task["obs"][f"robot{id}_eef_wrench_right"]
                         )
+
+            if control_para["set_depth_to_zero"] and "depth_0" in obs_task["obs"]:
+                obs_task["obs"]["depth_0"] = np.zeros_like(obs_task["obs"]["depth_0"])
 
             assert (
                 action_type == "pose9pose9s1a2"

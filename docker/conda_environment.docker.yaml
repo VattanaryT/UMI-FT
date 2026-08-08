@@ -1,0 +1,44 @@
+# Same as PyriteML/conda_environment.yaml, but without pytorch/torchvision/torchaudio.
+# Those are installed via pip first (per UMI-FT README) for a CUDA-matched wheel.
+name: pyrite
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - timm
+  - diffusers
+  - accelerate
+  - huggingface_hub
+  - wandb
+  - threadpoolctl
+  - plotly
+  - dill
+  - einops
+  - hydra-core
+  - ipykernel
+  - ipython
+  - matplotlib
+  - omegaconf
+  # opencv via pip (opencv-python-headless) — conda opencv often breaks libjpeg in CUDA images
+  - pandas
+  - pyyaml
+  - scipy
+  - tqdm
+  - zarr=2.18
+  - spatialmath-python
+  - numcodecs=0.15.1
+  - scikit-video
+  - scikit-fda
+  # trick to avoid cpu affinity issue described in https://github.com/pytorch/pytorch/issues/99625
+  - llvm-openmp=14
+  - eigen=3.4
+  - cmake
+  - pybind11
+  - boost
+  - fmt
+  - spdlog
+  - imageio-ffmpeg
+  - nbformat
+  - cvxpy
