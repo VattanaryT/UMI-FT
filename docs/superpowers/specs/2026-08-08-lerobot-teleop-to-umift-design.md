@@ -18,7 +18,7 @@ Convert LeRobot teleop data into the UMIFT episode-zarr schema, with **all modal
 - **Arm / cameras:** right arm only; `wrist_cam_0` → `rgb_0`; drop center cam and `wrist_cam_1` / left arm.
 - **Depth:** keep `depth_0` in schema; fill with zeros (same HxWx3 float16 layout as stringer). Confirmed `wrench_right_0` in stringer is all zeros (not a left duplicate) — mirror that.
 - **Image size:** write `rgb_0` / `depth_0` / `ultrawide_0` at **224×224** in converters. Train/infer configs already use 224.
-- **Rate:** canonicalize converted data to **10 Hz for every stream** (teleop native; unified→UMIFT converter resamples output the same way). No 15 Hz teleop set exists.
+- **Rate:** teleop converter always writes **10 Hz for every stream** (source is locked). Unified→UMIFT can optionally `--resample-10hz` for matching 10 Hz training zarrs; default leaves native multi-rate. No 15 Hz teleop set exists.
 - **Train/infer retune (required):** because the stack uses index-based asymmetric buffers, zucchini + env-runner must be updated for 10 Hz data. **Most `down_sample_steps` → 1**; horizons retuned so wall-clock history / action chunks stay reasonable (see below). Inference `raw_time_step_s` and layup `*_downsample_correction` updated for 10 Hz training vs live RTDE rates.
 - **Poses:** LeRobot has feedback in `observation.state` and desired as `actdelta`. For UMIFT labels we match stringer:
   - `ts_pose_fb_0` = feedback (rot6d → pose7)
@@ -26,7 +26,7 @@ Convert LeRobot teleop data into the UMIFT episode-zarr schema, with **all modal
   - `ts_pose_virtual_target_0` + `stiffness_0` from **existing** `postprocessing_add_virtual_target_label_umift.py` (fb + wrench)
   - LeRobot desired/`actdelta` is **not** used for VT
 - **Query-relative:** unchanged via existing `umift_type_conversions`.
-- **Stringer path:** only `convert_unified_t265_wild_to_umift_zarr.py` output side (224 + 10 Hz). Never rewrite bags or input `*_unified.zarr`.
+- **Stringer path:** only `convert_unified_t265_wild_to_umift_zarr.py` output side. Always resize to 224; **10 Hz resampling is behind a CLI flag** (default off for backward-compatible wild rates; pass the flag when producing 10 Hz training zarrs). Never rewrite bags or input `*_unified.zarr`.
 
 ## Pipeline
 
@@ -38,7 +38,7 @@ LeRobot 08_03 combined
   → train with retuned umift_zucchini.yaml
 
 Unified wild recordings (future / regen)
-  → convert_unified_t265_wild_to_umift_zarr.py  (+224, +10 Hz grid on output)
+  → convert_unified_t265_wild_to_umift_zarr.py  (+224; optional --resample-10hz)
   → same VT postprocess
   → bags / unified.zarr left untouched
 ```
@@ -65,9 +65,11 @@ Episode packaging: `data/episode_k/` + cumulative `meta/episode_*_len`. Optional
 
 In `convert_unified_t265_wild_to_umift_zarr.py` only (output side):
 
-1. Resize rgb / depth / ultrawide to 224×224 before write.
-2. Resample onto a 10 Hz grid: nearest for images (+ rebuild `map_to_*_idx`); interpolate pose7; nearest wrench; shared timestamps.
+1. Resize rgb / depth / ultrawide to 224×224 before write (always).
+2. **Optional** `--resample-10hz` (name TBD; default **false**): when set, resample onto a 10 Hz grid — nearest for images (+ rebuild `map_to_*_idx`); interpolate pose7; nearest wrench; shared timestamps. When unset, keep native multi-rate streams (legacy wild behavior aside from 224 resize).
 3. Never modify bags or input unified zarr in place.
+
+Teleop converter always writes 10 Hz (source is already locked); no equivalent off-switch needed there.
 
 ## Train / infer config retune (10 Hz)
 
