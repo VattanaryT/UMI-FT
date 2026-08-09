@@ -18,6 +18,8 @@ if str(UMIFT_DATA_ROOT) not in sys.path:
     sys.path.insert(0, str(UMIFT_DATA_ROOT))
 
 from umift.utils.frame_conventions import (
+    DEFAULT_R_FT_IN_TCP_M,
+    FRAME_CONVENTION_VERSION,
     check_tcp_pose_consistency,
     conversion_info_json,
     ft_poses_to_tcp_poses,
@@ -53,11 +55,29 @@ def normalize_timestamps(streams: Dict[str, np.ndarray]) -> Dict[str, np.ndarray
     return {k: np.asarray(v, dtype=np.float64) - offset for k, v in streams.items()}
 
 
-def build_ts_pose_fb(
+def _detect_frame_convention(root) -> str:
+    """Read stamped convention from unified zarr attrs/manifest; default legacy."""
+    attrs = getattr(root, "attrs", {}) or {}
+    for key in ("frame_convention", "frame_convention_version"):
+        if key in attrs:
+            return str(attrs[key])
+    try:
+        manifest = attrs.get("manifest")
+        if manifest:
+            if isinstance(manifest, str):
+                manifest = json.loads(manifest)
+            if isinstance(manifest, dict) and "frame_convention" in manifest:
+                return str(manifest["frame_convention"])
+    except Exception:
+        pass
+    return "legacy"
+
+
+def build_ts_pose_fb_legacy(
     odom: Dict[str, np.ndarray],
     sensor_offset_xyz_m: np.ndarray = np.array([0.0, 0.0, -0.02], dtype=np.float64),
 ) -> np.ndarray:
-    """Build UMIFT TCP pose [x, y, z, qw, qx, qy, qz] from publisher-corrected FT odom."""
+    """LEGACY: FT-frame / umift_tcp_v1 odom → TCP via ft_poses_to_tcp_poses."""
     positions = np.column_stack([odom["pos_x"], odom["pos_y"], odom["pos_z"]])
     orientations_wxyz = np.column_stack(
         [odom["orient_w"], odom["orient_x"], odom["orient_y"], odom["orient_z"]]
@@ -67,6 +87,21 @@ def build_ts_pose_fb(
         orientations_wxyz=orientations_wxyz,
         sensor_offset_xyz_m=sensor_offset_xyz_m,
     )
+
+
+def build_ts_pose_fb_v2(odom: Dict[str, np.ndarray]) -> np.ndarray:
+    """umift_std_v2: odom already TCP in odom_std — identity copy to pose7."""
+    return np.column_stack(
+        [
+            odom["pos_x"],
+            odom["pos_y"],
+            odom["pos_z"],
+            odom["orient_w"],
+            odom["orient_x"],
+            odom["orient_y"],
+            odom["orient_z"],
+        ]
+    ).astype(np.float64)
 
 
 def resolve_tag_traj_path(unified_path: Path) -> Path | None:
@@ -140,9 +175,11 @@ def _apply_wrench_point_offset(
 def build_wrench_keys(
     ft: Dict[str, np.ndarray],
     sensor_offset_xyz_m: np.ndarray = np.zeros(3),
+    *,
+    frame_convention: str = "legacy",
 ) -> Dict[str, np.ndarray]:
-    """Build UMIFT wrench keys from wrist FT sensor readings (FT frame -> TCP frame)."""
-    wrench_ft = np.column_stack(
+    """Build UMIFT wrench keys. v2: already TCP (identity). Legacy: FT→TCP remap."""
+    wrench = np.column_stack(
         [
             ft["force_x"],
             ft["force_y"],
@@ -152,8 +189,11 @@ def build_wrench_keys(
             ft["torque_z"],
         ]
     ).astype(np.float64)
-    left = ft_wrench_to_tcp_wrench(wrench_ft)
-    left = _apply_wrench_point_offset(left, sensor_offset_xyz_m=sensor_offset_xyz_m)
+    if frame_convention == FRAME_CONVENTION_VERSION or frame_convention == "umift_std_v2":
+        left = wrench  # already TCP from FT publisher
+    else:
+        left = ft_wrench_to_tcp_wrench(wrench)
+        left = _apply_wrench_point_offset(left, sensor_offset_xyz_m=sensor_offset_xyz_m)
     right = np.zeros_like(left)
     concat = np.hstack((left, right))
 
@@ -217,15 +257,17 @@ def _read_episode_from_unified(
     path: Path,
     sensor_offset_xyz_m: np.ndarray = np.zeros(3),
     pose_source: str = "auto",
-) -> tuple[Dict[str, np.ndarray], str]:
+) -> tuple[Dict[str, np.ndarray], str, str]:
     """
-    Returns (episode_dict, pose_source_used).
+    Returns (episode_dict, pose_source_used, frame_convention).
 
     pose_source: 'auto' | 't265' | 'tag'
       auto = tag sidecar if present else t265
-      tag poses are already TCP body in master-tag world — do not run ft_poses_to_tcp_poses.
+    umift_std_v2: pose/wrench already TCP — identity copy (no remap).
     """
     root = _open_unified_root(path)
+    frame_convention = _detect_frame_convention(root)
+    is_v2 = frame_convention in (FRAME_CONVENTION_VERSION, "umift_std_v2")
 
     color_group = root["camera"]["color"]
     depth_group = root["camera"]["depth"]
@@ -260,17 +302,21 @@ def _read_episode_from_unified(
         if "timestamp_sec_unified" in odom_group:
             odom_unified = _read_ts(odom_group, "timestamp_sec_unified").reshape(-1)
         else:
-            # Fall back: align relative streams by assuming same clock span as RGB unified if present
             odom_unified = _read_ts(odom_group, "timestamp_sec_relative").reshape(-1)
             if "timestamp_sec_unified" in color_group:
                 rgb_u = np.asarray(color_group["timestamp_sec_unified"], dtype=np.float64).reshape(-1)
                 odom_unified = odom_unified - odom_unified[0] + rgb_u[0]
         pose = load_tag_traj_pose7(sidecar, odom_unified)
-        pose_source_used = "tag_master_tcp"
+        pose_source_used = "tag_fixture_tcp"
         print(f"[convert] Using tag traj sidecar {sidecar.name} for {path.name}")
+    elif is_v2:
+        pose = build_ts_pose_fb_v2(odom)
+        pose_source_used = "t265_tcp_odom_std_v2"
+        print(f"[convert] umift_std_v2 identity pose copy for {path.name}")
     else:
-        pose = build_ts_pose_fb(odom, sensor_offset_xyz_m=sensor_offset_xyz_m)
-        pose_source_used = "t265_odom_ft_to_tcp"
+        pose = build_ts_pose_fb_legacy(odom, sensor_offset_xyz_m=sensor_offset_xyz_m)
+        pose_source_used = "t265_odom_ft_to_tcp_legacy"
+        print(f"[convert] LEGACY ft_poses_to_tcp_poses for {path.name}")
 
     consistency = check_tcp_pose_consistency(pose)
     print(f"[convert] TCP pose consistency ({path.name}): {consistency}")
@@ -283,7 +329,11 @@ def _read_episode_from_unified(
         "torque_y",
         "torque_z",
     ]}
-    wrench_keys = build_wrench_keys(ft, sensor_offset_xyz_m=sensor_offset_xyz_m)
+    wrench_keys = build_wrench_keys(
+        ft,
+        sensor_offset_xyz_m=sensor_offset_xyz_m,
+        frame_convention=frame_convention if is_v2 else "legacy",
+    )
 
     ts_norm = normalize_timestamps(
         {
@@ -316,7 +366,7 @@ def _read_episode_from_unified(
         "wrench_time_stamps_left_0": _as_col(ts_norm["wrench_time_stamps_left_0"]),
         "wrench_time_stamps_right_0": _as_col(ts_norm["wrench_time_stamps_right_0"]),
         **wrench_keys,
-    }, pose_source_used
+    }, pose_source_used, frame_convention
 
 
 def _episode_len(cumulative: List[int], this_len: int) -> None:
@@ -360,14 +410,16 @@ def convert(
     episode_gripper_len = []
     episode_wrench_len = []
     pose_sources_used: List[str] = []
+    conventions_used: List[str] = []
 
     for ep_idx, unified_path in enumerate(unified_paths):
-        ep_data, pose_used = _read_episode_from_unified(
+        ep_data, pose_used, frame_conv = _read_episode_from_unified(
             unified_path,
             sensor_offset_xyz_m=sensor_offset_xyz_m,
             pose_source=pose_source,
         )
         pose_sources_used.append(pose_used)
+        conventions_used.append(frame_conv)
         ep_group = data_group.create_group(f"episode_{ep_idx}")
 
         for key, value in ep_data.items():
@@ -422,28 +474,37 @@ def convert(
     )
 
     dominant_pose = (
-        "tag_master_tcp"
-        if pose_sources_used and all(p == "tag_master_tcp" for p in pose_sources_used)
+        "tag_fixture_tcp"
+        if pose_sources_used and all(p == "tag_fixture_tcp" for p in pose_sources_used)
         else (
             "mixed"
             if len(set(pose_sources_used)) > 1
-            else (pose_sources_used[0] if pose_sources_used else "t265_odom_ft_to_tcp")
+            else (pose_sources_used[0] if pose_sources_used else "unknown")
         )
     )
+    all_v2 = bool(conventions_used) and all(
+        c in (FRAME_CONVENTION_VERSION, "umift_std_v2") for c in conventions_used
+    )
     world_frame = (
-        "master_apriltag"
-        if dominant_pose == "tag_master_tcp"
-        else "+Y up (T265/ARKit native)"
+        "fixture"
+        if dominant_pose == "tag_fixture_tcp"
+        else ("odom" if all_v2 else "+Y up (legacy)")
     )
 
     root.attrs["conversion_info"] = conversion_info_json(
+        r_ft_in_tcp_m=DEFAULT_R_FT_IN_TCP_M if all_v2 else sensor_offset_xyz_m,
         extra={
             "source_type": "unified_t265_wild",
             "pose_source": dominant_pose,
             "pose_sources_per_episode": pose_sources_used,
+            "frame_conventions_per_episode": conventions_used,
             "world_frame_override": world_frame,
             "gripper_source": "synthetic_zero",
-            "wrench_source": "single_wrist_ft_mapped_to_left_tcp_frame",
+            "wrench_source": (
+                "tcp_from_publisher_v2"
+                if all_v2
+                else "single_wrist_ft_mapped_to_left_tcp_frame_legacy"
+            ),
             "sensor_offset_xyz_m": np.asarray(sensor_offset_xyz_m, dtype=np.float64).tolist(),
             "ultrawide_source": "alias_of_d405_color",
             "depth_source": "d405_depth_mm_to_m_float16_3ch_clipped_0p5",

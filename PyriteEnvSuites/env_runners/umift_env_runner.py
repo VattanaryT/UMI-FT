@@ -1,6 +1,11 @@
+import json
 import os
+import re
+import subprocess
 import time
-from typing import Optional, Tuple
+from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import yaml
@@ -33,6 +38,286 @@ def flush_matplotlib_figure(fig, pause_s: float = 0.1) -> None:
     fig.canvas.draw()
     fig.canvas.flush_events()
     plt.pause(pause_s)
+
+
+def _parse_tagged_line(stdout: str, tag: str) -> Optional[str]:
+    """Return value from a ``TAG=value`` line in subprocess stdout."""
+    match = re.search(rf"^{re.escape(tag)}=(.+)$", stdout, flags=re.MULTILINE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def home_to_pose7(
+    env,
+    id_list: list,
+    ts_pose_initial: list,
+    duration_s: float = 5.0,
+    n_samples: int = 100,
+    wait: bool = True,
+) -> None:
+    """Interpolate from current TCP pose(s) back to episode-start pose7."""
+    obs_raw = env.get_observation_from_buffer()
+    sample_indices = np.linspace(0, 1, n_samples)
+    timestamps = sample_indices * duration_s
+    homing_ts_targets = np.zeros([7 * len(id_list), n_samples])
+    for rid in id_list:
+        ts_pose_fb = obs_raw[f"ts_pose_fb_{rid}"][-1]
+        pose7_waypoints = su.pose7_interp(
+            ts_pose_fb, ts_pose_initial[rid], sample_indices
+        )
+        homing_ts_targets[0 + rid * 7 : 7 + rid * 7, :] = pose7_waypoints.T
+    time_now_s = env.current_hardware_time_s
+    env.schedule_controls(
+        pose7_cmd=homing_ts_targets,
+        timestamps=(timestamps + time_now_s) * 1000,
+    )
+    if wait:
+        time.sleep(duration_s + 0.5)
+
+
+def read_robot_joints_via_rtde(
+    keyence_python: Path,
+    robot_ip: str,
+) -> List[float]:
+    """Read actual Q via RTDE receive (coexists with ManipServer control)."""
+    code = (
+        "from rtde_receive import RTDEReceiveInterface\n"
+        f"r = RTDEReceiveInterface(hostname={robot_ip!r})\n"
+        "print(','.join(map(str, r.getActualQ())))\n"
+        "r.disconnect()\n"
+    )
+    proc = subprocess.run(
+        [str(keyence_python), "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Failed to read joints from {robot_ip}: {proc.stderr.strip()}"
+        )
+    joints = [float(x) for x in proc.stdout.strip().split(",") if x.strip()]
+    if len(joints) != 6:
+        raise RuntimeError(f"Expected 6 joints, got {joints!r} from {robot_ip}")
+    return joints
+
+
+def run_compare_pointcloud(
+    *,
+    keyence_python: Path,
+    keyence_ws: Path,
+    compare_script: Path,
+    episode_id: int,
+    high_ply: Path,
+    low_ply: Path,
+    png_path: Path,
+    score_json: Path,
+    session_dir: Path,
+) -> Dict[str, Any]:
+    """Blocking compare; safe to run in a background thread."""
+    print(
+        f"[layup-eval] [bg] Episode {episode_id}: comparing "
+        f"{high_ply.name} vs {low_ply.name}..."
+    )
+    cmp_proc = subprocess.run(
+        [
+            str(keyence_python),
+            str(compare_script),
+            "--high",
+            str(high_ply),
+            "--low",
+            str(low_ply),
+            "--no-show",
+            "--png",
+            str(png_path),
+            "--score-json",
+            str(score_json),
+        ],
+        cwd=str(keyence_ws),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cmp_proc.stdout:
+        print(cmp_proc.stdout, flush=True)
+    if cmp_proc.stderr:
+        print(cmp_proc.stderr, flush=True)
+    if cmp_proc.returncode != 0:
+        raise RuntimeError(
+            "compare_pointcloud_distance failed with code "
+            f"{cmp_proc.returncode}"
+        )
+    if score_json.is_file():
+        score = json.loads(score_json.read_text(encoding="utf-8"))
+        mean_mm = float(score["mean_mm"])
+        heatmap = str(score.get("png", png_path))
+    else:
+        mean_s = _parse_tagged_line(cmp_proc.stdout, "EVAL_MEAN_MM")
+        if mean_s is None:
+            raise RuntimeError(
+                "Could not parse EVAL_MEAN_MM from compare output"
+            )
+        mean_mm = float(mean_s)
+        heatmap = str(png_path)
+    result = {
+        "episode_id": int(episode_id),
+        "mean_mm": float(mean_mm),
+        "heatmap_png": str(heatmap),
+        "session_dir": str(session_dir),
+        "high_ply": str(high_ply),
+        "low_ply": str(low_ply),
+    }
+    print(
+        f"[layup-eval] [bg] Episode {episode_id} mean distance: "
+        f"{result['mean_mm']:.3f} mm"
+    )
+    print(f"[layup-eval] [bg] Heatmap: {result['heatmap_png']}")
+    return result
+
+
+def run_layup_scan_eval(
+    *,
+    env,
+    episode_id: int,
+    control_para: dict,
+    right_return_joints: List[float],
+    compare_executor: ThreadPoolExecutor,
+) -> Future:
+    """Pause RTDE, scan + restore right, resume RTDE, compare in background.
+
+    Returns a Future that yields the score dict when compare finishes.
+    """
+    keyence_ws = Path(control_para["keyence_ws"])
+    keyence_python = Path(control_para["keyence_python"])
+    low_ply = Path(control_para["layup_eval_low_ply"])
+    if not low_ply.is_file():
+        raise FileNotFoundError(
+            f"layup_eval_low_ply not found: {low_ply}. "
+            "Set control_para['layup_eval_low_ply'] to the reference PLY."
+        )
+    if not keyence_python.is_file():
+        raise FileNotFoundError(f"keyence_python not found: {keyence_python}")
+    if len(right_return_joints) != 6:
+        raise ValueError(
+            f"right_return_joints must be length 6, got {len(right_return_joints)}"
+        )
+
+    session_name = f"inference_ep{episode_id}_{int(time.time())}"
+    scan_script = keyence_ws / "scripts" / "run_layup_scan.py"
+    compare_script = keyence_ws / "utils" / "compare_pointcloud_distance.py"
+    joints_csv = ",".join(f"{q:.9g}" for q in right_return_joints)
+
+    print(f"[layup-eval] Pausing RTDE control for episode {episode_id}...")
+    if not env.pause_rtde_control():
+        raise RuntimeError("pause_rtde_control failed")
+
+    session_dir: Optional[Path] = None
+    high_ply: Optional[Path] = None
+    scan_error: Optional[BaseException] = None
+    try:
+        try:
+            print(
+                f"[layup-eval] Running layup scan ({session_name}); "
+                "right arm returns via RTDE moveJ after scan..."
+            )
+            # Use --flag=value so joint values starting with '-' are not
+            # parsed as new argparse options.
+            scan_proc = subprocess.run(
+                [
+                    str(keyence_python),
+                    str(scan_script),
+                    "--session-name",
+                    session_name,
+                    f"--right-return-joints={joints_csv}",
+                ],
+                cwd=str(keyence_ws),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            print(scan_proc.stdout)
+            if scan_proc.stderr:
+                print(scan_proc.stderr, flush=True)
+            if scan_proc.returncode != 0:
+                raise RuntimeError(
+                    f"run_layup_scan failed with code {scan_proc.returncode}"
+                )
+            session_dir_s = _parse_tagged_line(scan_proc.stdout, "LAYUP_SESSION_DIR")
+            if not session_dir_s:
+                raise RuntimeError(
+                    "Could not parse LAYUP_SESSION_DIR from scan output"
+                )
+            session_dir = Path(session_dir_s)
+            high_ply = session_dir / "merged.ply"
+            if not high_ply.is_file():
+                raise FileNotFoundError(
+                    f"Expected merged cloud missing: {high_ply}"
+                )
+        except BaseException as exc:
+            scan_error = exc
+    finally:
+        print("[layup-eval] Resuming RTDE control...")
+        if not env.resume_rtde_control():
+            raise RuntimeError("resume_rtde_control failed") from scan_error
+
+    if scan_error is not None:
+        raise scan_error
+    assert session_dir is not None and high_ply is not None
+
+    png_path = session_dir / "distance_heatmap.png"
+    score_json = session_dir / "eval_score.json"
+    print(
+        f"[layup-eval] Scan done for episode {episode_id}; "
+        "starting compare in background so the next episode can begin."
+    )
+    return compare_executor.submit(
+        run_compare_pointcloud,
+        keyence_python=keyence_python,
+        keyence_ws=keyence_ws,
+        compare_script=compare_script,
+        episode_id=int(episode_id),
+        high_ply=high_ply,
+        low_ply=low_ply,
+        png_path=png_path,
+        score_json=score_json,
+        session_dir=session_dir,
+    )
+
+
+def collect_layup_eval_futures(
+    futures: List[Future],
+    *,
+    wait: bool,
+) -> List[Dict[str, Any]]:
+    """Collect finished (or all, if wait) compare futures into result dicts."""
+    results: List[Dict[str, Any]] = []
+    still_pending: List[Future] = []
+    for fut in futures:
+        if not wait and not fut.done():
+            still_pending.append(fut)
+            continue
+        try:
+            results.append(fut.result())
+        except Exception as exc:
+            print(f"[layup-eval] Background compare FAILED: {exc}")
+    futures[:] = still_pending
+    results.sort(key=lambda r: r["episode_id"])
+    return results
+
+
+def print_layup_eval_summary(results: List[Dict[str, Any]]) -> None:
+    print("\n========== Layup scan evaluation summary ==========")
+    if not results:
+        print("(no evaluations run)")
+        print("===================================================\n")
+        return
+    print(f"{'Episode':>8}  {'mean_mm':>10}  heatmap")
+    for r in results:
+        print(
+            f"{r['episode_id']:>8}  {r['mean_mm']:>10.3f}  {r['heatmap_png']}"
+        )
+    print("===================================================\n")
 
 
 def _stiffness_6x6n_to_per_step(stiffness_6x6n: np.ndarray) -> np.ndarray:
@@ -214,6 +499,13 @@ def main():
         "log_policy_vision": True,
         "pausing_mode": False,  # matplotlib debug only; independent of logging
         "device": "cuda",
+        # Post-episode Keyence layup scan eval (menu option "e")
+        "keyence_ws": "/home/boeing/keyence_scan_ws",
+        "keyence_python": "/home/boeing/keyence_scan_ws/.venv/bin/python",
+        # Reference / "low" surface PLY for compare_pointcloud_distance --low
+        "layup_eval_low_ply": "/mnt/data/boeing/scans/scan_20260808_144428/merged.ply",
+        # Right-arm IP for capturing episode-start joints (RTDE receive).
+        "layup_eval_right_ip": "192.168.1.2",
     }
     pipeline_para = {
         # Layup: D405 rgb (manip_server) + depth (pyrealsense2) + UR5e wrist FT.
@@ -242,6 +534,11 @@ def main():
         pipeline_para["wrench_downsample_correction"] = 1
     verbose = 1
     episode_id = 0
+    layup_eval_results: List[Dict[str, Any]] = []
+    layup_eval_futures: List[Future] = []
+    compare_executor = ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="layup-compare"
+    )
 
     def get_real_obs_resolution(shape_meta: dict) -> Tuple[int, int]:
         out_res = None
@@ -581,6 +878,23 @@ def main():
     ts_pose_initial = []
     for id in id_list:
         ts_pose_initial.append(obs_raw[f"ts_pose_fb_{id}"][-1])
+    # Joints at the same moment — used by layup scan to restore right arm via
+    # RTDE moveJ (avoids ManipServer zone/incremental limits around right_park).
+    right_start_joints: Optional[List[float]] = None
+    try:
+        right_start_joints = read_robot_joints_via_rtde(
+            Path(control_para["keyence_python"]),
+            str(control_para["layup_eval_right_ip"]),
+        )
+        print(
+            "[layup-eval] Captured right start joints: "
+            + ",".join(f"{q:.4f}" for q in right_start_joints)
+        )
+    except Exception as exc:
+        print(
+            f"[layup-eval] WARNING: could not capture right start joints ({exc}). "
+            "Menu option 'e' will be unavailable until restart."
+        )
     #########################################
     # main loop starts
     #########################################
@@ -1022,6 +1336,7 @@ def main():
                     break
 
         printOrNot(vbs_h1, "End of episode.")
+        finished_episode_id = episode_id
         episode_id += 1
 
         env.stop_saving_data()
@@ -1029,29 +1344,46 @@ def main():
         print("Options:")
         print("     c: continue to next episode.")
         print("     r: reset to default pose, then continue.")
+        print(
+            "     e: layup scan eval (scan+restore now; compare runs in background)."
+        )
         print("     b: reset to default pose, then quit the program.")
         print("     others: quit the program.")
+        # Surface any compares that finished during the previous episode.
+        layup_eval_results.extend(
+            collect_layup_eval_futures(layup_eval_futures, wait=False)
+        )
         c = input("Please select an option: ")
-        if c == "r" or c == "b":
-            print("Resetting to default pose.")
-            obs_raw = env.get_observation_from_buffer()
-            N = 100
-            duration_s = 5
-            sample_indices = np.linspace(0, 1, N)
-            timestamps = sample_indices * duration_s
-            homing_ts_targets = np.zeros([7 * len(id_list), N])
-            for id in id_list:
-                ts_pose_fb = obs_raw[f"ts_pose_fb_{id}"][-1]
-
-                pose7_waypoints = su.pose7_interp(
-                    ts_pose_fb, ts_pose_initial[id], sample_indices
+        if c == "e":
+            if right_start_joints is None:
+                print(
+                    "[layup-eval] Cannot run: right start joints were not "
+                    "captured at startup."
                 )
-                homing_ts_targets[0 + id * 7 : 7 + id * 7, :] = pose7_waypoints.T
-
-            time_now_s = env.current_hardware_time_s
-            env.schedule_controls(
-                pose7_cmd=homing_ts_targets,
-                timestamps=(timestamps + time_now_s) * 1000,
+            else:
+                try:
+                    fut = run_layup_scan_eval(
+                        env=env,
+                        episode_id=finished_episode_id,
+                        control_para=control_para,
+                        right_return_joints=right_start_joints,
+                        compare_executor=compare_executor,
+                    )
+                    layup_eval_futures.append(fut)
+                except Exception as exc:
+                    print(f"[layup-eval] FAILED: {exc}")
+                    print(
+                        "RTDE may still be paused; attempting resume before continuing."
+                    )
+                    try:
+                        env.resume_rtde_control()
+                    except Exception as resume_exc:
+                        print(f"[layup-eval] resume also failed: {resume_exc}")
+            input("Press Enter to continue.")
+        elif c == "r" or c == "b":
+            print("Resetting to default pose.")
+            home_to_pose7(
+                env, id_list, ts_pose_initial, duration_s=5.0, wait=False
             )
         elif c == "c":
             pass
@@ -1069,6 +1401,16 @@ def main():
         print("Continuing to execution.")
     # env.save_whole_episode()
     # env.save_video()
+    if layup_eval_futures:
+        print(
+            f"[layup-eval] Waiting for {len(layup_eval_futures)} background "
+            "compare job(s)..."
+        )
+    layup_eval_results.extend(
+        collect_layup_eval_futures(layup_eval_futures, wait=True)
+    )
+    print_layup_eval_summary(layup_eval_results)
+    compare_executor.shutdown(wait=True)
     env.cleanup()
     # end of episode
     # # plot

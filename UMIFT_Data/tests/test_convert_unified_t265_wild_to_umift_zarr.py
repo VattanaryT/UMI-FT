@@ -24,7 +24,7 @@ def test_normalize_timestamps_uses_global_first_sample_offset():
     assert np.isclose(normalized["wrench"][0, 0], 0.2)
 
 
-def test_build_ts_pose_fb_converts_world_and_body_frames_before_offset():
+def test_build_ts_pose_fb_legacy_converts_world_and_body_frames_before_offset():
     odom = {
         "pos_x": np.array([1.0, 2.0]),
         "pos_y": np.array([3.0, 4.0]),
@@ -34,7 +34,7 @@ def test_build_ts_pose_fb_converts_world_and_body_frames_before_offset():
         "orient_z": np.array([0.0, 0.0]),
         "orient_w": np.array([1.0, 1.0]),
     }
-    pose = MODULE.build_ts_pose_fb(
+    pose = MODULE.build_ts_pose_fb_legacy(
         odom,
         sensor_offset_xyz_m=np.array([0.0, 0.0, -0.02], dtype=np.float64),
     )
@@ -61,7 +61,7 @@ def test_build_wrench_keys_populates_coinft_and_concat():
         "torque_y": np.array([9.0, 10.0]),
         "torque_z": np.array([11.0, 12.0]),
     }
-    keys = MODULE.build_wrench_keys(ft)
+    keys = MODULE.build_wrench_keys(ft, frame_convention="legacy")
 
     expected_left = np.array([[-3.0, 1.0, 5.0, -9.0, 7.0, 11.0], [-4.0, 2.0, 6.0, -10.0, 8.0, 12.0]])
     expected_right = np.zeros_like(expected_left)
@@ -85,12 +85,44 @@ def test_build_wrench_keys_applies_point_offset_to_torque():
         "torque_z": np.array([30.0]),
     }
     # sensor is 3 cm at -z from target point
-    keys = MODULE.build_wrench_keys(ft, sensor_offset_xyz_m=np.array([0.0, 0.0, -0.03]))
+    keys = MODULE.build_wrench_keys(
+        ft,
+        sensor_offset_xyz_m=np.array([0.0, 0.0, -0.03]),
+        frame_convention="legacy",
+    )
 
     # FT -> TCP rotates force to [-3, 2, 4] and torque to [-20, 10, 30].
     # Then tau_target = tau_sensor + r x F, r=[0,0,-0.03], r x F = [0.06, 0.09, 0.0].
     expected_left = np.array([[-3.0, 2.0, 4.0, -19.94, 10.09, 30.0]])
     assert np.allclose(keys["wrench_left_0"], expected_left)
+
+
+def test_build_ts_pose_fb_v2_is_identity_copy():
+    odom = {
+        "pos_x": np.array([1.0]),
+        "pos_y": np.array([2.0]),
+        "pos_z": np.array([3.0]),
+        "orient_w": np.array([1.0]),
+        "orient_x": np.array([0.0]),
+        "orient_y": np.array([0.0]),
+        "orient_z": np.array([0.0]),
+    }
+    pose = MODULE.build_ts_pose_fb_v2(odom)
+    assert pose.shape == (1, 7)
+    assert np.allclose(pose[0], [1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0])
+
+
+def test_build_wrench_keys_v2_identity():
+    ft = {
+        "force_x": np.array([1.0]),
+        "force_y": np.array([2.0]),
+        "force_z": np.array([3.0]),
+        "torque_x": np.array([4.0]),
+        "torque_y": np.array([5.0]),
+        "torque_z": np.array([6.0]),
+    }
+    keys = MODULE.build_wrench_keys(ft, frame_convention="umift_std_v2")
+    assert np.allclose(keys["wrench_left_0"][0], [1, 2, 3, 4, 5, 6])
 
 
 def test_resolve_tag_traj_path_and_resample(tmp_path):

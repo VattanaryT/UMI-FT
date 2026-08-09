@@ -2,7 +2,7 @@
 
 ## Goal
 
-Convert LeRobot teleop data into the same UMIFT episode-zarr schema used by `stringer_data_v2_full`, so it can train a UMIFT policy with query-relative kinematics unchanged. Prefer offloading resize and temporal alignment into preprocessing so the training loader does less work. Do not modify original bags.
+Convert LeRobot teleop data into the UMIFT episode-zarr schema, with **all modalities on a 10 Hz grid**, and retune training/inference configs so asymmetric-buffer `down_sample_steps` no longer assume ~15 Hz RGB / ~200 Hz pose / ~28 Hz wrench. Prefer offloading resize into preprocessing. Do not modify original bags.
 
 ## Source / sink
 
@@ -17,27 +17,28 @@ Convert LeRobot teleop data into the same UMIFT episode-zarr schema used by `str
 - **Approach:** dedicated LeRobot → UMIFT converter, then reuse existing virtual-target postprocess (same as stringer).
 - **Arm / cameras:** right arm only; `wrist_cam_0` → `rgb_0`; drop center cam and `wrist_cam_1` / left arm.
 - **Depth:** keep `depth_0` in schema; fill with zeros (same HxWx3 float16 layout as stringer). Confirmed `wrench_right_0` in stringer is all zeros (not a left duplicate) — mirror that.
-- **Image size:** write `rgb_0` / `depth_0` / `ultrawide_0` at **224×224** in converters (not 244). Train/infer configs already use 224.
-- **Rate / wall-clock:** all teleop streams are **10 Hz** (no 15 Hz teleop set). Sampler horizons are index-based, so stream Hz must match train↔infer. Canonicalize to a **10 Hz policy grid**; inference runs at 10 Hz with the same `down_sample_steps` / horizons.
-- **Poses:** LeRobot has feedback pose in `observation.state` and desired as `actdelta`. For UMIFT labels we match stringer:
+- **Image size:** write `rgb_0` / `depth_0` / `ultrawide_0` at **224×224** in converters. Train/infer configs already use 224.
+- **Rate:** canonicalize converted data to **10 Hz for every stream** (teleop native; unified→UMIFT converter resamples output the same way). No 15 Hz teleop set exists.
+- **Train/infer retune (required):** because the stack uses index-based asymmetric buffers, zucchini + env-runner must be updated for 10 Hz data. **Most `down_sample_steps` → 1**; horizons retuned so wall-clock history / action chunks stay reasonable (see below). Inference `raw_time_step_s` and layup `*_downsample_correction` updated for 10 Hz training vs live RTDE rates.
+- **Poses:** LeRobot has feedback in `observation.state` and desired as `actdelta`. For UMIFT labels we match stringer:
   - `ts_pose_fb_0` = feedback (rot6d → pose7)
   - `ts_pose_command_0` = feedback (nominal)
   - `ts_pose_virtual_target_0` + `stiffness_0` from **existing** `postprocessing_add_virtual_target_label_umift.py` (fb + wrench)
-  - LeRobot desired/`actdelta` is **not** used for VT (keeps one shared postprocess path)
-- **Query-relative:** unchanged at train/inference via existing `umift_type_conversions`.
-- **Stringer path changes:** only in `convert_unified_t265_wild_to_umift_zarr.py` (resize to 224 + 10 Hz vision/low-dim grid on **output** zarr). Do **not** rewrite bags or source `*_unified.zarr`. Regenerating `acp_replay_buffer.zarr` from unified zarr is optional and out-of-band.
+  - LeRobot desired/`actdelta` is **not** used for VT
+- **Query-relative:** unchanged via existing `umift_type_conversions`.
+- **Stringer path:** only `convert_unified_t265_wild_to_umift_zarr.py` output side (224 + 10 Hz). Never rewrite bags or input `*_unified.zarr`.
 
 ## Pipeline
 
 ```
 LeRobot 08_03 combined
   → convert_lerobot_teleop_to_umift_zarr.py
-  → acp_replay_buffer.zarr  (geometry, zero depth, 224, 10 Hz)
+  → acp_replay_buffer.zarr  (geometry, zero depth, 224, 10 Hz all streams)
   → postprocessing_add_virtual_target_label_umift.py  (unchanged)
-  → train via UmiFTDataset / umift_zucchini.yaml
+  → train with retuned umift_zucchini.yaml
 
 Unified wild recordings (future / regen)
-  → convert_unified_t265_wild_to_umift_zarr.py  (+224 resize, +10 Hz grid)
+  → convert_unified_t265_wild_to_umift_zarr.py  (+224, +10 Hz grid on output)
   → same VT postprocess
   → bags / unified.zarr left untouched
 ```
@@ -46,44 +47,79 @@ Unified wild recordings (future / regen)
 
 | UMIFT key | Source |
 |---|---|
-| `rgb_0` | decode `wrist_cam_0` video; resize 224×224 |
+| `rgb_0` | decode `wrist_cam_0`; resize 224×224 |
 | `depth_0` | zeros `(T,224,224,3)` float16 |
 | `ultrawide_0` | copy of `rgb_0` |
 | `map_to_uw_idx_0` / `map_to_d_idx_0` | identity |
-| `ts_pose_fb_0` | right obs pos3 + rot6d → pose7 `(x,y,z,qw,qx,qy,qz)` |
+| `ts_pose_fb_0` | right obs pos3 + rot6d → pose7 |
 | `ts_pose_command_0` | copy of `ts_pose_fb_0` |
 | `wrench_left_0` | right obs wrench6 |
 | `wrench_right_0` | zeros |
 | `gripper_0` | zeros |
-| `*_time_stamps_0` | LeRobot `timestamp` (episode-relative, 10 Hz) |
-| VT / stiffness | filled later by shared postprocess |
+| all `*_time_stamps_0` | same 10 Hz episode clock |
+| VT / stiffness | shared postprocess |
 
-Episode packaging: `data/episode_k/` + cumulative `meta/episode_*_len` (stringer style). Optional coinft-named wrench mirrors for tooling compatibility.
+Episode packaging: `data/episode_k/` + cumulative `meta/episode_*_len`. Optional coinft-named wrench mirrors.
 
 ## Unified → UMIFT converter changes
 
 In `convert_unified_t265_wild_to_umift_zarr.py` only (output side):
 
 1. Resize rgb / depth / ultrawide to 224×224 before write.
-2. Resample onto a 10 Hz policy grid before write: nearest-neighbor for rgb/depth/ultrawide (+ rebuild `map_to_*_idx`); interpolate pose7 for robot streams; nearest wrench samples. Same grid timestamps on all `*_time_stamps_0` so zucchini `ds`/`horizon` match teleop and 10 Hz inference.
+2. Resample onto a 10 Hz grid: nearest for images (+ rebuild `map_to_*_idx`); interpolate pose7; nearest wrench; shared timestamps.
 3. Never modify bags or input unified zarr in place.
 
-## Training / inference consistency
+## Train / infer config retune (10 Hz)
 
-- Point `task.dataset_path` at the new teleop UMIFT zarr (or a regenerated stringer acp buffer from the updated converter).
-- Keep query-relative kinematics.
-- Run inference observation buffering at **10 Hz** so `horizon × down_sample_steps` matches training wall-clock.
+Target: most `down_sample_steps = 1`. Horizons chosen for wall-clock, not legacy index counts.
+
+### Proposed `umift_zucchini.yaml` (policy rate = 10 Hz)
+
+| Param | Current | Proposed | Wall-clock @ 10 Hz, ds=1 |
+|---|---|---|---|
+| `sparse_obs_rgb_down_sample_steps` | 8 | **1** | — |
+| `sparse_obs_rgb_horizon` | 10 | **50** | 5.0 s history |
+| `sparse_obs_depth_*` | same as rgb | **ds=1, h=50** | 5.0 s |
+| `sparse_obs_low_dim_down_sample_steps` | 2 | **1** | — |
+| `sparse_obs_low_dim_horizon` | 32 | **32** | 3.2 s pose history |
+| `sparse_obs_wrench_down_sample_steps` | 1 | **1** | — |
+| `sparse_obs_wrench_horizon` | 32 | **32** | 3.2 s wrench history |
+| `sparse_action_down_sample_steps` | 2 | **1** | — |
+| `sparse_action_horizon` | 32 | **32** | 3.2 s action chunk |
+| `sparse_query_frequency_down_sample_steps` | 2 | **2** | query @ 5 Hz |
+| `training_duration_per_sparse_query` | 5.0 | keep / align to action span | — |
+
+Rationale: RGB history stays ~5 s (was ~5.3 s at 15 Hz×ds8). Pose/wrench/action at 10 Hz with ds=1 naturally get multi-second windows (pose was only ~0.32 s at 200 Hz — acceptable change once data is 10 Hz). Action chunk 3.2 s is a reasonable diffusion horizon; bump to **50** (5.0 s) if we want the yaml’s old “~5.33 s” comment literally.
+
+### Inference (`umift_env_runner.py` / layup path)
+
+- `raw_time_step_s`: **1/10** (was 1/15 for layup).
+- Live buffers remain fast (RTDE ~500 Hz, cam may still be ~15 Hz). Keep correction factors so **strided sampling matches 10 Hz training wall-clock**:
+  - `robot_downsample_correction` ≈ `live_robot_hz / 10`
+  - `wrench_downsample_correction` ≈ `live_wrench_hz / 10`
+  - depth/rgb corrections updated if live camera ≠ 10 Hz
+- Effective: training `ds=1` on 10 Hz data ↔ inference `ds ≈ live_hz/10` on high-rate buffers.
+
+### Touch points
+
+- `PyriteML/diffusion_policy/config/task/umift_zucchini.yaml`
+- `train_umift_workspace.yaml` only if it overrides horizons/ds
+- `PyriteEnvSuites/env_runners/umift_env_runner.py` (`raw_time_step_s`, corrections)
+- Any playback / open-loop val scripts that hardcode old ds or 15 Hz assumptions
+- Docs/comments that describe AH3-DS8 physical times
 
 ## Validation
 
-- Episode count matches LeRobot meta (47 for source A).
-- `wrench_right_0` all-zero; `depth_0` all-zero; images `(T,224,224,3)`.
-- After VT postprocess: `stiffness_0` in expected band (~200–3000); `ts_pose_virtual_target_0` present.
-- Smoke: construct `UmiFTDataset` and draw one batch without loader resize dependence on native 480×640.
+- Episode count matches LeRobot meta (47).
+- `wrench_right_0` all-zero; `depth_0` all-zero; images `(T,224,224,3)`; all stream lengths equal (10 Hz).
+- After VT: stiffness in ~[200,3000]; VT present.
+- Smoke `UmiFTDataset` batch with retuned zucchini.
+- Inference dry-check: corrected `down_sample_steps` yield intended wall-clock strides.
 
 ## Non-goals
 
 - Using LeRobot desired pose as virtual target.
-- Train-time LeRobot adapter (no on-the-fly parquet/mp4 in `UmiFTDataset`).
+- Train-time LeRobot adapter.
 - Editing original bags or source LeRobot trees.
 - Changing action dim / query-relative math.
+- Collapsing live hardware to 10 Hz publish rates (only training store + sampling math).

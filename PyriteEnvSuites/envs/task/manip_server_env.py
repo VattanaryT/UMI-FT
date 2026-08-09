@@ -126,6 +126,15 @@ class ManipServerEnv:
     def set_high_level_free_jogging(self):
         self.server.set_high_level_free_jogging()
 
+    def pause_rtde_control(self) -> bool:
+        return bool(self.server.pause_rtde_control())
+
+    def resume_rtde_control(self) -> bool:
+        return bool(self.server.resume_rtde_control())
+
+    def is_rtde_control_paused(self) -> bool:
+        return bool(self.server.is_rtde_control_paused())
+
     def calibrate_robot_wrench(self, NSamples=100):
         self.server.calibrate_robot_wrench(NSamples)
 

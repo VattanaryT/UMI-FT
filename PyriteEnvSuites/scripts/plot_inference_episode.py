@@ -64,53 +64,41 @@ def _parse_manip_json_array(text: str) -> list:
 
 
 def load_pose7_offset_tc(hardware_config_path: Optional[str]) -> Optional[np.ndarray]:
-    """Load pose7_offset_TC from hardware yaml; return SE3_TC or None."""
+    """Legacy SE3_TC from pose7_offset_TC, or None for umift_std_v2 (UR TCP only)."""
     if not hardware_config_path:
-        print(
-            "[plot] No hardware_config_path in log attrs; "
-            "skipping compliance-frame pose correction."
-        )
+        print("[plot] No hardware_config_path; poses assumed TCP (umift_std_v2).")
         return None
     if not os.path.isfile(hardware_config_path):
         print(
             f"[plot] hardware_config_path not found: {hardware_config_path}; "
-            "skipping compliance-frame pose correction."
+            "poses assumed TCP (umift_std_v2)."
         )
         return None
     try:
         with open(hardware_config_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
     except Exception as exc:
-        print(
-            f"[plot] Failed to read hardware config ({exc}); "
-            "skipping compliance-frame pose correction."
-        )
+        print(f"[plot] Failed to read hardware config ({exc}); poses assumed TCP.")
         return None
 
     pose7 = cfg.get("pose7_offset_TC")
     if pose7 is None:
-        print(
-            f"[plot] pose7_offset_TC missing in {hardware_config_path}; "
-            "skipping compliance-frame pose correction."
-        )
+        print("[plot] pose7_offset_TC absent; poses assumed TCP (umift_std_v2).")
         return None
 
     pose7 = np.asarray(pose7, dtype=np.float64).reshape(-1)
     if pose7.size != 7:
-        print(
-            f"[plot] pose7_offset_TC has unexpected length {pose7.size}; "
-            "skipping compliance-frame pose correction."
-        )
+        print(f"[plot] pose7_offset_TC length {pose7.size}; skipping.")
         return None
 
-    # Match C++ apply_tc_offset gate: skip if translation is ~zero.
+    # umift_std_v2: identity / zero translation — no software flange↔TCP.
     if np.linalg.norm(pose7[:3]) < 1e-6:
-        print("[plot] pose7_offset_TC translation ~0; no pose correction needed.")
+        print("[plot] pose7_offset_TC identity; UR/RTDE TCP only (umift_std_v2).")
         return None
 
     se3_tc = su.pose7_to_SE3(pose7)
     print(
-        f"[plot] Correcting JSON pose_fb from compliance frame using "
+        f"[plot] LEGACY: correcting JSON pose_fb using "
         f"pose7_offset_TC={pose7.tolist()} from {hardware_config_path}"
     )
     return se3_tc
