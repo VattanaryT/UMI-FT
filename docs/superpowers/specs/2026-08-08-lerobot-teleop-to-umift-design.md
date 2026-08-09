@@ -78,18 +78,18 @@ Target: most `down_sample_steps = 1`. Horizons chosen for wall-clock, not legacy
 | Param | Current | Proposed | Wall-clock @ 10 Hz, ds=1 |
 |---|---|---|---|
 | `sparse_obs_rgb_down_sample_steps` | 8 | **1** | — |
-| `sparse_obs_rgb_horizon` | 10 | **50** | 5.0 s history |
-| `sparse_obs_depth_*` | same as rgb | **ds=1, h=50** | 5.0 s |
+| `sparse_obs_rgb_horizon` | 10 | **16** | 1.6 s history |
+| `sparse_obs_depth_*` | same as rgb | **ds=1, h=16** | 1.6 s |
 | `sparse_obs_low_dim_down_sample_steps` | 2 | **1** | — |
-| `sparse_obs_low_dim_horizon` | 32 | **32** | 3.2 s pose history |
+| `sparse_obs_low_dim_horizon` | 32 | **16** | 1.6 s pose history |
 | `sparse_obs_wrench_down_sample_steps` | 1 | **1** | — |
-| `sparse_obs_wrench_horizon` | 32 | **32** | 3.2 s wrench history |
+| `sparse_obs_wrench_horizon` | 32 | **16** | 1.6 s wrench history |
 | `sparse_action_down_sample_steps` | 2 | **1** | — |
 | `sparse_action_horizon` | 32 | **32** | 3.2 s action chunk |
-| `sparse_query_frequency_down_sample_steps` | 2 | **2** | query @ 5 Hz |
+| `sparse_query_frequency_down_sample_steps` | 2 | **1** | query @ 10 Hz |
 | `training_duration_per_sparse_query` | 5.0 | keep / align to action span | — |
 
-Rationale: RGB history stays ~5 s (was ~5.3 s at 15 Hz×ds8). Pose/wrench/action at 10 Hz with ds=1 naturally get multi-second windows (pose was only ~0.32 s at 200 Hz — acceptable change once data is 10 Hz). Action chunk 3.2 s is a reasonable diffusion horizon; bump to **50** (5.0 s) if we want the yaml’s old “~5.33 s” comment literally.
+Rationale: at 10 Hz with `ds=1`, histories are denser than the old sparsely strided buffers, so **horizon 16** (~1.6 s) is enough for rgb/depth/pose/wrench. Action chunk stays **32** (3.2 s). Query every step (10 Hz).
 
 ### Inference (`umift_env_runner.py` / layup path)
 
