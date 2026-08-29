@@ -5,6 +5,7 @@ from typing import Optional
 
 import dill
 import torch
+import wandb
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
 
@@ -30,6 +31,57 @@ class BaseWorkspace:
         Create any resource shouldn't be serialized as local variables
         """
         pass
+
+    def init_wandb_trackers(self, accelerator, cfg):
+        """Start accelerate's wandb tracker without depending on wandb's
+        local resume='auto' bookkeeping file.
+
+        Passing `resume=True` straight through to `wandb.init()` (as the old
+        per-workspace `run()` code did) makes wandb treat it as
+        `resume="auto"`, which tries to read/write a local
+        `<dir>/wandb/wandb-resume.json` file to remember the run id across
+        process restarts *in the same working directory*. That assumption
+        breaks in this Slurm+apptainer setup: the default wandb dir is the
+        process cwd, which is the read-only container image tree, and even
+        after pointing WANDB_DIR elsewhere, each job/container invocation
+        doesn't share a pre-existing writable `wandb/` folder for it to
+        write into -- both cases crash inside `_save_autoresume_run_id`.
+
+        Instead we manage a stable run id ourselves, stored as a plain text
+        file next to the checkpoints (a directory that is writable,
+        job-specific, and persists across resumes), and always pass
+        `resume="allow"` with that explicit id. `resume="allow"` never
+        touches the local auto-resume file (only `resume="auto"` does): it
+        just resumes the run with that id on the wandb server if it already
+        exists, or starts a new one otherwise.
+        """
+        wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
+        project = wandb_cfg.pop("project")
+        wandb_cfg.pop("log_every", None)  # train-loop knob, not a wandb.init arg
+        wants_resume = bool(wandb_cfg.pop("resume", False))
+
+        run_id_path = pathlib.Path(self.output_dir) / "wandb_run_id.txt"
+        run_id = wandb_cfg.get("id")
+        if run_id is None and wants_resume and run_id_path.is_file():
+            run_id = run_id_path.read_text().strip() or None
+        if run_id is None:
+            run_id = wandb.util.generate_id()
+
+        run_id_path.parent.mkdir(parents=True, exist_ok=True)
+        run_id_path.write_text(run_id)
+
+        wandb_cfg["id"] = run_id
+        wandb_cfg["resume"] = "allow"
+        # Keep wandb's own local run files under the writable, persistent
+        # checkpoint output dir instead of defaulting to cwd (read-only
+        # container image) or requiring WANDB_DIR to already exist.
+        wandb_cfg.setdefault("dir", self.output_dir)
+
+        accelerator.init_trackers(
+            project_name=project,
+            config=OmegaConf.to_container(cfg, resolve=True),
+            init_kwargs={"wandb": wandb_cfg},
+        )
 
     def save_checkpoint(
         self,

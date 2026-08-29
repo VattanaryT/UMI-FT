@@ -25,6 +25,7 @@ from PyriteUtility.spatial_math import spatial_utilities as su
 
 from PyriteEnvSuites.envs.task.manip_server_layup_env import ManipServerLayupEnv
 # from PyriteEnvSuites.envs.task.manip_server_umift_env import ManipServerUMIFTEnv
+from PyriteEnvSuites.envs.task.run_layup_scan_periodic import run_layup_scan_periodic
 
 from PyriteEnvSuites.utils.env_utils import (
     pose9g1_to_traj,
@@ -48,6 +49,34 @@ def _parse_tagged_line(stdout: str, tag: str) -> Optional[str]:
     return match.group(1).strip()
 
 
+def _pose7_with_y_offset(pose7: np.ndarray, dy_m: float) -> np.ndarray:
+    out = np.array(pose7, dtype=np.float64, copy=True)
+    out[1] += dy_m
+    return out
+
+
+def _stitch_pose7_path(
+    poses: List[np.ndarray],
+    durations_s: List[float],
+    n_per_seg: List[int],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Interpolate pose7 waypoints; drop duplicate joints between segments."""
+    chunks_w: List[np.ndarray] = []
+    chunks_t: List[np.ndarray] = []
+    t_cursor = 0.0
+    for i, (dur, n) in enumerate(zip(durations_s, n_per_seg)):
+        alpha = np.linspace(0.0, 1.0, n)
+        waypoints = su.pose7_interp(poses[i], poses[i + 1], alpha)
+        times = np.linspace(t_cursor, t_cursor + dur, n)
+        if i > 0:
+            waypoints = waypoints[1:]
+            times = times[1:]
+        chunks_w.append(waypoints)
+        chunks_t.append(times)
+        t_cursor += dur
+    return np.concatenate(chunks_w, axis=0), np.concatenate(chunks_t, axis=0)
+
+
 def home_to_pose7(
     env,
     id_list: list,
@@ -55,18 +84,51 @@ def home_to_pose7(
     duration_s: float = 5.0,
     n_samples: int = 100,
     wait: bool = True,
+    lift_m: float = 0.10,
 ) -> None:
-    """Interpolate from current TCP pose(s) back to episode-start pose7."""
+    """Interpolate from current TCP pose(s) back to episode-start pose7.
+
+    Default path first lifts ``lift_m`` in -Y (base frame, same convention as
+    scan park-clear), travels at that height, then descends onto start.
+    """
     obs_raw = env.get_observation_from_buffer()
-    sample_indices = np.linspace(0, 1, n_samples)
-    timestamps = sample_indices * duration_s
-    homing_ts_targets = np.zeros([7 * len(id_list), n_samples])
-    for rid in id_list:
-        ts_pose_fb = obs_raw[f"ts_pose_fb_{rid}"][-1]
-        pose7_waypoints = su.pose7_interp(
-            ts_pose_fb, ts_pose_initial[rid], sample_indices
-        )
-        homing_ts_targets[0 + rid * 7 : 7 + rid * 7, :] = pose7_waypoints.T
+    if lift_m > 0.0:
+        n_lift = max(2, int(round(n_samples * 0.2)))
+        n_descend = n_lift
+        n_transit = max(2, n_samples - n_lift - n_descend)
+        durations_s = [
+            0.2 * duration_s,
+            0.6 * duration_s,
+            0.2 * duration_s,
+        ]
+        n_per_seg = [n_lift, n_transit, n_descend]
+        waypoints_by_id: Dict[int, np.ndarray] = {}
+        timestamps: Optional[np.ndarray] = None
+        for rid in id_list:
+            current = np.asarray(obs_raw[f"ts_pose_fb_{rid}"][-1], dtype=np.float64)
+            goal = np.asarray(ts_pose_initial[rid], dtype=np.float64)
+            current_up = _pose7_with_y_offset(current, -lift_m)
+            goal_up = _pose7_with_y_offset(goal, -lift_m)
+            waypoints, timestamps = _stitch_pose7_path(
+                [current, current_up, goal_up, goal],
+                durations_s,
+                n_per_seg,
+            )
+            waypoints_by_id[rid] = waypoints
+        assert timestamps is not None
+        homing_ts_targets = np.zeros([7 * len(id_list), timestamps.shape[0]])
+        for rid in id_list:
+            homing_ts_targets[rid * 7 : rid * 7 + 7, :] = waypoints_by_id[rid].T
+    else:
+        sample_indices = np.linspace(0, 1, n_samples)
+        timestamps = sample_indices * duration_s
+        homing_ts_targets = np.zeros([7 * len(id_list), n_samples])
+        for rid in id_list:
+            ts_pose_fb = obs_raw[f"ts_pose_fb_{rid}"][-1]
+            pose7_waypoints = su.pose7_interp(
+                ts_pose_fb, ts_pose_initial[rid], sample_indices
+            )
+            homing_ts_targets[0 + rid * 7 : 7 + rid * 7, :] = pose7_waypoints.T
     time_now_s = env.current_hardware_time_s
     env.schedule_controls(
         pose7_cmd=homing_ts_targets,
@@ -114,26 +176,30 @@ def run_compare_pointcloud(
     png_path: Path,
     score_json: Path,
     session_dir: Path,
+    zones_config: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """Blocking compare; safe to run in a background thread."""
     print(
         f"[layup-eval] [bg] Episode {episode_id}: comparing "
         f"{high_ply.name} vs {low_ply.name}..."
     )
+    cmd = [
+        str(keyence_python),
+        str(compare_script),
+        "--high",
+        str(high_ply),
+        "--low",
+        str(low_ply),
+        "--no-show",
+        "--png",
+        str(png_path),
+        "--score-json",
+        str(score_json),
+    ]
+    if zones_config is not None:
+        cmd.extend(["--zones-config", str(zones_config)])
     cmp_proc = subprocess.run(
-        [
-            str(keyence_python),
-            str(compare_script),
-            "--high",
-            str(high_ply),
-            "--low",
-            str(low_ply),
-            "--no-show",
-            "--png",
-            str(png_path),
-            "--score-json",
-            str(score_json),
-        ],
+        cmd,
         cwd=str(keyence_ws),
         capture_output=True,
         text=True,
@@ -148,10 +214,16 @@ def run_compare_pointcloud(
             "compare_pointcloud_distance failed with code "
             f"{cmp_proc.returncode}"
         )
+    zones: Optional[Dict[str, Any]] = None
+    zones_axis: Optional[str] = None
     if score_json.is_file():
         score = json.loads(score_json.read_text(encoding="utf-8"))
         mean_mm = float(score["mean_mm"])
         heatmap = str(score.get("png", png_path))
+        raw_zones = score.get("zones")
+        if isinstance(raw_zones, dict):
+            zones = raw_zones
+            zones_axis = score.get("eval_zones_axis")
     else:
         mean_s = _parse_tagged_line(cmp_proc.stdout, "EVAL_MEAN_MM")
         if mean_s is None:
@@ -160,7 +232,7 @@ def run_compare_pointcloud(
             )
         mean_mm = float(mean_s)
         heatmap = str(png_path)
-    result = {
+    result: Dict[str, Any] = {
         "episode_id": int(episode_id),
         "mean_mm": float(mean_mm),
         "heatmap_png": str(heatmap),
@@ -168,10 +240,27 @@ def run_compare_pointcloud(
         "high_ply": str(high_ply),
         "low_ply": str(low_ply),
     }
+    if zones is not None:
+        result["zones"] = zones
+        if zones_axis is not None:
+            result["eval_zones_axis"] = zones_axis
     print(
         f"[layup-eval] [bg] Episode {episode_id} mean distance: "
         f"{result['mean_mm']:.3f} mm"
     )
+    if zones:
+        zone_bits = []
+        for name, z in zones.items():
+            mean_z = z.get("mean_mm")
+            count = int(z.get("count", 0))
+            if mean_z is None or count <= 0:
+                zone_bits.append(f"{name}=n/a")
+            else:
+                zone_bits.append(f"{name}={float(mean_z):.3f}mm")
+        print(
+            f"[layup-eval] [bg] Episode {episode_id} zones: "
+            + ", ".join(zone_bits)
+        )
     print(f"[layup-eval] [bg] Heatmap: {result['heatmap_png']}")
     return result
 
@@ -206,6 +295,7 @@ def run_layup_scan_eval(
     session_name = f"inference_ep{episode_id}_{int(time.time())}"
     scan_script = keyence_ws / "scripts" / "run_layup_scan.py"
     compare_script = keyence_ws / "utils" / "compare_pointcloud_distance.py"
+    zones_config = keyence_ws / "config" / "layup_scan.yaml"
     joints_csv = ",".join(f"{q:.9g}" for q in right_return_joints)
 
     print(f"[layup-eval] Pausing RTDE control for episode {episode_id}...")
@@ -282,6 +372,7 @@ def run_layup_scan_eval(
         png_path=png_path,
         score_json=score_json,
         session_dir=session_dir,
+        zones_config=zones_config if zones_config.is_file() else None,
     )
 
 
@@ -312,12 +403,78 @@ def print_layup_eval_summary(results: List[Dict[str, Any]]) -> None:
         print("(no evaluations run)")
         print("===================================================\n")
         return
-    print(f"{'Episode':>8}  {'mean_mm':>10}  heatmap")
+    zone_names: List[str] = []
     for r in results:
+        for name in (r.get("zones") or {}):
+            if name not in zone_names:
+                zone_names.append(name)
+    zone_hdr = "".join(f"  {name:>10}" for name in zone_names)
+    print(f"{'Episode':>8}  {'mean_mm':>10}{zone_hdr}  heatmap")
+    for r in results:
+        zone_cols = ""
+        zones = r.get("zones") or {}
+        for name in zone_names:
+            z = zones.get(name) or {}
+            mean_z = z.get("mean_mm")
+            count = int(z.get("count", 0))
+            if mean_z is None or count <= 0:
+                zone_cols += f"  {'n/a':>10}"
+            else:
+                zone_cols += f"  {float(mean_z):>10.3f}"
         print(
-            f"{r['episode_id']:>8}  {r['mean_mm']:>10.3f}  {r['heatmap_png']}"
+            f"{r['episode_id']:>8}  {r['mean_mm']:>10.3f}{zone_cols}  "
+            f"{r['heatmap_png']}"
         )
     print("===================================================\n")
+
+
+def layup_eval_json_path(ckpt_path: Path) -> Path:
+    """JSON path adjacent to the checkpoint: ``<stem>_layup_eval.json``."""
+    return ckpt_path.with_name(f"{ckpt_path.stem}_layup_eval.json")
+
+
+def save_layup_eval_results(
+    ckpt_path: Path,
+    results: List[Dict[str, Any]],
+) -> Optional[Path]:
+    """Append layup-eval results to JSON next to the checkpoint.
+
+    Re-running on the same ckpt merges into any existing file rather than
+    overwriting prior episode scores.
+    """
+    if not results:
+        return None
+    out_path = layup_eval_json_path(ckpt_path)
+    existing: List[Dict[str, Any]] = []
+    if out_path.is_file():
+        try:
+            prior = json.loads(out_path.read_text(encoding="utf-8"))
+            prior_eps = prior.get("episodes")
+            if isinstance(prior_eps, list):
+                existing = prior_eps
+            else:
+                print(
+                    f"[layup-eval] WARNING: {out_path} has no episodes list; "
+                    "starting fresh merge from new results only."
+                )
+        except (json.JSONDecodeError, OSError) as exc:
+            print(
+                f"[layup-eval] WARNING: could not read {out_path} ({exc}); "
+                "overwriting with this run's results."
+            )
+    merged = existing + list(results)
+    payload = {
+        "ckpt_path": str(ckpt_path),
+        "num_episodes": len(merged),
+        "episodes": merged,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"[layup-eval] Wrote results: {out_path} "
+        f"(appended {len(results)}, total {len(merged)})"
+    )
+    return out_path
 
 
 def _stiffness_6x6n_to_per_step(stiffness_6x6n: np.ndarray) -> np.ndarray:
@@ -478,15 +635,19 @@ def log_horizon(
 
 def main():
     control_para = {
-        # D405 @ 15 Hz for layup stack; iPhone/GoPro legacy path uses 0.0167 (~60 Hz).
+        # Training policy rate = 10 Hz; iPhone/GoPro legacy path uses 0.0167 (~60 Hz).
         "raw_time_step_s": 1.0 / 15.0,
         "slow_down_factor": 2,  # slow down policy execution by this factor
+        # Must be <= the loaded checkpoint's sparse_action_horizon (epoch=0170 is 12;
+        # new 10 Hz yaml uses 32). With ensemble on, smaller => more overlap.
         "sparse_execution_horizon": 14, # first step is at t=0, so this should be >1
         # Zero-added-latency temporal ensembling of overlapping action chunks.
         # Lower sparse_execution_horizon with this on increases overlap/smoothing.
         "enable_ensemble_chunking": True,
         "ensemble_decay_m": 0.01,  # 0 = uniform; >0 trusts near-term steps more (exp)
-        "max_duration_s": 3500,
+        # Per-episode wall-clock cutoff (hardware time). Episode ends and
+        # returns to the post-episode menu when exceeded. Default: 4 minutes.
+        "max_duration_s": 4 * 60,
         "gripper_action_scale": 1000,
         "use_audio": False,
         "gripper_lookahead_steps": 0,  # how many steps to look ahead for gripper action
@@ -503,9 +664,20 @@ def main():
         "keyence_ws": "/home/boeing/keyence_scan_ws",
         "keyence_python": "/home/boeing/keyence_scan_ws/.venv/bin/python",
         # Reference / "low" surface PLY for compare_pointcloud_distance --low
-        "layup_eval_low_ply": "/mnt/data/boeing/scans/scan_20260808_144428/merged.ply",
+        "layup_eval_low_ply": "/mnt/data/boeing/scans/scan_20260817_173630/merged.ply",
         # Right-arm IP for capturing episode-start joints (RTDE receive).
         "layup_eval_right_ip": "192.168.1.2",
+        # Periodic mid-episode Keyence layup scan interrupts
+        # (run_layup_scan_periodic). Distinct from the post-episode-only "e"
+        # menu option (run_layup_scan_eval) above: this pauses/resumes the
+        # LIVE control loop itself, roughly every periodic_scan_interval_s
+        # seconds during an episode. Each call cold-starts run_layup_scan.py
+        # (no persistent daemon) and resumes control only after the new
+        # scan_heatmap_0 has been loaded, since the policy conditions on it.
+        "periodic_scan_enabled": False,
+        "periodic_scan_interval_s": 30.0,
+        "periodic_scan_timeout_s": 90.0,
+        "periodic_scan_compare_timeout_s": 30.0,
     }
     pipeline_para = {
         # Layup: D405 rgb (manip_server) + depth (pyrealsense2) + UR5e wrist FT.
@@ -514,13 +686,14 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        "ckpt_path": "/2026.07.30_22.08.36_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI/checkpoints/epoch=0040-train_loss=0.019.ckpt",
+        "ckpt_path": "/stringer_scanner/no_scan_or_tag/epoch=0175-train_loss=0.013.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
-        # D405 depth @ 15 Hz (no iPhone 60 Hz / 30 Hz correction).
+        # D405 rgb/depth ~15 Hz live vs 10 Hz training → 15/10=1.5; //= floor → 1.
         "depth_downsample_correction": 1,
-        # UR RTDE ~500 Hz at inference vs wild collection ~200 Hz pose / ~28 Hz wrench.
+        # Live wrist FT via UR RTDE at 500 Hz (ur5e_wrist_ft.yaml: rtde_frequency=500,
+        # run_wrench_thread=false); scale ds to match 10 Hz training wall-clock.
         "robot_downsample_correction": 500.0 / 200.0,
         "wrench_downsample_correction": 500.0 / 28.0,
     }
@@ -546,7 +719,10 @@ def main():
         for key, attr in obs_shape_meta.items():
             type = attr.get("type", "low_dim")
             shape = attr.get("shape")
-            if type == "rgb":
+            # scan_heatmap_* is typed rgb for the data pipeline but has a
+            # different (H, W) than rgb_0/depth_0; exclude it here the same
+            # way timm_obs_encoder_with_force._is_scan_heatmap_key does.
+            if type == "rgb" and "scan_heatmap" not in key:
                 co, ho, wo = shape
                 if out_res is None:
                     out_res = (wo, ho)
@@ -562,11 +738,12 @@ def main():
     # vbs_p = verbose - 1  # verbosity for paragraph
 
     # load policy
-    print("Loading policy: ", checkpoint_folder_path + pipeline_para["ckpt_path"])
-    device = torch.device(control_para["device"])
-    policy, shape_meta = load_policy(
-        checkpoint_folder_path + pipeline_para["ckpt_path"], device
+    ckpt_full_path = Path(
+        checkpoint_folder_path + pipeline_para["ckpt_path"]
     )
+    print("Loading policy: ", ckpt_full_path)
+    device = torch.device(control_para["device"])
+    policy, shape_meta = load_policy(str(ckpt_full_path), device)
 
     # image size
     (image_width, image_height) = get_real_obs_resolution(shape_meta)
@@ -591,25 +768,24 @@ def main():
     if len(vision_key) > 2:
         raise ValueError("More than two vision modalities present in shape_meta.")
 
-    print("====================Remove this later==========================")
+    # Drop unused camera streams from shape_meta.raw (e.g. ultrawide when only
+    # rgb_0 is active). Do NOT drop scan_heatmap_*: it is typed rgb for the data
+    # pipeline but is not a camera stream, and MPC still samples it from
+    # shape_meta.sample.obs.sparse via raw_to_obs_inference.
     from omegaconf import OmegaConf
 
-    # Temporarily disable struct mode to allow deletions
     OmegaConf.set_struct(shape_meta["raw"], False)
-
-    # ... perform deletions ...
-    valid_keys = set(vision_key)
+    valid_camera_keys = set(vision_key)
     raw_vision_keys = [
         k for k, v in shape_meta["raw"].items() if v.get("type") == "rgb"
     ]
     for key in raw_vision_keys:
-        if key not in valid_keys:
-            print(f"[DEBUG] Removing invalid vision key from raw: {key}")
+        if "scan_heatmap" in key:
+            continue
+        if key not in valid_camera_keys:
+            print(f"Removing unused camera key from raw: {key}")
             del shape_meta["raw"][key]
-
-    # Optionally re-enable struct mode to protect against future accidental changes
     OmegaConf.set_struct(shape_meta["raw"], True)
-    print("====================Remove this later==========================")
 
     print(f"Vision Keys for id:0 in this shape meta: {vision_key}")
 
@@ -621,7 +797,7 @@ def main():
         shape_meta["sample"]["obs"]["sparse"][rgb_key]["horizon"] - 1
     ) * shape_meta["sample"]["obs"]["sparse"][rgb_key]["down_sample_steps"] + 1
 
-    # Depth physically streams at 30Hz. The shape_meta parameters are all defined based on a (effectively) 60Hz stream.
+    # Depth: live D405 ~15 Hz; shape_meta ds/h are for 10 Hz training. Floor-correction via //=.
     # Correction for depth downsampling
     if "depth_0" in shape_meta["sample"]["obs"]["sparse"]:
         shape_meta["sample"]["obs"]["sparse"]["depth_0"]["down_sample_steps"] //= (
@@ -636,8 +812,8 @@ def main():
     else:
         depth_query_size = None
 
-    # Layup: scale down_sample_steps so MPC striding on ~500 Hz RTDE buffers
-    # matches wild-collection effective rates (~200 Hz pose, ~28 Hz wrench).
+    # Layup: scale down_sample_steps so MPC striding on ~500 Hz RTDE (pose + wrist FT)
+    # buffers matches 10 Hz training wall-clock (ds=1 on 10 Hz zarr).
     if pipeline_para["use_layup_env"]:
         OmegaConf.set_struct(shape_meta["sample"]["obs"]["sparse"], False)
         robot_corr = pipeline_para["robot_downsample_correction"]
@@ -757,6 +933,13 @@ def main():
         )
 
     env.reset()
+
+    # Periodic mid-episode scan interrupts (see
+    # control_para["periodic_scan_*"] above). run_layup_scan_periodic() is
+    # called directly from the main loop below -- no persistent
+    # daemon/controller object to construct or tear down per episode.
+    periodic_scan_enabled = bool(control_para.get("periodic_scan_enabled", False))
+    next_scan_id = 0
 
     p_timestep_s = control_para["raw_time_step_s"]
 
@@ -943,10 +1126,47 @@ def main():
             )
 
         episode_initial_time_s = env.current_hardware_time_s
+        last_scan_time_s = -float("inf")
         killer = GracefulKiller()
         while not killer.kill_now:
             horizon_initial_time_s = env.current_hardware_time_s
             printOrNot(vbs_h1, "Starting new horizon at ", horizon_initial_time_s)
+
+            # Periodic mid-episode laser scan interrupt: pauses RTDE control,
+            # runs a one-shot run_layup_scan.py, loads the new heatmap, then
+            # resumes RTDE control -- all inside run_layup_scan_periodic(),
+            # blocking this single-threaded loop. Nothing below this point
+            # runs until it returns, which is what keeps the D405/pose/wrench
+            # buffers' *observed* history uncorrupted (same reasoning the old
+            # ScanPauseController relied on); the loop simply resumes calling
+            # env.get_observation_from_buffer() fresh afterward.
+            if (
+                periodic_scan_enabled
+                and horizon_initial_time_s - last_scan_time_s
+                >= control_para["periodic_scan_interval_s"]
+            ):
+                scan_id = next_scan_id
+                next_scan_id += 1
+                printOrNot(
+                    vbs_h1, f"Pausing for periodic laser scan (scan_id={scan_id})..."
+                )
+                outcome = run_layup_scan_periodic(
+                    env=env, scan_id=scan_id, control_para=control_para
+                )
+                if outcome.success:
+                    printOrNot(
+                        vbs_h1,
+                        f"Scan {scan_id} complete: {outcome.session_dir} "
+                        f"(duration={outcome.duration_s:.1f}s)",
+                    )
+                else:
+                    printOrNot(vbs_h1, f"Scan {scan_id} FAILED: {outcome.error}")
+                # Real wall-clock time passed during the scan; refresh both
+                # the horizon clock (used below for execution-duration sleep
+                # math) and the periodic-scan clock (measured from when this
+                # scan actually finished, not when it was due).
+                horizon_initial_time_s = env.current_hardware_time_s
+                last_scan_time_s = horizon_initial_time_s
 
             obs_raw = env.get_observation_from_buffer()
 
@@ -1234,6 +1454,15 @@ def main():
             if action_ensemblers is not None:
                 start_step = horizon_count * exec_h
                 for id in id_list:
+                    chunk_len = int(np.asarray(outputs_ts_targets[id]).shape[0])
+                    if exec_h > chunk_len:
+                        raise ValueError(
+                            f"sparse_execution_horizon={exec_h} exceeds policy "
+                            f"action chunk length={chunk_len} (robot {id}). "
+                            f"Lower sparse_execution_horizon to <= {chunk_len} "
+                            f"(loaded ckpt horizon), or retrain with a longer "
+                            f"sparse_action_horizon."
+                        )
                     fields = {
                         "pose7": outputs_ts_targets[id],
                         "nominal_pose7": outputs_ts_nominal_targets[id],
@@ -1332,7 +1561,13 @@ def main():
 
             if not control_para["pausing_mode"]:
                 # only check duration when not in pausing mode
-                if time_s - episode_initial_time_s > control_para["max_duration_s"]:
+                elapsed_s = time_s - episode_initial_time_s
+                if elapsed_s > control_para["max_duration_s"]:
+                    printOrNot(
+                        vbs_h1,
+                        f"Episode cutoff: {elapsed_s:.1f}s > "
+                        f"max_duration_s={control_para['max_duration_s']}",
+                    )
                     break
 
         printOrNot(vbs_h1, "End of episode.")
@@ -1347,6 +1582,10 @@ def main():
         print(
             "     e: layup scan eval (scan+restore now; compare runs in background)."
         )
+        print(
+            "     s: layup scan eval then quit "
+            "(wait for compare; save results next to ckpt)."
+        )
         print("     b: reset to default pose, then quit the program.")
         print("     others: quit the program.")
         # Surface any compares that finished during the previous episode.
@@ -1354,7 +1593,7 @@ def main():
             collect_layup_eval_futures(layup_eval_futures, wait=False)
         )
         c = input("Please select an option: ")
-        if c == "e":
+        if c in ("e", "s"):
             if right_start_joints is None:
                 print(
                     "[layup-eval] Cannot run: right start joints were not "
@@ -1379,6 +1618,11 @@ def main():
                         env.resume_rtde_control()
                     except Exception as resume_exc:
                         print(f"[layup-eval] resume also failed: {resume_exc}")
+            if c == "s":
+                print(
+                    "[layup-eval] Scan queued; waiting for compare, then quitting."
+                )
+                break
             input("Press Enter to continue.")
         elif c == "r" or c == "b":
             print("Resetting to default pose.")
@@ -1410,6 +1654,7 @@ def main():
         collect_layup_eval_futures(layup_eval_futures, wait=True)
     )
     print_layup_eval_summary(layup_eval_results)
+    save_layup_eval_results(ckpt_full_path, layup_eval_results)
     compare_executor.shutdown(wait=True)
     env.cleanup()
     # end of episode

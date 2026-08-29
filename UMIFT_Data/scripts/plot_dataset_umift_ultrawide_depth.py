@@ -34,7 +34,7 @@ if "PYRITE_DATASET_FOLDERS" not in os.environ:
 dataset_folder_path = os.environ.get("PYRITE_DATASET_FOLDERS")
 dataset_path = os.environ.get(
     "UMIFT_DATASET_PATH",
-    "/mnt/data/umidata/ft/stringer_data_v2_full/acp_replay_buffer.zarr",
+    "/mnt/data/umidata/ft/datasets/stringer_scanner/t265_acp_replay_buffer_zero_scan.zarr",
 )
 
 print("Loading dataset from: ", dataset_path)
@@ -43,7 +43,7 @@ print("Loading dataset from: ", dataset_path)
 buffer = zarr.open(dataset_path, mode="r+")
 
 # select which episode to visualize    
-ep = "episode_48"
+ep = "episode_35"
 print("Loading episode: ", ep)
 print(buffer.tree())
 
@@ -166,6 +166,53 @@ print("got data1")
 map_to_uw_idx = np.array(buffer["data"][ep]["map_to_uw_idx_0"])
 map_to_d_idx = np.array(buffer["data"][ep]["map_to_d_idx_0"])
 
+# Optional: periodic laser-scan data (absent entirely for episodes recorded
+# without scans, or datasets predating this feature -- treat that as a
+# normal, expected case, not an error).
+SCAN_HEATMAP_CLIP_MM = 5.0  # matches task.scan_heatmap_clip_mm's default
+has_scan_data = "scan_heatmap_0" in buffer["data"][ep] and "map_to_scan_idx_0" in buffer["data"][ep]
+if has_scan_data:
+    scan_heatmap = np.array(buffer["data"][ep]["scan_heatmap_0"])
+    map_to_scan_idx = np.array(buffer["data"][ep]["map_to_scan_idx_0"])
+    print(f"got scan data: {scan_heatmap.shape[0]} scan(s)")
+else:
+    scan_heatmap = None
+    map_to_scan_idx = None
+    print("no scan data for this episode")
+
+if "scan_gap_intervals_0" in buffer["data"][ep]:
+    scan_gap_intervals = np.array(buffer["data"][ep]["scan_gap_intervals_0"]).reshape(-1, 2)
+else:
+    scan_gap_intervals = np.zeros((0, 2))
+
+
+def _gap_containing(t):
+    """Return the (start, end) scan-gap interval containing time t, or None."""
+    for start, end in scan_gap_intervals:
+        if start <= t <= end:
+            return float(start), float(end)
+    return None
+
+
+def _skip_gap(idx, direction):
+    """If plot_time[idx] falls inside a scan-gap interval, move idx to just
+    past that interval's edge in the given direction (+1 or -1), repeating
+    in case of adjacent/overlapping intervals. Clamps to the array bounds
+    if the rest of the trajectory in that direction is entirely gap."""
+    idx = int(np.clip(idx, 0, len(plot_time) - 1))
+    for _ in range(len(scan_gap_intervals) + 1):
+        hit = _gap_containing(float(plot_time[idx]))
+        if hit is None:
+            return idx
+        start, end = hit
+        if direction >= 0:
+            idx = int(np.searchsorted(plot_time, end, side="right"))
+        else:
+            idx = int(np.searchsorted(plot_time, start, side="left")) - 1
+        idx = int(np.clip(idx, 0, len(plot_time) - 1))
+    return idx
+
+
 titles = [
     title_pos,
     title_rot,
@@ -177,12 +224,13 @@ print("Finished loading data")
 
 
 # Initialize figure and axes
-fig = plt.figure(figsize=(12, 20))
-gs = fig.add_gridspec(6, 3, height_ratios=[3, 1, 1, 1, 1, 1], hspace=0.8, wspace=0.3)
+fig = plt.figure(figsize=(15, 20))
+gs = fig.add_gridspec(6, 4, height_ratios=[3, 1, 1, 1, 1, 1], hspace=0.8, wspace=0.3)
 
 ax_rgb = fig.add_subplot(gs[0, 0])
 ax_uw = fig.add_subplot(gs[0, 1])
 ax_depth = fig.add_subplot(gs[0, 2])
+ax_scan = fig.add_subplot(gs[0, 3])
 ax1 = fig.add_subplot(gs[1, :])
 ax1_rot = fig.add_subplot(gs[2, :])
 ax2 = fig.add_subplot(gs[3, :])
@@ -190,17 +238,18 @@ ax3 = fig.add_subplot(gs[4, :])
 ax4 = fig.add_subplot(gs[5, :])
 
 
-# ax_rgb, ax_uw, ax_depth, ax1, ax2, ax3, ax4 = axes
+# ax_rgb, ax_uw, ax_depth, ax_scan, ax1, ax2, ax3, ax4 = axes
 ax_rgb.axis("off")
 ax_uw.axis("off")
 ax_depth.axis("off")
+ax_scan.axis("off")
 
 
 # Set plot title
 fig.suptitle(
     f"Plotting for {ep}. "
     f"Pose: {'global' if use_absolute_pose else 'rel. frame 0'} "
-    f"(left/right: rgb frame, a: toggle pose frame)"
+    f"(left/right: rgb frame [skips scan-gap segments], a: toggle pose frame)"
 )
 
 # Plot data
@@ -213,6 +262,15 @@ ax4.plot(time_data4, data4, '.-')
 time_axes = [ax1, ax1_rot, ax2, ax3, ax4]
 for ax in time_axes:
     ax.set_xlim(plot_xlim)
+
+# Shade scan-gap intervals (the windows excluded from action-sampling by
+# SequenceSamplerUmiFT's scan_gap_intervals_0 filter) on every time-series
+# axis, drawn once since these don't change per-frame.
+for start, end in scan_gap_intervals:
+    for ax in time_axes:
+        ax.axvspan(start, end, color="orange", alpha=0.25, zorder=0, label="_scan_gap")
+if len(scan_gap_intervals) > 0:
+    print(f"scan gaps ({len(scan_gap_intervals)}): {scan_gap_intervals.tolist()}")
 
 # Set titles
 ax1.set_title(titles[0])
@@ -227,7 +285,7 @@ ax1_rot.legend(["roll (x)", "pitch (y)", "yaw (z)"])
 ax3.legend(["x", "y", "z"])
 
 # Shared vertical cursor (indexed to RGB frames)
-cursor_frame_idx = 0
+cursor_frame_idx = _skip_gap(0, +1)
 cursor_time = float(plot_time[cursor_frame_idx])
 cursor_line = [ax1.axvline(cursor_time, color='r', linestyle='--'),
                ax1_rot.axvline(cursor_time, color='r', linestyle='--'),
@@ -252,7 +310,7 @@ def refresh_pose_plots():
     fig.suptitle(
         f"Plotting for {ep}. "
         f"Pose: {'global' if use_absolute_pose else 'rel. frame 0'} "
-        f"(left/right: rgb frame, a: toggle pose frame)"
+        f"(left/right: rgb frame [skips scan-gap segments], a: toggle pose frame)"
     )
 
 # Function to update the displayed image
@@ -295,6 +353,23 @@ def update_image(frame_idx):
     ax_depth.set_title("Depth Image")
     ax_depth.axis("off")
 
+    # Most recent scan (mm-deviation heatmap), resolved the same way
+    # sampler_umift.py resolves scan_heatmap_0 for a training query: the
+    # index of the most-recently-completed scan as of this frame, or -1
+    # ("no scan yet") before the first one lands.
+    ax_scan.clear()
+    scan_idx = int(np.asarray(map_to_scan_idx[frame_idx]).reshape(-1)[0]) if has_scan_data else -1
+    if has_scan_data and 0 <= scan_idx < len(scan_heatmap):
+        scan_frame = np.asarray(scan_heatmap[scan_idx])
+        if scan_frame.ndim == 3 and scan_frame.shape[-1] == 3:
+            scan_frame = scan_frame[..., 0]  # channels are replicated; one is enough
+        ax_scan.imshow(scan_frame, cmap="viridis", vmin=0.0, vmax=SCAN_HEATMAP_CLIP_MM)
+        ax_scan.set_title(f"Most Recent Scan (id={scan_idx})")
+    else:
+        ax_scan.text(0.5, 0.5, "no scan yet", ha="center", va="center", transform=ax_scan.transAxes)
+        ax_scan.set_title("Most Recent Scan")
+    ax_scan.axis("off")
+
     fig.canvas.draw_idle()
 
 
@@ -306,8 +381,10 @@ def on_key(event):
     global cursor_frame_idx, use_absolute_pose
     if event.key == "right":
         cursor_frame_idx += 1
+        cursor_frame_idx = _skip_gap(cursor_frame_idx, +1)
     elif event.key == "left":
         cursor_frame_idx -= 1
+        cursor_frame_idx = _skip_gap(cursor_frame_idx, -1)
     elif event.key == "a":
         use_absolute_pose = not use_absolute_pose
         refresh_pose_plots()

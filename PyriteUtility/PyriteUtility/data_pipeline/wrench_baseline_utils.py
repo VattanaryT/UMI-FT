@@ -122,6 +122,34 @@ def time_based_moving_average(
     return smoothed
 
 
+def _quat_wxyz_rotate_vectors(quat_wxyz: np.ndarray, vecs: np.ndarray) -> np.ndarray:
+    """Rotate vectors by pose7 quaternions (wxyz). quat (N,4), vecs (N,3) -> (N,3)."""
+    w = quat_wxyz[:, 0]
+    x = quat_wxyz[:, 1]
+    y = quat_wxyz[:, 2]
+    z = quat_wxyz[:, 3]
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    wx, wy, wz = w * x, w * y, w * z
+    xy, xz, yz = x * y, x * z, y * z
+    r00 = ww + xx - yy - zz
+    r01 = 2 * (xy - wz)
+    r02 = 2 * (xz + wy)
+    r10 = 2 * (xy + wz)
+    r11 = ww - xx + yy - zz
+    r12 = 2 * (yz - wx)
+    r20 = 2 * (xz - wy)
+    r21 = 2 * (yz + wx)
+    r22 = ww - xx - yy + zz
+    return np.stack(
+        [
+            r00 * vecs[:, 0] + r01 * vecs[:, 1] + r02 * vecs[:, 2],
+            r10 * vecs[:, 0] + r11 * vecs[:, 1] + r12 * vecs[:, 2],
+            r20 * vecs[:, 0] + r21 * vecs[:, 1] + r22 * vecs[:, 2],
+        ],
+        axis=-1,
+    )
+
+
 def check_virtual_target_push_direction(
     ts_pose_fb: np.ndarray,
     ts_pose_virtual_target: np.ndarray,
@@ -130,22 +158,27 @@ def check_virtual_target_push_direction(
     """
     Check that virtual targets lie on the far side of the command along dominant force.
     Returns summary metrics for validation logging.
+
+    Force is rotated from tool/TCP frame into the world frame using ``ts_pose_fb``
+    so it is comparable to the world-frame pose delta (VT - fb).
     """
     pose_fb = np.asarray(ts_pose_fb, dtype=np.float64)
     pose_vt = np.asarray(ts_pose_virtual_target, dtype=np.float64)
     wrench = np.asarray(wrench_tcp, dtype=np.float64)
 
     delta = pose_vt[:, :3] - pose_fb[:, :3]
-    force = wrench[:, :3]
+    # wrench_tcp is tool-frame; delta is world-frame
+    force = _quat_wxyz_rotate_vectors(pose_fb[:, 3:7], wrench[:, :3])
     force_norm = np.linalg.norm(force, axis=1)
-    valid = force_norm > 2.0
+    delta_norm = np.linalg.norm(delta, axis=1)
+    valid = (force_norm > 2.0) & (delta_norm > 1e-9)
     if not np.any(valid):
         return {"push_alignment": 0.0, "valid_samples": 0.0}
 
     cos = np.sum(delta[valid] * force[valid], axis=1) / (
-        np.linalg.norm(delta[valid], axis=1) * force_norm[valid]
+        delta_norm[valid] * force_norm[valid]
     )
-  # virtual target should oppose measured wrench (f=-wrench in estimator)
+    # virtual target should oppose measured wrench (f=-wrench in estimator)
     return {
         "push_alignment": float(np.mean(-cos)),
         "valid_samples": float(np.sum(valid)),

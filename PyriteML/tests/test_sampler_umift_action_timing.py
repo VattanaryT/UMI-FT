@@ -4,6 +4,7 @@ from diffusion_policy.common.sampler_umift import (
     action_targets_have_timestamp_gap,
     filter_rgb_ids_without_action_gaps,
     sparse_action_indices_from_rgb_timestamps,
+    zero_fill_scan_heatmap,
 )
 
 
@@ -105,3 +106,25 @@ def test_filter_rgb_ids_disabled_when_mult_nonpositive():
     )
     np.testing.assert_array_equal(kept, rgb_ids)
     assert n_discarded == 0
+
+
+def test_zero_fill_scan_heatmap_uses_channel_last_layout():
+    # declared_shape mirrors shape_meta.obs.scan_heatmap_0.shape: channel-first
+    # (C, H, W), with H != W so a transposed result is caught by the shape
+    # check below rather than accidentally passing.
+    declared_shape = (3, 80, 160)
+    n_frames = 4
+
+    output = zero_fill_scan_heatmap(declared_shape, n_frames)
+
+    # Real scan_heatmap_{id} data (and raw_to_obs's own NaN placeholder) is
+    # channel-last: (T, H, W, C). The placeholder must match, not (T, C, H, W).
+    assert output.shape == (n_frames, 80, 160, 3)
+
+    # Guard against the exact regression: obs_rgb_depth_preprocess unpacks the
+    # array as (t, hi, wi, ci) and asserts ci == co, where (co, ho, wo) is the
+    # declared (C, H, W) shape. A (T, C, H, W) placeholder would fail this.
+    t, hi, wi, ci = output.shape
+    co, ho, wo = declared_shape
+    assert ci == co
+    assert (hi, wi) == (ho, wo)

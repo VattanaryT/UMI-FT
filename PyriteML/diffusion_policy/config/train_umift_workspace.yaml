@@ -105,6 +105,14 @@ policy:
       use_group_norm: False
       share_force_model: False
 
+    # cfg for the small dedicated CNN branch that handles scan_heatmap-like obs
+    # keys (e.g. scan_heatmap_0), bypassing the shared pretrained vision backbone
+    # above entirely -- see ScanHeatmapEncoder / TimmObsEncoderWithForce for why.
+    # Only consulted if shape_meta contains such a key; harmless no-op otherwise.
+    scan_heatmap_encoder_cfg:
+      feature_dim: 128
+      share_model: True
+
   num_inference_steps: 16 # 8
   diffusion_step_embed_dim: 32
   down_dims: [256,512,1024]
@@ -126,8 +134,8 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 16 # 128 seems to work fine.
-  num_workers: 8 # debug 32
+  batch_size: 24 # 128 seems to work fine.
+  num_workers: 12 # debug 32
   prefetch_factor: 4
   shuffle: True
   pin_memory: True
@@ -137,8 +145,8 @@ dataloader:
   #   _target_: torch.utils.data.Sampler
 
 val_dataloader:
-  batch_size: 16 # 128 seems to work fine.
-  num_workers: 16 # debug 32
+  batch_size: 24 # 128 seems to work fine.
+  num_workers: 12 # debug 32
   shuffle: False
   pin_memory: True
   persistent_workers: True # debug: True
@@ -192,9 +200,9 @@ training:
 logging:
   log_every: 10
   project: hierarchical-policy
-  resume: False
+  resume: True
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_${task_name}_${name}
+  name: test_run # ${now:%Y.%m.%d-%H.%M.%S}_${task_name}_${name}
   tags: ["${name}", "${task_name}", "${exp_name}"]
   id: null
   group: null
@@ -216,7 +224,7 @@ hydra:
   job:
     override_dirname: ${name}
   run:
-    dir: ${output_dir}/2026.08.06_00.32.20_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI
+    dir: ${output_dir}/${now:%Y.%m.%d}_${now:%H.%M.%S}_${task_name}_${name}
   sweep:
-    dir: ${output_dir}/2026.08.06_00.32.20_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI # ${now:%Y.%m.%d}_${now:%H.%M.%S}_${task_name}_${name}
+    dir: ${output_dir}/${now:%Y.%m.%d}_${now:%H.%M.%S}_${task_name}_${name}
     subdir: ${hydra.job.num}

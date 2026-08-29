@@ -23,6 +23,26 @@ try:
 except ImportError:  # pragma: no cover - optional at import time for unit tests
     rs = None
 
+# Live "scan_heatmap_0" observation slot, filled synchronously by
+# run_layup_scan_periodic() (envs/task/run_layup_scan_periodic.py) via
+# set_latest_scan_heatmap() -- called before RTDE control resumes, so the
+# policy never reads a stale heatmap after a scan -- and read by
+# get_observation_from_buffer() on every horizon. Wired up in
+# umift_env_runner.main()'s per-episode loop (periodic ~30s pause/scan/
+# resume, separate from the post-episode-only run_layup_scan_eval path).
+#
+# Internal storage shape: (3, 80, 160) float32 CHW, values in mm (NaN -> 0.0).
+# Matches shape_meta.raw/obs.scan_heatmap_0 in umift_zucchini.yaml:
+# C=3 (single NN-distance channel replicated 3x, like depth_0),
+# H=80, W=160 (compare_pointcloud_distance.py save_small_ml_grid convention).
+# Initialized to zeros until the first scan completes.
+#
+# Emission shape (get_observation_from_buffer): (1, H, W, C) THWC so
+# MPC.sample_sparse_obs (horizon=1) and obs_rgb_depth_preprocess's
+# scan_heatmap branch (expects THWC, converts to TCHW) see the same layout
+# as rgb_0/depth_0. Internal slot stays CHW for set_latest_scan_heatmap.
+SCAN_HEATMAP_SHAPE: Tuple[int, int, int] = (3, 80, 160)
+
 
 def convert_depth_frame_to_umift(
     depth_raw: np.ndarray,
@@ -309,6 +329,59 @@ class ManipServerLayupEnv(ManipServerEnv):
             )
             self._vision_buffer.start()
 
+        # Live scan_heatmap_0 slot (see SCAN_HEATMAP_SHAPE comment above).
+        # Written synchronously by run_layup_scan_periodic() (via
+        # set_latest_scan_heatmap, called before it resumes RTDE control);
+        # read from the main obs-assembly path (get_observation_from_buffer).
+        # A plain Lock is enough since this is just a small array swap, not
+        # a hot loop.
+        self._scan_heatmap_lock = threading.Lock()
+        self._latest_scan_heatmap = np.zeros(SCAN_HEATMAP_SHAPE, dtype=np.float32)
+
+    def set_latest_scan_heatmap(self, heatmap: np.ndarray) -> None:
+        """Thread-safe setter for the live scan_heatmap_0 obs slot.
+
+        Called synchronously from run_layup_scan_periodic()
+        (envs/task/run_layup_scan_periodic.py), before it resumes RTDE
+        control, so the policy never reads a stale heatmap after a scan;
+        read from the main obs-assembly thread inside
+        get_observation_from_buffer().
+
+        Accepts either a single (H, W) grid (as produced directly by
+        compare_pointcloud_distance.py's <stem>_small.npy) or an
+        already-channel-replicated (1, H, W) / (C, H, W) array; always
+        normalizes to SCAN_HEATMAP_SHAPE before storing. NaNs
+        (invalid/unscanned cells) are replaced with 0.0 -- "no measured
+        deviation" -- rather than left as NaN, since the live inference
+        path (raw_to_obs_inference / obs_rgb_depth_preprocess) does not do
+        the NaN-aware index resolution the offline training pipeline does
+        for scan_heatmap_0 (see umift_type_conversions.raw_to_obs).
+        """
+        arr = np.asarray(heatmap, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr[None, ...]
+        if arr.ndim != 3:
+            raise ValueError(
+                "set_latest_scan_heatmap expects a (H,W) or (C,H,W) array, "
+                f"got shape {arr.shape}"
+            )
+        if arr.shape[0] == 1 and SCAN_HEATMAP_SHAPE[0] > 1:
+            arr = np.repeat(arr, SCAN_HEATMAP_SHAPE[0], axis=0)
+        if arr.shape != SCAN_HEATMAP_SHAPE:
+            raise ValueError(
+                f"set_latest_scan_heatmap shape {arr.shape} does not match "
+                f"SCAN_HEATMAP_SHAPE {SCAN_HEATMAP_SHAPE}"
+            )
+        arr = np.nan_to_num(arr, nan=0.0)
+        with self._scan_heatmap_lock:
+            self._latest_scan_heatmap = arr
+
+    def get_latest_scan_heatmap(self) -> np.ndarray:
+        """Thread-safe getter; returns a copy so callers can't mutate the
+        stored array out from under a concurrent set_latest_scan_heatmap."""
+        with self._scan_heatmap_lock:
+            return self._latest_scan_heatmap.copy()
+
     def cleanup(self) -> None:
         if self._vision_buffer is not None:
             self._vision_buffer.stop()
@@ -446,5 +519,13 @@ class ManipServerLayupEnv(ManipServerEnv):
                 depth_frames, depth_ts = self._vision_buffer.get_last_k_depth(depth_k)
                 results[f"depth_{robot_id}"] = depth_frames
                 results[f"depth_time_stamps_{robot_id}"] = depth_ts
+
+        # scan_heatmap_0: not per-robot-indexed in shape_meta (unlike
+        # rgb_{id}/depth_{id}) -- matches how mic_0 is handled elsewhere.
+        # Populated synchronously by run_layup_scan_periodic() via
+        # set_latest_scan_heatmap(); zeros until the first scan completes.
+        # Emit THWC (T=1) for sample_sparse_obs / preprocess.
+        chw = self.get_latest_scan_heatmap()  # (C, H, W)
+        results["scan_heatmap_0"] = np.moveaxis(chw, 0, -1)[None, ...]  # (1, H, W, C)
 
         return results

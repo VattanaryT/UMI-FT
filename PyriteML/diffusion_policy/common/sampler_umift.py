@@ -98,6 +98,109 @@ def filter_rgb_ids_without_action_gaps(
     return np.asarray(kept, dtype=np.int64), n_discarded
 
 
+def action_window_overlaps_any_interval(
+    window_start: float,
+    window_end: float,
+    intervals: np.ndarray,
+) -> bool:
+    """Return True if [window_start, window_end] overlaps any [start, end] row of intervals."""
+    intervals = np.asarray(intervals, dtype=np.float64)
+    if intervals.size == 0:
+        return False
+    intervals = intervals.reshape(-1, 2)
+    return bool(
+        np.any((window_start < intervals[:, 1]) & (window_end > intervals[:, 0]))
+    )
+
+
+def filter_rgb_ids_without_scan_gap_overlap(
+    rgb_ids: np.ndarray,
+    action_times: np.ndarray,
+    rgb_times: np.ndarray,
+    action_horizon: int,
+    rgb_frame_stride: int,
+    scan_gap_intervals: Optional[np.ndarray],
+    enabled: bool = True,
+) -> tuple[np.ndarray, int]:
+    """Keep rgb query ids whose sparse action-target time window does not overlap
+    any scan-pause interval.
+
+    This is an EXPLICIT complement to filter_rgb_ids_without_action_gaps(): the
+    operator physically pauses to run a laser scan, but recording continues
+    through the pause, so the implicit "large timestamp jump" heuristic used by
+    that function may or may not catch it. Here we instead reject a query
+    outright if its sparse action-target time window [target_times[0],
+    target_times[-1]] (the same window sparse_action_indices_from_rgb_timestamps()
+    computes for that query) overlaps any known scan-pause interval.
+
+    Args:
+        rgb_ids: candidate query ids to filter.
+        action_times, rgb_times: same convention as filter_rgb_ids_without_action_gaps.
+        action_horizon, rgb_frame_stride: same convention as filter_rgb_ids_without_action_gaps.
+        scan_gap_intervals: (n_gaps, 2) array of [start_time, end_time] rows, in the
+            same time convention as rgb_times/action_times, or None/empty if this
+            episode has no recorded scan-pause windows (e.g. it predates the
+            scan_heatmap_0 modality, or had zero scans). In that case this is a
+            no-op: all rgb_ids are kept, so episodes/datasets without scan data
+            are completely unaffected.
+        enabled: mirrors the action_gap_threshold_mult>0 on/off pattern; set False
+            (or pass scan_gap_intervals=None) to disable this filter entirely.
+
+    Returns (kept_rgb_ids, n_discarded).
+    """
+    rgb_ids = np.asarray(rgb_ids, dtype=np.int64).reshape(-1)
+    if not enabled or rgb_ids.size == 0 or scan_gap_intervals is None:
+        return rgb_ids.copy(), 0
+
+    scan_gap_intervals = np.asarray(scan_gap_intervals, dtype=np.float64)
+    if scan_gap_intervals.size == 0:
+        return rgb_ids.copy(), 0
+    scan_gap_intervals = scan_gap_intervals.reshape(-1, 2)
+
+    rgb_times = np.asarray(rgb_times, dtype=np.float64).reshape(-1)
+    action_times = np.asarray(action_times, dtype=np.float64).reshape(-1)
+
+    kept = []
+    n_discarded = 0
+    for rgb_id in rgb_ids:
+        _, target_times = sparse_action_indices_from_rgb_timestamps(
+            action_times=action_times,
+            rgb_times=rgb_times,
+            rgb_id=int(rgb_id),
+            action_horizon=action_horizon,
+            rgb_frame_stride=rgb_frame_stride,
+        )
+        if target_times.size == 0:
+            # nothing to overlap-check against; let the other filter/padding
+            # logic handle empty-target-window queries.
+            kept.append(int(rgb_id))
+            continue
+        window_start = float(target_times[0])
+        window_end = float(target_times[-1])
+        if action_window_overlaps_any_interval(
+            window_start, window_end, scan_gap_intervals
+        ):
+            n_discarded += 1
+        else:
+            kept.append(int(rgb_id))
+    return np.asarray(kept, dtype=np.int64), n_discarded
+
+
+def zero_fill_scan_heatmap(declared_shape, n_frames: int) -> np.ndarray:
+    """Build a zero placeholder for scan_heatmap_{id} with `n_frames` steps.
+
+    `declared_shape` (from `shape_meta["obs"][key]["shape"]`) is channel-first
+    (C, H, W) -- matching how obs_rgb_depth_preprocess reads it (`co, ho, wo =
+    shape`) -- but scan_heatmap_{id} sample data, like rgb_0/depth_0, is stored
+    channel-last (T, H, W, C) (raw_to_obs's own NaN placeholder for a
+    fully-missing episode uses this same (episode_len, h, w, c) order). Return
+    an array in that (n_frames, H, W, C) layout so it matches real scan data
+    instead of silently transposing H/W/C.
+    """
+    c, h, w = declared_shape
+    return np.zeros((n_frames, h, w, c), dtype=np.float32)
+
+
 def get_val_mask(n_episodes, val_ratio, seed=0):
     val_mask = np.zeros(n_episodes, dtype=bool)
     if val_ratio <= 0:
@@ -139,8 +242,16 @@ class SequenceSamplerUmiFT:
         weighted_sampling: int = 1,  # if > 1, duplicate the correction sample's ids weighted_sampling times
         correction_horizon: int = 1,  # the times of action horizon to be counted as "start of correction"
         action_gap_threshold_mult: float = 3.0,
+        scan_gap_filter_enabled: bool = True,
     ):
         self.action_gap_threshold_mult = float(action_gap_threshold_mult)
+        # Explicit filter that discards queries whose action-target window overlaps
+        # a recorded scan-pause interval (scan_gap_intervals_0). Only has any effect
+        # for episodes that actually carry scan_gap_intervals_0; episodes/datasets
+        # without it are unaffected regardless of this flag. Set False to disable
+        # even when scan_gap_intervals_0 is present (e.g. if it proves redundant
+        # with the implicit action_gap_threshold_mult heuristic).
+        self.scan_gap_filter_enabled = bool(scan_gap_filter_enabled)
         self.flag_has_dense = "dense" in shape_meta["sample"]["obs"]
         self.flag_has_gripper = (
             "robot0_gripper" in shape_meta["sample"]["obs"]["sparse"]
@@ -416,6 +527,9 @@ class SequenceSamplerUmiFT:
         gap_discard_total = 0
         gap_candidate_total = 0
         gap_discard_by_episode = {}
+        scan_gap_discard_total = 0
+        scan_gap_candidate_total = 0
+        scan_gap_discard_by_episode = {}
         action_horizon = shape_meta["sample"]["action"]["sparse"]["horizon"]
         action_rgb_frame_stride = shape_meta["sample"]["action"]["sparse"][
             "down_sample_steps"
@@ -439,6 +553,24 @@ class SequenceSamplerUmiFT:
             rgb_times = np.squeeze(
                 replay_buffer["data"][key]["obs"]["rgb_time_stamps_0"]
             )
+
+            # Optional: scan-pause intervals for this episode (present only for
+            # episodes recorded with the scan_heatmap_0 modality and that had at
+            # least one scan). Look under both the episode-level dict (parallel
+            # to action_time_stamps, which is also per-episode/non-per-timestep)
+            # and under "obs" (parallel to map_to_scan_idx_0), since the exact
+            # placement is defined by the in-progress data-prep pipeline. Missing
+            # or empty -> None, which makes filter_rgb_ids_without_scan_gap_overlap
+            # a complete no-op for this episode.
+            scan_gap_intervals = replay_buffer["data"][key].get("scan_gap_intervals_0")
+            if scan_gap_intervals is None:
+                scan_gap_intervals = replay_buffer["data"][key]["obs"].get(
+                    "scan_gap_intervals_0"
+                )
+            if scan_gap_intervals is not None:
+                scan_gap_intervals = np.asarray(scan_gap_intervals)
+                if scan_gap_intervals.size == 0:
+                    scan_gap_intervals = None
 
             if not has_mask:
                 # normal processing
@@ -464,6 +596,24 @@ class SequenceSamplerUmiFT:
                     gap_discard_by_episode[episode_index] = (
                         n_discarded,
                         len(candidate_rgb_ids),
+                    )
+
+                scan_gap_candidate_count = len(kept_rgb_ids)
+                kept_rgb_ids, n_scan_discarded = filter_rgb_ids_without_scan_gap_overlap(
+                    rgb_ids=kept_rgb_ids,
+                    action_times=action_times,
+                    rgb_times=rgb_times,
+                    action_horizon=action_horizon,
+                    rgb_frame_stride=action_rgb_frame_stride,
+                    scan_gap_intervals=scan_gap_intervals,
+                    enabled=self.scan_gap_filter_enabled,
+                )
+                scan_gap_discard_total += n_scan_discarded
+                scan_gap_candidate_total += scan_gap_candidate_count
+                if n_scan_discarded > 0:
+                    scan_gap_discard_by_episode[episode_index] = (
+                        n_scan_discarded,
+                        scan_gap_candidate_count,
                     )
 
                 epi_id.extend([episode_index] * len(kept_rgb_ids))
@@ -559,6 +709,29 @@ class SequenceSamplerUmiFT:
                                 prev[0] + add_discarded,
                                 prev[1] + len(additional_sample_ids),
                             )
+
+                        scan_add_candidate_count = len(additional_kept)
+                        additional_kept, add_scan_discarded = (
+                            filter_rgb_ids_without_scan_gap_overlap(
+                                rgb_ids=additional_kept,
+                                action_times=action_times,
+                                rgb_times=rgb_times,
+                                action_horizon=action_horizon,
+                                rgb_frame_stride=action_rgb_frame_stride,
+                                scan_gap_intervals=scan_gap_intervals,
+                                enabled=self.scan_gap_filter_enabled,
+                            )
+                        )
+                        scan_gap_discard_total += add_scan_discarded
+                        scan_gap_candidate_total += scan_add_candidate_count
+                        if add_scan_discarded > 0:
+                            prev = scan_gap_discard_by_episode.get(
+                                episode_index, (0, 0)
+                            )
+                            scan_gap_discard_by_episode[episode_index] = (
+                                prev[0] + add_scan_discarded,
+                                prev[1] + scan_add_candidate_count,
+                            )
                         for _ in range(weighted_sampling):
                             ids.extend(additional_kept.tolist())
                             epi_id.extend([episode_index] * len(additional_kept))
@@ -593,6 +766,24 @@ class SequenceSamplerUmiFT:
                         len(np.asarray(rgb_id_at_mask_start).reshape(-1)),
                     )
 
+                scan_gap_candidate_count = len(kept_rgb_ids)
+                kept_rgb_ids, n_scan_discarded = filter_rgb_ids_without_scan_gap_overlap(
+                    rgb_ids=kept_rgb_ids,
+                    action_times=action_times,
+                    rgb_times=rgb_times,
+                    action_horizon=action_horizon,
+                    rgb_frame_stride=action_rgb_frame_stride,
+                    scan_gap_intervals=scan_gap_intervals,
+                    enabled=self.scan_gap_filter_enabled,
+                )
+                scan_gap_discard_total += n_scan_discarded
+                scan_gap_candidate_total += scan_gap_candidate_count
+                if n_scan_discarded > 0:
+                    scan_gap_discard_by_episode[episode_index] = (
+                        n_scan_discarded,
+                        scan_gap_candidate_count,
+                    )
+
                 epi_id.extend([episode_index] * len(kept_rgb_ids))
                 ids.extend(kept_rgb_ids.tolist())
 
@@ -611,6 +802,20 @@ class SequenceSamplerUmiFT:
                 f"({pct:.1f}%)"
             )
             for ep_idx, (n_disc, n_cand) in sorted(gap_discard_by_episode.items()):
+                print(f"  episode_{ep_idx}: {n_disc}/{n_cand}")
+
+        if self.scan_gap_filter_enabled and scan_gap_candidate_total > 0:
+            pct = (
+                100.0 * scan_gap_discard_total / scan_gap_candidate_total
+                if scan_gap_candidate_total > 0
+                else 0.0
+            )
+            print(
+                f"[SequenceSamplerUmiFT] scan-gap-overlap filter: "
+                f"discarded {scan_gap_discard_total}/{scan_gap_candidate_total} queries "
+                f"({pct:.1f}%)"
+            )
+            for ep_idx, (n_disc, n_cand) in sorted(scan_gap_discard_by_episode.items()):
                 print(f"  episode_{ep_idx}: {n_disc}/{n_cand}")
 
         self.shape_meta = shape_meta
@@ -652,18 +857,29 @@ class SequenceSamplerUmiFT:
                 id = int(key.split("_")[-1])
             elif "depth" in key:
                 id = int(key.split("_")[-1])
+            elif "scan_heatmap" in key:
+                id = int(key.split("_")[-1])
             elif "policy" in key:
                 id = int(key[12])
             else:
                 id = int(key[5])  # robot0_xxxx
 
-            # Assigning rgb time stamps for ultrawide and depth is not a bug. This allows consistent sampling of rgb, uw, and d.
-            # Make sure the index found later is mapped to the correct index for ultrawide and depth.
+            # Assigning rgb time stamps for ultrawide, depth, and scan_heatmap is not a bug.
+            # This allows consistent sampling of rgb, uw, d, and scan_heatmap, all on the rgb
+            # time grid. Make sure the index found later is mapped to the correct index for
+            # ultrawide, depth, and scan_heatmap.
             if "ultrawide" in key:
                 time_stamp_key = f"rgb_time_stamps_{id}"
             elif "rgb" in key:
                 time_stamp_key = f"rgb_time_stamps_{id}"
             elif "depth" in key:
+                time_stamp_key = f"rgb_time_stamps_{id}"
+            elif "scan_heatmap" in key:
+                # scan_heatmap_{id} is sparser still than depth/ultrawide: it has one
+                # entry per completed laser scan (not one per rgb frame). We still key
+                # off rgb_time_stamps here (same as depth/ultrawide) so the query id
+                # found below is on the same dense/consistent time grid; the actual
+                # scan_heatmap_{id} row is resolved via map_to_scan_idx_{id} below.
                 time_stamp_key = f"rgb_time_stamps_{id}"
             elif "wrench" in key:
                 time_stamp_key = f"wrench_time_stamps_{id}"
@@ -703,7 +919,7 @@ class SequenceSamplerUmiFT:
 
             # sample every this_downsample_steps frames from slice_start to query_id+1,
             # then fill the rest with the first frame if needed
-            if type == "rgb":
+            if type == "rgb" or type == "scan_heatmap":
                 if self.ignore_rgb_is_applied:
                     continue
 
@@ -723,6 +939,41 @@ class SequenceSamplerUmiFT:
                         rgb_indices
                     ].squeeze()
                     output = input_arr[d_indices]
+                elif "scan_heatmap" in key:
+                    scan_map = data_episode["obs"].get(f"map_to_scan_idx_{id}")
+                    if scan_map is None or len(input_arr) == 0:
+                        # Episode has no completed scans (or lacks this modality
+                        # entirely). Degrade gracefully instead of crashing: emit
+                        # a zero-filled placeholder of the declared shape. This
+                        # should only be reachable if scan_heatmap_{id} is listed
+                        # in shape_meta for a dataset that mixes episodes with and
+                        # without scan data -- callers that only use this key on
+                        # episodes known to have scans will never hit this branch.
+                        # See zero_fill_scan_heatmap() for why this can't just be
+                        # np.zeros((len(rgb_indices), *declared_shape)).
+                        output = zero_fill_scan_heatmap(
+                            self.shape_meta["obs"][key]["shape"], len(rgb_indices)
+                        )
+                    else:
+                        scan_indices = np.atleast_1d(
+                            np.squeeze(np.asarray(scan_map)[rgb_indices])
+                        )
+                        # map_to_scan_idx_{id} == -1 means "no scan has completed
+                        # yet at this point in the episode". Depth/ultrawide never
+                        # hit an analogous case within the sampler's valid query
+                        # range: they are co-recorded 1:1 with rgb from t=0, so
+                        # map_to_d_idx_{id}/map_to_uw_idx_{id} are always >= 0 once
+                        # a query is valid at all, and pad_episode_start.py's
+                        # _INDEX_MAP_KEYS handling literally zero-fills the padded
+                        # start-of-episode prefix for those maps (never -1). A scan
+                        # can legitimately still be pending well past that point
+                        # (e.g. before the first scan of the episode completes),
+                        # so we explicitly fall back to the earliest available scan
+                        # (index 0), matching that same "not yet available -> use
+                        # index 0" convention rather than crashing on a negative
+                        # index.
+                        scan_indices = np.where(scan_indices < 0, 0, scan_indices)
+                        output = input_arr[scan_indices]
 
             elif type == "low_dim":
                 output = input_arr[

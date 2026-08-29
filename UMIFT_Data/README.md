@@ -194,7 +194,7 @@ Notes:
   - `ts_pose_fb_0` from T265 odom (`[x, y, z, qw, qx, qy, qz]`)
   - `gripper_0` and `gripper_time_stamps_0` synthesized as zeros
   - single wrist FT mapped to `wrench_left_0`, right side filled with zeros
-  - `ultrawide_0` aliased from D405 color
+  - `ultrawide_0` filled with zeros (schema placeholder; not used in zucchini training)
   - `depth_0` converted to clipped float16 meters, expanded to 3 channels
 
 ### 2) Run virtual-target/stiffness postprocessing

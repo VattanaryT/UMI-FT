@@ -125,6 +125,39 @@ def test_build_wrench_keys_v2_identity():
     assert np.allclose(keys["wrench_left_0"][0], [1, 2, 3, 4, 5, 6])
 
 
+def test_main_parser_has_resample_flag():
+    parser = MODULE.build_parser()
+    args = parser.parse_args(["--input", "x", "--output", "y", "--resample-10hz"])
+    assert args.resample_10hz is True
+    args2 = parser.parse_args(["--input", "x", "--output", "y"])
+    assert args2.resample_10hz is False
+
+
+def test_main_parser_start_pad_seconds_defaults_to_five():
+    parser = MODULE.build_parser()
+    args = parser.parse_args(["--input", "x", "--output", "y"])
+    assert args.start_pad_seconds == 5.0
+    args2 = parser.parse_args(
+        ["--input", "x", "--output", "y", "--start-pad-seconds", "0"]
+    )
+    assert args2.start_pad_seconds == 0.0
+
+
+def test_postprocess_episode_resizes_images_to_224():
+    ep = {
+        "rgb_0": np.full((2, 48, 64, 3), 7, dtype=np.uint8),
+        "ultrawide_0": np.full((2, 48, 64, 3), 9, dtype=np.uint8),
+        "depth_0": np.ones((2, 40, 50, 3), dtype=np.float16),
+    }
+    out = MODULE._postprocess_episode(ep, resample_10hz=False)
+    assert out["rgb_0"].shape == (2, 224, 224, 3)
+    assert out["ultrawide_0"].shape == (2, 224, 224, 3)
+    assert out["ultrawide_0"].dtype == np.uint8
+    assert np.array_equal(out["ultrawide_0"], np.zeros_like(out["ultrawide_0"]))
+    assert out["depth_0"].shape == (2, 224, 224, 3)
+    assert out["depth_0"].dtype == np.float16
+
+
 def test_resolve_tag_traj_path_and_resample(tmp_path):
     folder = tmp_path / "data"
     zarr_dir = folder / "zarr"

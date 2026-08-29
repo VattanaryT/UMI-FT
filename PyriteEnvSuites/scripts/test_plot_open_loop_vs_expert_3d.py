@@ -68,17 +68,20 @@ def test_build_open_loop_reveal_times_single_query_uses_offsets_fallback():
 
 def test_policy_prefix_and_visible_queries():
     reveal = np.array([1.0, 1.03, 2.0, 2.03])
-    assert MODULE.policy_prefix_len(reveal, 0.5) == 0
-    assert MODULE.policy_prefix_len(reveal, 1.0) == 1
-    assert MODULE.policy_prefix_len(reveal, 1.03) == 2
-    assert MODULE.policy_prefix_len(reveal, 2.5) == 4
+    assert MODULE.policy_tip_pose_in_window(np.zeros((4, 7)), reveal, 0.5) is None
+    assert MODULE.policy_tip_pose_in_window(np.zeros((4, 7)), reveal, 1.0) is not None
+    assert MODULE.policy_tip_pose_in_window(np.zeros((4, 7)), reveal, 2.5) is not None
 
     queries = [
         {"expert_robot_time_s": 1.0, "query_idx": 0},
         {"expert_robot_time_s": 2.0, "query_idx": 1},
     ]
-    assert [q["query_idx"] for q in MODULE.visible_queries(queries, 1.5)] == [0]
-    assert [q["query_idx"] for q in MODULE.visible_queries(queries, 2.0)] == [0, 1]
+    assert [
+        q["query_idx"] for q in MODULE.visible_queries_in_window(queries, 1.0, 1.5)
+    ] == [0]
+    assert [
+        q["query_idx"] for q in MODULE.visible_queries_in_window(queries, 1.0, 2.0)
+    ] == [0, 1]
 
 
 def test_action_arrow_xyz_from_expert_pose():
@@ -86,7 +89,9 @@ def test_action_arrow_xyz_from_expert_pose():
         {
             "expert_robot_time_s": 1.0,
             "expert_pose_index": 1,
-            "base_pose7": [9.0, 9.0, 9.0, 1.0, 0.0, 0.0, 0.0],
+            # base_pose7 must agree with expert[pose_idx] (same frame) for the
+            # expert-pose override path; otherwise arrows stay on base_pose7.
+            "base_pose7": [0.05, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
             "open_loop_start_idx": 0,
             "open_loop_end_idx": 2,
             "action_offsets_s": [0.0, 0.1],
@@ -108,13 +113,41 @@ def test_action_arrow_xyz_from_expert_pose():
         queries,
         expert,
         policy,
-        t=1.05,
+        t_start=1.0,
+        t_end=1.05,
         reveal_times=reveal,
         policy_pose_key="policy_pose_command_raw",
     )
     assert xs == [0.05, 0.1, None]
     assert ys == [0.0, 0.0, None]
     assert zs == [0.0, 0.0, None]
+
+
+def test_action_arrow_xyz_ignores_mismatched_expert_frame():
+    """If expert[pose_idx] is in another frame, keep query base_pose7."""
+    queries = [
+        {
+            "expert_robot_time_s": 1.0,
+            "expert_pose_index": 0,
+            "base_pose7": [0.5, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            "open_loop_start_idx": 0,
+            "open_loop_end_idx": 1,
+            "action_offsets_s": [0.0],
+            "policy_pose_command_raw": [[0.55, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]],
+        }
+    ]
+    expert = np.array([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]])  # wrong frame
+    reveal = np.array([1.0])
+    xs, ys, zs = MODULE.action_arrow_xyz(
+        queries,
+        expert,
+        np.zeros((1, 7)),
+        t_start=0.0,
+        t_end=2.0,
+        reveal_times=reveal,
+        policy_pose_key="policy_pose_command_raw",
+    )
+    assert xs == [0.5, 0.55, None]
 
 
 def test_policy_poses_from_query_records():
@@ -140,6 +173,71 @@ def test_policy_poses_from_query_records():
     )
     assert out is not None
     assert np.allclose(out[:, 0], [1.0, 2.0, 3.0])
+
+
+def test_path_xyz_policy_chunks_breaks_between_queries():
+    queries = [
+        {
+            "expert_robot_time_s": 1.0,
+            "open_loop_start_idx": 0,
+            "open_loop_end_idx": 2,
+        },
+        {
+            "expert_robot_time_s": 2.0,
+            "open_loop_start_idx": 2,
+            "open_loop_end_idx": 4,
+        },
+    ]
+    poses = np.array(
+        [
+            [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.1, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [1.1, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        ]
+    )
+    reveal = np.array([1.0, 1.03, 2.0, 2.03])
+    xs, ys, zs = MODULE.path_xyz_policy_chunks(poses, queries, reveal, 0.0, 3.0)
+    assert xs == [0.0, 0.1, None, 1.0, 1.1]
+
+
+def test_path_xyz_time_window_skips_scan_gap():
+    times = np.array([0.0, 0.5, 1.0, 1.5, 2.0])
+    poses = np.zeros((5, 7), dtype=np.float64)
+    poses[:, 0] = times
+    poses[:, 3] = 1.0
+    gaps = np.array([[0.9, 1.1]])
+    xs, ys, zs = MODULE.path_xyz_time_window(poses, times, 0.0, 2.0, gaps)
+    assert xs == [0.0, 0.5, None, 1.5, 2.0]
+
+
+def test_build_figure_expert_only():
+    """Expert-only mode builds a scrubbable figure without policy / queries."""
+    n = 20
+    t = np.linspace(0.0, 2.0, n)
+    cmd = np.zeros((n, 7), dtype=np.float64)
+    cmd[:, 0] = np.linspace(0.0, 0.1, n)
+    cmd[:, 3] = 1.0
+    vt = cmd.copy()
+    vt[:, 2] = 0.01
+    expert = {"command": cmd, "virtual": vt, "times_s": t}
+    fig, payload = MODULE.build_figure(
+        expert=expert,
+        policy=MODULE.empty_policy_poses(),
+        queries=[],
+        title="expert only",
+        max_slider_steps=10,
+        expert_only=True,
+    )
+    assert len(fig.layout.sliders) == 2
+    assert len(payload["sliderTimes"]) == 10
+    names = [tr.name for tr in fig.data]
+    assert "expert nominal" in names
+    assert "expert virtual" in names
+    # Policy traces exist for frame layout but are hidden.
+    policy_traces = [tr for tr in fig.data if tr.name and "policy" in tr.name]
+    assert policy_traces
+    assert all(tr.visible is False for tr in policy_traces)
 
 
 def test_load_episode_and_queries_roundtrip():

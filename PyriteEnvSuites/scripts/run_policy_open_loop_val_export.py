@@ -352,9 +352,9 @@ def compute_action_field_errors(
             grip_err.append(_mae(pred[:, o + 19], gt[:, o + 19]))
             force_err.append(_mae(pred[:, o + 20], gt[:, o + 20]))
 
-    print(pred[:, :3])
-    print(gt[:, :3])
-    print(np.linalg.norm(pred[:, :3] - gt[:, :3], axis=-1))
+    # print(pred[:, :3])
+    # print(gt[:, :3])
+    # print(np.linalg.norm(pred[:, :3] - gt[:, :3], axis=-1))
     metrics["pos_rmse"] = float(np.mean(pos_err))
     metrics["rot_rmse"] = float(np.mean(rot_err))
     if vt_pos_err:

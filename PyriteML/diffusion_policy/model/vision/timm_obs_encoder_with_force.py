@@ -10,6 +10,7 @@ import torchvision
 
 from diffusion_policy.common.pytorch_util import replace_submodules
 from diffusion_policy.model.common.module_attr_mixin import ModuleAttrMixin
+from diffusion_policy.model.vision.scan_heatmap_encoder import ScanHeatmapEncoder
 
 # from diffusion_policy.model.vision.force_spec_encoder import ForceSpecEncoder, convert_to_spec
 from multimodal_representation.multimodal.models.base_models.encoders import (
@@ -17,6 +18,29 @@ from multimodal_representation.multimodal.models.base_models.encoders import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_scan_heatmap_key(key: str) -> bool:
+    """Identify scan_heatmap-like obs keys among rgb-typed shape_meta entries.
+
+    scan_heatmap_0 is declared with `type: rgb` in shape_meta (kept that way so the
+    rest of the data pipeline -- the sampler's dispatch-by-type logic and
+    umift_type_conversions.obs_rgb_depth_preprocess -- continues to treat it exactly
+    as it does today; those already work and were intentionally left untouched).
+    This encoder, however, cannot treat it as a normal rgb key: it has a different
+    (H, W) and a different horizon than rgb_0/depth_0, which violates the two
+    hardwired assumptions in this class (single shared image_shape across all
+    rgb-typed keys, single shared horizon for the modality-attention feature
+    count). So we explicitly exclude keys matching this substring from the
+    shared-backbone `rgb_keys` collection and route them to a small dedicated CNN
+    branch (ScanHeatmapEncoder) instead.
+
+    Uses a substring match ("scan_heatmap" in key) to match the exact convention
+    already used elsewhere in this codebase for the same purpose (see
+    PyriteConfig/tasks/umift/umift_type_conversions.py and
+    PyriteML/diffusion_policy/common/sampler_umift.py).
+    """
+    return "scan_heatmap" in key
 
 
 class AttentionPool2d(nn.Module):
@@ -71,6 +95,16 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
         reduce_pretrained_lr: bool,
         vision_encoder_cfg: dict = None,
         force_encoder_cfg: dict = None,
+        # optional cfg for the small dedicated scan_heatmap CNN branch (see
+        # ScanHeatmapEncoder). Only consulted if shape_meta contains a
+        # scan_heatmap-like rgb key (see _is_scan_heatmap_key). Recognized fields:
+        #   feature_dim: int, output feature size per scan_heatmap key (default 128)
+        #   share_model: bool, share one encoder instance across all scan_heatmap
+        #                keys, mirroring vision_encoder_cfg.share_rgb_model
+        #                (default True)
+        # If None (default), a scan_heatmap key still gets an encoder built with
+        # these defaults -- no yaml changes are required to use this branch.
+        scan_heatmap_encoder_cfg: dict = None,
         # replace BatchNorm with GroupNorm
         # use single rgb model for all rgb inputs
         # renormalize rgb input with imagenet normalization
@@ -86,9 +120,22 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
         rgb_keys = list()
         low_dim_keys = list()
         wrench_keys = list()
+        scan_heatmap_keys = list()
         key_model_map = nn.ModuleDict()
         key_transform_map = nn.ModuleDict()
+        scan_heatmap_model_map = nn.ModuleDict()
         key_shape_map = dict()
+
+        scan_feature_dim = 128
+        scan_share_model = True
+        if scan_heatmap_encoder_cfg is not None:
+            scan_feature_dim = scan_heatmap_encoder_cfg.get(
+                "feature_dim", scan_feature_dim
+            )
+            scan_share_model = scan_heatmap_encoder_cfg.get(
+                "share_model", scan_share_model
+            )
+        _shared_scan_heatmap_model = None
 
         model_list = []
         feature_dim_list = []
@@ -193,7 +240,7 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr["shape"])
             type = attr.get("type", "low_dim")
-            if type == "rgb":
+            if type == "rgb" and not _is_scan_heatmap_key(key):
                 assert image_shape is None or image_shape == shape[1:]
                 image_shape = shape[1:]
         if vision_encoder_cfg is not None:
@@ -216,7 +263,23 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
             shape = tuple(attr["shape"])
             type = attr.get("type", "low_dim")
             key_shape_map[key] = shape
-            if type == "rgb":
+            if type == "rgb" and _is_scan_heatmap_key(key):
+                # scan_heatmap-like key: bypass the shared pretrained backbone
+                # entirely, route to the small dedicated ScanHeatmapEncoder branch.
+                scan_heatmap_keys.append(key)
+                in_channels = shape[0]
+                if scan_share_model:
+                    if _shared_scan_heatmap_model is None:
+                        _shared_scan_heatmap_model = ScanHeatmapEncoder(
+                            in_channels=in_channels, feature_dim=scan_feature_dim
+                        )
+                    scan_model = _shared_scan_heatmap_model
+                else:
+                    scan_model = ScanHeatmapEncoder(
+                        in_channels=in_channels, feature_dim=scan_feature_dim
+                    )
+                scan_heatmap_model_map[key] = scan_model
+            elif type == "rgb":
                 rgb_keys.append(key)
 
                 vision_encoder = (
@@ -247,8 +310,10 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
 
         rgb_keys = sorted(rgb_keys)
         low_dim_keys = sorted(low_dim_keys)
+        scan_heatmap_keys = sorted(scan_heatmap_keys)
         print("rgb keys:         ", rgb_keys)
         print("low_dim_keys keys:", low_dim_keys)
+        print("scan_heatmap keys:", scan_heatmap_keys)
 
         self.vision_encoder_cfg = vision_encoder_cfg
         self.force_encoder_cfg = force_encoder_cfg
@@ -259,6 +324,9 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
         self.rgb_keys = rgb_keys
         self.low_dim_keys = low_dim_keys
         self.wrench_keys = wrench_keys
+        self.scan_heatmap_keys = scan_heatmap_keys
+        self.scan_heatmap_model_map = scan_heatmap_model_map
+        self.scan_heatmap_feature_dim = scan_feature_dim
         self.key_shape_map = key_shape_map
         self.position_encoding = position_encoding
 
@@ -434,6 +502,23 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
             features.append(feature.reshape(B, -1))
             modality_features.append(feature.reshape(B, T, -1))
 
+        # process scan_heatmap input: small dedicated CNN branch, entirely separate
+        # from the shared pretrained vision backbone above. Its output is fused in
+        # further below, at the same point low_dim/force features are concatenated
+        # in (i.e. it does NOT participate in the modality-attention transformer
+        # over `modality_features`, since its feature_dim need not match
+        # v_feature_dim/f_feature_dim).
+        scan_heatmap_features = list()
+        for key in self.scan_heatmap_keys:
+            img = obs_dict[key]
+            B, T = img.shape[:2]
+            assert B == batch_size
+            assert img.shape[2:] == self.key_shape_map[key]
+            img = img.reshape(B * T, *img.shape[2:])
+            feature = self.scan_heatmap_model_map[key](img.float())
+            assert len(feature.shape) == 2 and feature.shape[0] == B * T
+            scan_heatmap_features.append(feature.reshape(B, -1))
+
         for key in self.wrench_keys:
             data = obs_dict[key]
             B, T = data.shape[:2]
@@ -486,6 +571,14 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
                 result = torch.concat(
                     [result, torch.cat(low_dim_features, dim=-1)], dim=1
                 )
+
+        # fuse in the dedicated scan_heatmap CNN branch's output, at the same
+        # place low_dim/force features are concatenated in (see product decision
+        # in the class-level comments for _is_scan_heatmap_key). This is a no-op
+        # concat (identity) for any task whose shape_meta has no scan_heatmap-like
+        # key, since scan_heatmap_features is then empty.
+        if len(scan_heatmap_features) > 0:
+            result = torch.cat([result] + scan_heatmap_features, dim=-1)
 
         return result
 

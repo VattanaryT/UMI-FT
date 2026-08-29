@@ -33,7 +33,7 @@ Convert LeRobot teleop data into the UMIFT episode-zarr schema, with **all modal
 ```
 LeRobot 08_03 combined
   → convert_lerobot_teleop_to_umift_zarr.py
-  → acp_replay_buffer.zarr  (geometry, zero depth, 224, 10 Hz all streams)
+  → acp_replay_buffer.zarr  (geometry, zero depth/ultrawide, 224, 10 Hz all streams)
   → postprocessing_add_virtual_target_label_umift.py  (unchanged)
   → train with retuned umift_zucchini.yaml
 
@@ -49,7 +49,7 @@ Unified wild recordings (future / regen)
 |---|---|
 | `rgb_0` | decode `wrist_cam_0`; resize 224×224 |
 | `depth_0` | zeros `(T,224,224,3)` float16 |
-| `ultrawide_0` | copy of `rgb_0` |
+| `ultrawide_0` | zeros `(T,224,224,3)` uint8 (schema placeholder) |
 | `map_to_uw_idx_0` / `map_to_d_idx_0` | identity |
 | `ts_pose_fb_0` | right obs pos3 + rot6d → pose7 |
 | `ts_pose_command_0` | copy of `ts_pose_fb_0` |
@@ -66,7 +66,7 @@ Episode packaging: `data/episode_k/` + cumulative `meta/episode_*_len`. Optional
 In `convert_unified_t265_wild_to_umift_zarr.py` only (output side):
 
 1. Resize rgb / depth / ultrawide to 224×224 before write (always).
-2. **Optional** `--resample-10hz` (name TBD; default **false**): when set, resample onto a 10 Hz grid — nearest for images (+ rebuild `map_to_*_idx`); interpolate pose7; nearest wrench; shared timestamps. When unset, keep native multi-rate streams (legacy wild behavior aside from 224 resize).
+2. **Optional** `--resample-10hz` (default **false**): when set, resample onto a 10 Hz grid — nearest for images (+ rebuild `map_to_*_idx`); interpolate pose7; nearest wrench; shared timestamps. When unset, keep native multi-rate streams (legacy wild behavior aside from 224 resize).
 3. Never modify bags or input unified zarr in place.
 
 Teleop converter always writes 10 Hz (source is already locked); no equivalent off-switch needed there.
@@ -125,3 +125,4 @@ Rationale: at 10 Hz with `ds=1`, histories are denser than the old sparsely stri
 - Editing original bags or source LeRobot trees.
 - Changing action dim / query-relative math.
 - Collapsing live hardware to 10 Hz publish rates (only training store + sampling math).
+- Precomputing action21 / pose9 / float-CHW on disk (resize is the expensive sample-time step; leave the rest to existing dataset init / sample path).

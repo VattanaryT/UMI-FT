@@ -45,8 +45,9 @@ flag_subtract_wrench_baseline = os.environ.get(
     "UMIFT_SUBTRACT_WRENCH_BASELINE", "1"
 ).lower() not in ("0", "false", "no", "off")
 
-# FT300-S sign: 1.0 = native sensor sign; set -1.0 only if validation shows inverted push direction
-wrench_sign_multiplier = 1.0
+# Default +1 keeps stringer / FT300-S demos unchanged. Teleop LeRobot FT needs -1
+# (inverted push_alignment); override via UMIFT_WRENCH_SIGN_MULTIPLIER=-1.
+wrench_sign_multiplier = float(os.environ.get("UMIFT_WRENCH_SIGN_MULTIPLIER", "1.0"))
 
 # ‘r’ means read only (must exist); ‘r+’ means read/write (must exist); ‘a’ means read/write (create if doesn’t exist); ‘w’ means create (overwrite if exists); ‘w-’ means create (fail if exists).
 buffer = zarr.open(dataset_path, mode="r+")
@@ -55,6 +56,7 @@ print(
     "wrench baseline subtraction:",
     "enabled" if flag_subtract_wrench_baseline else "disabled",
 )
+print(f"wrench_sign_multiplier: {wrench_sign_multiplier}")
 
 
 num_of_process = 3  # 5
@@ -65,7 +67,8 @@ depth_clip = 0.5
 
 apply_mask = False
 clip_depth = True
-zero_depth = False  # fully zero depth (ablation; overrides clip_depth)
+zero_depth = True  # fully zero depth (ablation; overrides clip_depth)
+zero_ultrawide = True  # converters write zeros; rewrite existing aliased ultrawide on reprocess
 convert_BGR_to_RGB = False
 flag_mute_gripper = False
 flag_mute_wrench = False
@@ -185,7 +188,10 @@ def process_episode(ep, ep_data, id_list):
                 ep_data["rgb_0"] = rgb_images
                 ep_data[rgb_conversion_flag] = np.array([1])
 
-        if apply_mask:
+        if zero_ultrawide:
+            uw_images = np.array(ep_data["ultrawide_0"])
+            ep_data["ultrawide_0"] = np.zeros_like(uw_images)
+        elif apply_mask:
             images = np.array(ep_data["ultrawide_0"])
             # create a mask where the masked area is 0 and others are all 255 (0xFF)
             mask = np.ones_like(images[0], dtype=np.uint8) * 255

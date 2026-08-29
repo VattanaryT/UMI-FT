@@ -36,7 +36,19 @@ def raw_to_obs(
         type = attr.get("type", "low_dim")
         if type == "rgb":
             # obs.rgb: keep as compressed zarr array in memory
-            episode_data["obs"][key] = raw_data[key]
+            # scan_heatmap_0 is optional/sparse (not every episode/live buffer may have
+            # it populated yet, e.g. before the first scan completes). Fall back to an
+            # all-NaN placeholder of the correct raw shape (episode-length x H x W x C)
+            # so downstream code (map_to_scan_idx_0 resolution + sparse_obs_to_obs_sample's
+            # NaN handling) treats it as "no data" instead of raising a KeyError.
+            if key == "scan_heatmap_0" and key not in raw_data:
+                c, h, w = attr.get("shape")
+                episode_len = raw_data["rgb_time_stamps_0"].shape[0]
+                episode_data["obs"][key] = np.full(
+                    (episode_len, h, w, c), np.nan, dtype=np.float32
+                )
+            else:
+                episode_data["obs"][key] = raw_data[key]
 
     # obs.low_dim: load entry, convert to obs.low_dim
     for id in shape_meta["id_list"]:
@@ -92,6 +104,32 @@ def raw_to_obs(
             episode_data["obs"][f"map_to_d_idx_{id}"] = raw_data[f"map_to_d_idx_{id}"][
                 :
             ]
+
+        # scan_heatmap: map_to_scan_idx_{id} maps each rgb-aligned timestep to the index
+        # of the most-recently-completed scan, mirroring map_to_d_idx_{id} for depth_0.
+        # The sampler (SequenceSamplerUmiFT) uses this index to resolve scan_heatmap_0
+        # to a per-query (H, W) heatmap before it reaches sparse_obs_to_obs_sample, just
+        # like it does today for depth_0 via map_to_d_idx_{id}.
+        # Guarded on presence in raw_data too (not just shape_meta): an episode with
+        # zero completed scans never gets this key (see convert_unified_t265_wild_to
+        # _umift_zarr.py's `scans` group no-op convention), and unlike scan_heatmap_0
+        # there's no placeholder to fall back to here -- sampler_umift.py already reads
+        # this via `.get(...)`, degrading gracefully to a zero-filled scan_heatmap_0 when
+        # it's absent, so simply omitting the key (rather than raising KeyError) is the
+        # correct behavior for mixed datasets with some scan-less episodes.
+        if "scan_heatmap_0" in shape_meta["obs"].keys() and f"map_to_scan_idx_{id}" in raw_data:
+            episode_data["obs"][f"map_to_scan_idx_{id}"] = raw_data[
+                f"map_to_scan_idx_{id}"
+            ][:]
+
+        # scan_gap_intervals_0: [start,end] per completed scan, used by
+        # SequenceSamplerUmiFT (training-time-only) to filter out windows that fall
+        # inside a scan pause. Guarded on presence in raw_data too (not just
+        # shape_meta), since an episode with zero completed scans never gets this key
+        # at all (see convert_unified_t265_wild_to_umift_zarr.py's `scans` group
+        # no-op convention) -- must not raise KeyError for such episodes.
+        if "scan_heatmap_0" in shape_meta["obs"].keys() and "scan_gap_intervals_0" in raw_data:
+            episode_data["obs"]["scan_gap_intervals_0"] = raw_data["scan_gap_intervals_0"][:]
 
 
 def raw_to_obs_inference(
@@ -472,6 +510,43 @@ def obs_rgb_depth_preprocess(
             out_depth = out_depth / depth_clip
 
             obs_output[key] = np.moveaxis(out_depth, -1, 1)
+
+        elif type == "rgb" and "scan_heatmap" in key:
+            # scan_heatmap values are in [mm], NaN where invalid/no scan yet.
+            # Clip to [0, clip], normalize to [0, 1], THEN replace NaN with 0.0
+            # (interpreted as "no deviation / no data"). NaN survives np.clip and
+            # division unchanged (comparisons with NaN are False), so doing the
+            # nan_to_num after clip+normalize does not corrupt the clip range.
+            scan_clip = obs_shape_meta[key]["clip"]
+            this_scan_in = obs[key]
+            t, hi, wi, ci = this_scan_in.shape
+            co, ho, wo = shape
+            assert ci == co
+            out_scan = this_scan_in
+            if (ho != hi) or (wo != wi):
+                if reshape_mode == "reshape":
+                    tf = get_image_transform_with_border(
+                        input_res=(wi, hi), output_res=(wo, ho), bgr_to_rgb=False
+                    )
+                    out_scan = np.stack([tf(x) for x in this_scan_in])
+                elif reshape_mode == "check":
+                    print(
+                        f"[obs_rgb_depth_preprocess] scan_heatmap shape check failed! Require {ho}x{wo}, get {hi}x{wi}"
+                    )
+                    assert False
+
+            out_scan = out_scan.astype(np.float32)
+            out_scan = np.clip(out_scan, 0.0, scan_clip)
+            out_scan = out_scan / scan_clip
+            out_scan = np.nan_to_num(out_scan, nan=0.0)
+
+            assert not np.any(np.isnan(out_scan))
+            assert np.all(out_scan >= 0.0) and np.all(out_scan <= 1.0), (
+                f"scan_heatmap values out of [0,1] after normalization: "
+                f"min={np.min(out_scan)}, max={np.max(out_scan)}"
+            )
+
+            obs_output[key] = np.moveaxis(out_scan, -1, 1)
 
 
 def sparse_obs_to_obs_sample(

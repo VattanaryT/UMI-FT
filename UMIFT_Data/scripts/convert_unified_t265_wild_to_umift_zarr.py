@@ -17,6 +17,13 @@ UMIFT_DATA_ROOT = Path(__file__).resolve().parents[1]
 if str(UMIFT_DATA_ROOT) not in sys.path:
     sys.path.insert(0, str(UMIFT_DATA_ROOT))
 
+from umift.processing.pad_episode_start import pad_episode_start
+from umift.processing.umift_image_prep import (
+    resize_hwc_float,
+    resize_hwc_uint8,
+    resample_episode_to_hz,
+    build_map_to_scan_idx,
+)
 from umift.utils.frame_conventions import (
     DEFAULT_R_FT_IN_TCP_M,
     FRAME_CONVENTION_VERSION,
@@ -119,6 +126,30 @@ def resolve_tag_traj_path(unified_path: Path) -> Path | None:
     return None
 
 
+def _dedupe_strictly_increasing_times(
+    src_t: np.ndarray, pose7: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the last sample at each timestamp so SciPy Slerp accepts the series.
+
+    Unified RGB times occasionally repeat (same stamp on consecutive frames);
+    ee_tag_traj sidecars inherit that and otherwise crash combine.
+    """
+    src_t = np.asarray(src_t, dtype=np.float64).reshape(-1)
+    pose7 = np.asarray(pose7, dtype=np.float64)
+    if src_t.size == 0:
+        return src_t, pose7
+    # Last index of each unique time (stable for flat plateaus).
+    _, first_rev = np.unique(src_t[::-1], return_index=True)
+    keep = np.sort(src_t.size - 1 - first_rev)
+    t_u = src_t[keep]
+    # Guard against any remaining non-increase from float weirdness.
+    if t_u.size >= 2 and not np.all(np.diff(t_u) > 0):
+        for i in range(1, t_u.size):
+            if t_u[i] <= t_u[i - 1]:
+                t_u[i] = t_u[i - 1] + 1e-6
+    return t_u, pose7[keep]
+
+
 def _resample_pose7(
     src_t: np.ndarray,
     pose7: np.ndarray,
@@ -127,10 +158,14 @@ def _resample_pose7(
     """Linear pos + SLERP quat onto query times. pose7 is [x,y,z,qw,qx,qy,qz]."""
     from scipy.spatial.transform import Rotation, Slerp
 
-    src_t = np.asarray(src_t, dtype=np.float64).reshape(-1)
+    src_t, pose7 = _dedupe_strictly_increasing_times(src_t, pose7)
     query_t = np.asarray(query_t, dtype=np.float64).reshape(-1)
-    pose7 = np.asarray(pose7, dtype=np.float64)
     out = np.zeros((len(query_t), 7), dtype=np.float64)
+    if src_t.size == 0:
+        raise ValueError("empty tag traj timestamps")
+    if src_t.size == 1:
+        out[:] = pose7[0]
+        return out
     for j in range(3):
         out[:, j] = np.interp(query_t, src_t, pose7[:, j])
     # scipy Rotation uses xyzw
@@ -275,7 +310,8 @@ def _read_episode_from_unified(
     ft_group = root["sensors"]["ft_wrench"]
 
     rgb = np.asarray(color_group["frames"][:], dtype=np.uint8)
-    ultrawide = np.asarray(color_group["frames"][:], dtype=np.uint8)
+    # Schema placeholder only; filled with zeros in _postprocess_episode (not D405 color).
+    ultrawide = np.zeros_like(rgb)
     depth = convert_depth_to_umift_depth(np.asarray(depth_group["frames"][:], dtype=np.uint16))
 
     rgb_ts = _read_frame_ts(color_group)
@@ -335,20 +371,73 @@ def _read_episode_from_unified(
         frame_convention=frame_convention if is_v2 else "legacy",
     )
 
-    ts_norm = normalize_timestamps(
-        {
-            "rgb_time_stamps_0": rgb_ts,
-            "ultrawide_time_stamps_0": uw_ts,
-            "depth_time_stamps_0": depth_ts,
-            "robot_time_stamps_0": robot_ts,
-            "wrench_time_stamps_left_0": wrench_ts,
-            "wrench_time_stamps_right_0": wrench_ts,
-        }
-    )
+    ts_streams = {
+        "rgb_time_stamps_0": rgb_ts,
+        "ultrawide_time_stamps_0": uw_ts,
+        "depth_time_stamps_0": depth_ts,
+        "robot_time_stamps_0": robot_ts,
+        "wrench_time_stamps_left_0": wrench_ts,
+        "wrench_time_stamps_right_0": wrench_ts,
+    }
+    ts_norm = normalize_timestamps(ts_streams)
+    # normalize_timestamps() shifts every stream by the same scalar (the smallest
+    # first-sample time across `ts_streams`) but only returns the shifted arrays, not
+    # the offset itself. Recompute it here with the identical formula (same input dict)
+    # so scan_gap_intervals_0 below -- read in stage 1's own relative-time convention,
+    # which is the same convention as `rgb_ts` *before* this shift -- can be rebased
+    # onto the exact same zero point as ts_norm["rgb_time_stamps_0"].
+    _first_samples = [
+        float(np.asarray(v).reshape(-1)[0]) for v in ts_streams.values() if np.asarray(v).size > 0
+    ]
+    ts_norm_offset = min(_first_samples) if _first_samples else 0.0
 
     robot_len = pose.shape[0]
     gripper = np.zeros((robot_len, 1), dtype=np.float64)
     gripper_ts = _as_col(ts_norm["robot_time_stamps_0"])
+
+    # Laser-scan heatmaps (optional; see convert_recording_to_zarr.py stage 1's
+    # `scans` group). Absent for episodes with zero completed scans -- treat that as a
+    # clean no-op (no keys added), matching stage 1's own "no group written" convention.
+    scan_arrays: Dict[str, np.ndarray] = {}
+    if "scans" in root:
+        scans_group = root["scans"]
+        heatmap = np.asarray(scans_group["scan_heatmap_0"][:], dtype=np.float32)  # (N, 80, 160)
+        scan_gap_intervals_stage1 = np.asarray(
+            scans_group["scan_gap_intervals_0"][:], dtype=np.float64
+        )  # (N, 2), stage 1's relative-time convention (see _build_scan_gap_intervals)
+
+        # scan_heatmap_0: add a channel dim here (replicate the single channel to 3) to
+        # match the training schema's declared [3, 80, 160] (C,H,W) shape / the THWC
+        # convention obs_rgb_depth_preprocess expects at read time (it does
+        # `t, hi, wi, ci = this_scan_in.shape`). Stage 1's output is a general-purpose
+        # (N, H, W) grid with no channel axis -- channel replication is a training-schema
+        # concern, so it belongs here, not in stage 1. NaN is preserved (NOT nan_to_num'd
+        # here); obs_rgb_depth_preprocess does its own nan_to_num after clip+normalize.
+        scan_heatmap = np.repeat(heatmap[..., None], 3, axis=-1).astype(np.float32)  # (N, 80, 160, 3)
+
+        # Rebase stage 1's scan_gap_intervals_0 onto ts_norm's zero point (the same
+        # ts_norm_offset normalize_timestamps applied to rgb_time_stamps_0 above) so it's
+        # directly comparable to ts_norm["rgb_time_stamps_0"] and to the map_to_scan_idx_0
+        # we build next.
+        scan_gap_intervals = (scan_gap_intervals_stage1 - ts_norm_offset).astype(np.float32)
+
+        # map_to_scan_idx_0 is rebuilt fresh against THIS stage's own reference timeline
+        # (ts_norm["rgb_time_stamps_0"]), not copied from stage 1: normalize_timestamps
+        # always re-bases by ts_norm_offset (not guaranteed to be 0 -- e.g. if depth or
+        # robot happens to have the smallest first sample, not rgb), so stage 1's
+        # map_to_scan_idx_0 (built against stage 1's own reference-camera stream) is not
+        # guaranteed valid against ts_norm's timeline even when lengths happen to match.
+        map_to_scan_idx = build_map_to_scan_idx(ts_norm["rgb_time_stamps_0"], scan_gap_intervals)
+        assert map_to_scan_idx.shape[0] == ts_norm["rgb_time_stamps_0"].shape[0], (
+            "map_to_scan_idx_0 length must match rgb_time_stamps_0 length "
+            f"({map_to_scan_idx.shape[0]} != {ts_norm['rgb_time_stamps_0'].shape[0]})"
+        )
+
+        scan_arrays = {
+            "scan_heatmap_0": scan_heatmap,
+            "map_to_scan_idx_0": map_to_scan_idx,
+            "scan_gap_intervals_0": scan_gap_intervals,
+        }
 
     return {
         "rgb_0": rgb,
@@ -366,11 +455,24 @@ def _read_episode_from_unified(
         "wrench_time_stamps_left_0": _as_col(ts_norm["wrench_time_stamps_left_0"]),
         "wrench_time_stamps_right_0": _as_col(ts_norm["wrench_time_stamps_right_0"]),
         **wrench_keys,
+        **scan_arrays,
     }, pose_source_used, frame_convention
 
 
 def _episode_len(cumulative: List[int], this_len: int) -> None:
     cumulative.append((cumulative[-1] if cumulative else 0) + int(this_len))
+
+
+def _postprocess_episode(
+    ep_data: Dict[str, np.ndarray], resample_10hz: bool = False
+) -> Dict[str, np.ndarray]:
+    """Resize rgb/depth to 224; zero ultrawide; optionally resample episode to 10 Hz."""
+    ep_data["rgb_0"] = resize_hwc_uint8(ep_data["rgb_0"], (224, 224))
+    ep_data["ultrawide_0"] = np.zeros_like(ep_data["rgb_0"])
+    ep_data["depth_0"] = resize_hwc_float(ep_data["depth_0"], (224, 224))
+    if resample_10hz:
+        ep_data = resample_episode_to_hz(ep_data, hz=10.0)
+    return ep_data
 
 
 def _input_unified_paths(input_path: Path) -> List[Path]:
@@ -388,6 +490,8 @@ def convert(
     output_path: Path,
     sensor_offset_xyz_m: np.ndarray = np.zeros(3),
     pose_source: str = "auto",
+    resample_10hz: bool = False,
+    start_pad_seconds: float = 5.0,
 ) -> None:
     _ensure_zarr_v2()
 
@@ -418,9 +522,12 @@ def convert(
             sensor_offset_xyz_m=sensor_offset_xyz_m,
             pose_source=pose_source,
         )
+        ep_data = _postprocess_episode(ep_data, resample_10hz=resample_10hz)
+        ep_data = pad_episode_start(ep_data, pad_duration_s=start_pad_seconds)
         pose_sources_used.append(pose_used)
         conventions_used.append(frame_conv)
         ep_group = data_group.create_group(f"episode_{ep_idx}")
+        ep_group.attrs["start_pad_seconds"] = float(start_pad_seconds)
 
         for key, value in ep_data.items():
             compressor = image_compressor if key in {"rgb_0", "ultrawide_0"} else numeric_compressor
@@ -491,6 +598,9 @@ def convert(
         else ("odom" if all_v2 else "+Y up (legacy)")
     )
 
+    root.attrs["image_size_hw"] = [224, 224]
+    root.attrs["resample_hz"] = 10.0 if resample_10hz else None
+    root.attrs["start_pad_seconds"] = float(start_pad_seconds)
     root.attrs["conversion_info"] = conversion_info_json(
         r_ft_in_tcp_m=DEFAULT_R_FT_IN_TCP_M if all_v2 else sensor_offset_xyz_m,
         extra={
@@ -506,15 +616,16 @@ def convert(
                 else "single_wrist_ft_mapped_to_left_tcp_frame_legacy"
             ),
             "sensor_offset_xyz_m": np.asarray(sensor_offset_xyz_m, dtype=np.float64).tolist(),
-            "ultrawide_source": "alias_of_d405_color",
+            "ultrawide_source": "zeros",
             "depth_source": "d405_depth_mm_to_m_float16_3ch_clipped_0p5",
         },
     )
+    root.attrs["ultrawide_source"] = "zeros"
 
     print(f"[convert] wrote UMIFT-style dataset to: {output_path}")
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Convert unified T265 recordings to UMIFT zarr schema")
     parser.add_argument(
         "--input",
@@ -548,7 +659,29 @@ def main() -> int:
         default="auto",
         help="Pose for ts_pose_fb: auto prefers tag_traj sidecar when present.",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--resample-10hz",
+        action="store_true",
+        help="Resample episode streams to a uniform 10 Hz grid before write.",
+    )
+    parser.add_argument(
+        "--start-pad-seconds",
+        type=float,
+        default=5.0,
+        help=(
+            "Prepend this many seconds of repeated first-frame data to every "
+            "episode, so training queries can be sampled from the true reset "
+            "state instead of always requiring real backward history "
+            "(see SequenceSamplerUmiFT's obs horizons). Should cover at least "
+            "the largest configured obs horizon (currently ~3.2s). Set to 0 "
+            "to disable."
+        ),
+    )
+    return parser
+
+
+def main() -> int:
+    args = build_parser().parse_args()
 
     if args.sensor_offset_xyz_m is not None:
         sensor_offset_xyz_m = np.asarray(args.sensor_offset_xyz_m, dtype=np.float64)
@@ -560,6 +693,8 @@ def main() -> int:
         Path(args.output),
         sensor_offset_xyz_m=sensor_offset_xyz_m,
         pose_source=args.pose_source,
+        resample_10hz=args.resample_10hz,
+        start_pad_seconds=args.start_pad_seconds,
     )
     return 0
 

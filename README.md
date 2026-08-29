@@ -257,6 +257,21 @@ Wrench data order assumption: [Fx, Fy, Fz, Mx, My, Mz]
 
 Wrench body frame and world frame transformation in accordance with convention from [Modern Robotics, Lynch & Park](https://hades.mech.northwestern.edu/images/7/7f/MR.pdf#page=126.68) 
 
+#### Periodic laser scan heatmaps (`scan_heatmap_0`)
+
+Episodes collected with the periodic-scan feature enabled also carry, per
+episode: `scan_heatmap_0` `(N, 80, 160, 3)` float32 (`N` = number of
+completed scans, not per-timestep), `map_to_scan_idx_0` `(T, 1)` int32
+(most-recently-completed scan index per main-timeline timestep, `-1` before
+the first scan), and `scan_gap_intervals_0` `(N, 2)` float64 (scan
+start/end times, used by the sampler to exclude scan-interruption windows
+from action training targets). Episodes recorded without any scans simply
+lack these three keys — this is a normal, handled case, not an error.
+
+Full architecture (collection-time and inference-time orchestration,
+message contracts, the two-stage zarr conversion, the dedicated policy
+encoder branch): [`keyence_scan_ws/PERIODIC_SCAN_GUIDE.md`](/home/boeing/keyence_scan_ws/PERIODIC_SCAN_GUIDE.md).
+
 ### 7. Data Visualization
 Run `{repo_root}/UMIFT_Data/scripts/plot_dataset_umift_ultrawide_depth.py` with the proper dataset path.
 ![UMI-FT Visualization](umift_data_visualization.png)
@@ -405,6 +420,13 @@ Before testing, check the following:
 * Then start execution by running `UMI-FT/PyriteEnvSuites/env_runners/umift_env_runner.py`.
 
 The script will first launch the manpulation server, which initialize all the hardware specified in the hardware config file. A video streaming window will pop up. When the video stream looks good (actual video is streaming, no black screen), press `q` to leave the window and continue the test by following onscreen instructions.
+
+If `control_para["scan_pause_enabled"]` is set (see `umift_env_runner.py`),
+the live control loop will also periodically pause, run a Keyence scan via
+`PyriteEnvSuites/envs/task/scan_pause_controller.py`, restore the task
+arm's exact pre-scan pose, and resume — feeding the resulting heatmap into
+the policy's `scan_heatmap_0` observation. Details in
+[`keyence_scan_ws/PERIODIC_SCAN_GUIDE.md`](/home/boeing/keyence_scan_ws/PERIODIC_SCAN_GUIDE.md#4-inference-time-workflow).
 
 ## Citation
 If you find this codebase useful, feel free to cite our paper:

@@ -89,14 +89,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         cfg = copy.deepcopy(self.cfg)
 
         accelerator = Accelerator(log_with="wandb")
-        wandb_cfg = OmegaConf.to_container(cfg.logging, resolve=True)
-        wandb_cfg.pop("project")
-        wandb_cfg.pop("log_every", None)  # train-loop knob, not a wandb.init arg
-        accelerator.init_trackers(
-            project_name=cfg.logging.project,
-            config=OmegaConf.to_container(cfg, resolve=True),
-            init_kwargs={"wandb": wandb_cfg},
-        )
+        self.init_wandb_trackers(accelerator, cfg)
 
         # resume training
         if cfg.training.resume:
