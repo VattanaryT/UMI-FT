@@ -9,9 +9,10 @@
 # what's new (batch_convert_recordings_to_zarr.py moves each converted
 # pair's raw bags and optional *_scan_markers.json into <folder>/bags/, so
 # they drop out of the next scan; ee_tag_traj is run with --skip-existing).
-# Live ingest passes --prefix so an in-flight rsync of the next trajectory
-# is not picked up mid-transfer. This is what live_ingest/ingest_server.py
-# runs automatically after each trajectory is verified on the PC.
+# Live ingest passes --prefix so an in-flight write of the next trajectory
+# is not picked up mid-transfer. This is what
+# Robotiq-portable-real2sim/python/live_ingest/frame_ingest_server.py runs
+# automatically after each episode is fully received on the PC.
 #
 # This does NOT combine anything into the final UMIFT dataset or run
 # virtual-target postprocessing -- those are whole-dataset stages you run

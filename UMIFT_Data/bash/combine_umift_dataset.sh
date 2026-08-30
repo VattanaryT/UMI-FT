@@ -11,7 +11,7 @@
 # scales with total accumulated episode count, not just what's new.
 #
 # Run this by hand once a session (or several) is done. It is NOT triggered
-# automatically per trajectory by live_ingest/ingest_server.py -- see
+# automatically per trajectory by frame_ingest_server.py -- see
 # process_local_recordings.sh for the per-trajectory stages that are.
 #
 # Usage:
