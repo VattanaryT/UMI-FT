@@ -9,7 +9,121 @@ pip install -e .
 
 ---
 
-## 🍇 Data Collection Instructions
+## 📡 Live Wild Collection (portable Robotiq + T265 + D405)
+
+**This is the current in-the-wild collection path.** Camera frames stream live
+to the PC (no SD-card camera bag). Sensors still record a ROS2 bag on the Pi
+and upload as a whole file. Per-episode processing is automatic; dataset
+combine is manual.
+
+Hardware/env details: `Robotiq-portable-real2sim/README.md`,
+`T265_SETUP_GUIDE.md`, `TARE_GUIDE.md`. Periodic Keyence scans (optional):
+[`keyence_scan_ws/PERIODIC_SCAN_GUIDE.md`](/home/boeing/keyence_scan_ws/PERIODIC_SCAN_GUIDE.md).
+
+### What to run (order matters)
+
+Pick one `FOLDER_NAME` for the session (e.g. `straight_convex_data`). Data
+lands under `${LOCAL_FT_ROOT}/${FOLDER_NAME}/` (default
+`/mnt/data/umidata/ft/datasets/<FOLDER_NAME>/`).
+
+**1. PC — frame ingest (required)**
+
+```bash
+# From workspace root (/home/boeing/umi_ft_ws)
+bash UMI-FT/UMIFT_Data/bash/start_frame_ingest_server.sh <FOLDER_NAME>
+```
+
+Listens on control `6789` / data `6791` (override with
+`UMIFT_FRAME_INGEST_CONTROL_PORT` / `UMIFT_FRAME_INGEST_DATA_PORT`).
+Leave this terminal open for the whole session. Ctrl+C stops it.
+
+**2. PC — scan orchestrator (optional; only if collecting with Keyence pauses)**
+
+```bash
+cd /home/boeing/keyence_scan_ws
+.venv/bin/python scripts/scan_collection_orchestrator.py \
+  --config config/collection_scan.yaml
+# optional fallback if Pi omits folder_name:
+#   --dataset-name <FOLDER_NAME>
+```
+
+Listens on port `6790` by default. Do **not** point this at 6789 (that is
+frame ingest). See `PERIODIC_SCAN_GUIDE.md` if scans never fire.
+
+**3. Pi — device stack (required)**
+
+`ROBOTIQ_FRAME_INGEST_HOST` must be set to the PC's IP or recording refuses
+to start (no local camera fallback).
+
+```bash
+# On the Pi, from the robotiq_ws / Robotiq-portable-real2sim checkout
+export ROBOTIQ_FRAME_INGEST_HOST=<PC_IP>          # required
+export ROBOTIQ_INGEST_HOST=<PC_IP>                # optional; for scan PAUSE/RESUME (port 6790)
+export ROBOTIQ_INGEST_FOLDER_NAME=<FOLDER_NAME>   # optional; defaults to Pi hostname
+
+source /opt/ros/jazzy/setup.bash
+source ~/robotiq_ws/install/setup.bash
+python3 python/main_launcher.py
+```
+
+`main_launcher.py` starts T265 → tared FT publisher → unified controller
+(gripper + RealSense stream + recording).
+
+**4. Collect demos**
+
+| Control | Action |
+|---|---|
+| Joystick UP / DOWN / CENTER | Open / close / hold gripper |
+| Joystick button | Toggle recording (LED green = recording) |
+| Joystick full DOWN while recording | Discard current episode |
+
+Wait for LED green before moving. Stop with the button when the demo is done.
+After each completed episode, the PC ingest server auto-runs
+`process_local_recordings.sh` (Docker bag→unified zarr + AprilTag traj).
+
+**5. After the session — combine dataset (manual)**
+
+```bash
+bash UMI-FT/UMIFT_Data/bash/combine_umift_dataset.sh <FOLDER_NAME>
+# optional: --pose-source auto|t265|tag  --output acp_replay_buffer.zarr
+```
+
+This builds the UMIFT-schema zarr and runs virtual-target postprocessing.
+Not triggered automatically.
+
+### Offline / catch-up (no live ingest)
+
+If bags already exist on a remote Pi (or locally under `LOCAL_FT_ROOT`):
+
+```bash
+bash UMI-FT/UMIFT_Data/bash/process_ft_wild_recordings.sh <FOLDER_NAME>
+# useful flags: --skip-existing  --skip-scp  --skip-batch
+```
+
+### Ports cheat sheet
+
+| Service | Port | Env (Pi → PC) |
+|---|---|---|
+| Frame ingest control | 6789 | `ROBOTIQ_FRAME_INGEST_HOST` + `ROBOTIQ_FRAME_INGEST_CONTROL_PORT` |
+| Frame ingest data | 6791 | `ROBOTIQ_FRAME_INGEST_DATA_PORT` |
+| Scan orchestrator | 6790 | `ROBOTIQ_INGEST_HOST` + `ROBOTIQ_INGEST_PORT` |
+
+### Checklist
+
+- [ ] PC: `start_frame_ingest_server.sh <FOLDER_NAME>` running
+- [ ] PC: scan orchestrator running (only if you want periodic scans)
+- [ ] Pi: `ROBOTIQ_FRAME_INGEST_HOST` set to PC IP
+- [ ] Pi: `main_launcher.py` up; gripper LED blue when idle
+- [ ] Same `FOLDER_NAME` on PC script and (if set) `ROBOTIQ_INGEST_FOLDER_NAME`
+- [ ] After session: `combine_umift_dataset.sh <FOLDER_NAME>`
+
+---
+
+## 🍇 Classic CoinFT + iPhone Collection Instructions
+
+Use this path for the original UMI-FT handheld CoinFT + iPhone (+ GoPro)
+pipeline. For portable T265/D405 wild collection, use **Live Wild Collection**
+above instead.
 
 1. **Rename the session name on the iPhone app**
   Use the naming convention:  
@@ -71,7 +185,7 @@ pip install -e .
 ### 1. Set Constants in Postprocessing Scripts
 
 Set the `$raw_umi_data_dir` and `$session_name` in the following scripts for your collected data session:
-    - `bash/data_post_process_gopro_iphone.sh`
+    - `bash/data_post_process_iphone.sh`
     - `bash/data_post_process_multimodal.sh`
 
 - `$session_name`: Should match the session name set on the UMI_day app.

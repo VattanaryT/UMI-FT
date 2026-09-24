@@ -32,7 +32,11 @@ _FAKE_SCAN_SRC = textwrap.dedent(
     """
     #!/usr/bin/env python3
     # Fake stand-in for keyence_scan_ws/scripts/run_layup_scan.py.
+    # Mirrors the real script's steps 7.5/9.5: when --compare-low is given,
+    # runs the (fake) compare_pointcloud_distance.py itself and joins it
+    # before exiting -- a compare failure logs but doesn't fail the scan.
     import argparse
+    import subprocess
     import sys
     from pathlib import Path
 
@@ -40,6 +44,8 @@ _FAKE_SCAN_SRC = textwrap.dedent(
         p = argparse.ArgumentParser()
         p.add_argument("--session-name", required=True)
         p.add_argument("--right-return-joints", default=None)
+        p.add_argument("--compare-low", default=None)
+        p.add_argument("--compare-timeout", type=float, default=120.0)
         p.add_argument("--fail", action="store_true")
         args = p.parse_args()
 
@@ -49,6 +55,26 @@ _FAKE_SCAN_SRC = textwrap.dedent(
         session_dir = Path.cwd() / "scans" / args.session_name
         session_dir.mkdir(parents=True, exist_ok=True)
         (session_dir / "merged.ply").write_bytes(b"fake ply")
+
+        if args.compare_low is not None:
+            compare_script = (
+                Path(__file__).resolve().parents[1]
+                / "utils" / "compare_pointcloud_distance.py"
+            )
+            cmp_proc = subprocess.run(
+                [
+                    sys.executable, str(compare_script),
+                    "--high", str(session_dir / "merged.ply"),
+                    "--low", args.compare_low,
+                    "--no-show",
+                    "--png", str(session_dir / "distance_heatmap.png"),
+                    "--score-json", str(session_dir / "eval_score.json"),
+                ],
+                check=False,
+            )
+            if cmp_proc.returncode != 0:
+                print(f"compare failed with code {cmp_proc.returncode}", file=sys.stderr)
+
         print(f"LAYUP_SESSION_DIR={session_dir}", flush=True)
         return 0
 

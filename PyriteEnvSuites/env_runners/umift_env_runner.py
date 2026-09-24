@@ -664,7 +664,7 @@ def main():
         "keyence_ws": "/home/boeing/keyence_scan_ws",
         "keyence_python": "/home/boeing/keyence_scan_ws/.venv/bin/python",
         # Reference / "low" surface PLY for compare_pointcloud_distance --low
-        "layup_eval_low_ply": "/mnt/data/boeing/scans/scan_20260817_173630/merged.ply",
+        "layup_eval_low_ply": "/mnt/data/boeing/scans/scan_20260922_105516/merged.ply",
         # Right-arm IP for capturing episode-start joints (RTDE receive).
         "layup_eval_right_ip": "192.168.1.2",
         # Periodic mid-episode Keyence layup scan interrupts
@@ -686,7 +686,7 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        "ckpt_path": "/stringer_scanner/no_scan_or_tag/epoch=0175-train_loss=0.013.ckpt",
+        "ckpt_path": "/local_policies/2026.07.30_22.08.36_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI/checkpoints/epoch=0040-train_loss=0.019.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input

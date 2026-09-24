@@ -99,75 +99,38 @@ class ScanOutcome:
 
 def load_compare_heatmap(
     *,
-    keyence_python: Path,
-    keyence_ws: Path,
-    compare_script: Path,
     scan_id: int,
-    high_ply: Path,
-    low_ply: Path,
     png_path: Path,
-    score_json: Path,
     heatmap_channels: int,
-    timeout_s: float,
 ) -> Optional[np.ndarray]:
-    """Blocking compare + load of the small ML-ready heatmap grid.
+    """Load the small ML-ready heatmap grid already written by the compare
+    that run_layup_scan.py ran internally (via ``--compare-low``, joined
+    before the scan subprocess returns -- see its module docstring, steps
+    7.5/9.5).
 
-    Runs compare_pointcloud_distance.py, loads the small ML grid it writes
-    (``<png-stem>_small.npy``), and returns it replicated to
-    ``heatmap_channels`` channels as ``(C, H, W)`` float32 -- ready for
-    ``ManipServerLayupEnv.set_latest_scan_heatmap()``.
-
-    Called synchronously (not backgrounded) by run_layup_scan_periodic(),
-    which resumes RTDE control only after this returns -- the policy is
-    conditioned on scan_heatmap_0, so control must not resume against a
-    stale heatmap while a fresh one is about to be available. Returns None
-    (rather than raising) on any failure or timeout, so a bad/slow compare
-    never blocks resume indefinitely -- the caller just skips updating the
-    heatmap slot and logs.
+    Returns it replicated to ``heatmap_channels`` channels as ``(C, H, W)``
+    float32 -- ready for ``ManipServerLayupEnv.set_latest_scan_heatmap()``.
+    Returns None (rather than raising) if the grid is missing -- e.g. the
+    compare failed or timed out inside run_layup_scan.py, which logs but
+    doesn't fail the scan itself -- so the caller just skips updating the
+    heatmap slot.
     """
-    print(f"[layup-periodic] scan {scan_id}: comparing point clouds...")
-    try:
-        cmp_proc = subprocess.run(
-            [
-                str(keyence_python),
-                str(compare_script),
-                "--high",
-                str(high_ply),
-                "--low",
-                str(low_ply),
-                "--no-show",
-                "--png",
-                str(png_path),
-                "--score-json",
-                str(score_json),
-            ],
-            cwd=str(keyence_ws),
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout_s,
+    small_path = png_path.with_name(png_path.stem + "_small.npy")
+    if not small_path.is_file():
+        print(
+            f"[layup-periodic] scan {scan_id}: no heatmap grid at "
+            f"{small_path} (compare inside run_layup_scan.py may have "
+            "failed/timed out)"
         )
-        if cmp_proc.stdout:
-            print(cmp_proc.stdout, flush=True)
-        if cmp_proc.stderr:
-            print(cmp_proc.stderr, flush=True)
-        if cmp_proc.returncode != 0:
-            raise RuntimeError(
-                f"compare_pointcloud_distance failed with code {cmp_proc.returncode}"
-            )
-        small_path = png_path.with_name(png_path.stem + "_small.npy")
-        if not small_path.is_file():
-            raise FileNotFoundError(f"Expected small ML grid missing: {small_path}")
+        return None
+    try:
         grid_mm = np.load(small_path).astype(np.float32)  # (H, W); NaN where invalid
         grid_mm = np.nan_to_num(grid_mm, nan=0.0)
         heatmap = np.repeat(grid_mm[None, ...], heatmap_channels, axis=0)  # (C, H, W)
         print(f"[layup-periodic] scan {scan_id}: heatmap ready {heatmap.shape}")
         return heatmap.astype(np.float32)
-    except subprocess.TimeoutExpired:
-        print(f"[layup-periodic] scan {scan_id}: compare TIMED OUT after {timeout_s}s")
-        return None
-    except Exception as exc:  # noqa: BLE001 - never let a bad compare propagate
-        print(f"[layup-periodic] scan {scan_id}: compare FAILED: {exc}")
+    except Exception as exc:  # noqa: BLE001 - never let a bad heatmap load propagate
+        print(f"[layup-periodic] scan {scan_id}: heatmap load FAILED: {exc}")
         return None
 
 
@@ -194,7 +157,6 @@ def run_layup_scan_periodic(
     low_ply = Path(control_para["layup_eval_low_ply"])
     right_arm_ip = str(control_para["layup_eval_right_ip"])
     scan_script = keyence_ws / "scripts" / "run_layup_scan.py"
-    compare_script = keyence_ws / "utils" / "compare_pointcloud_distance.py"
 
     # Snapshot the right arm's CURRENT joints -- NOT the fixed episode-start
     # right_start_joints (that's only correct for the post-episode "e"
@@ -229,6 +191,7 @@ def run_layup_scan_periodic(
     duration_s = 0.0
     try:
         try:
+            compare_timeout_s = float(control_para["periodic_scan_compare_timeout_s"])
             scan_proc = subprocess.run(
                 [
                     str(keyence_python),
@@ -236,12 +199,17 @@ def run_layup_scan_periodic(
                     "--session-name",
                     session_name,
                     f"--right-return-joints={joints_csv}",
+                    f"--compare-low={low_ply}",
+                    f"--compare-timeout={compare_timeout_s}",
                 ],
                 cwd=str(keyence_ws),
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=float(control_para["periodic_scan_timeout_s"]),
+                # The scan subprocess now joins its own backgrounded compare
+                # (see run_layup_scan.py steps 7.5/9.5) before returning, so
+                # this timeout must cover scan + compare, not just the scan.
+                timeout=float(control_para["periodic_scan_timeout_s"]) + compare_timeout_s,
             )
             print(scan_proc.stdout)
             if scan_proc.stderr:
@@ -261,16 +229,9 @@ def run_layup_scan_periodic(
                 raise FileNotFoundError(f"Expected merged cloud missing: {high_ply}")
 
             heatmap = load_compare_heatmap(
-                keyence_python=keyence_python,
-                keyence_ws=keyence_ws,
-                compare_script=compare_script,
                 scan_id=scan_id,
-                high_ply=high_ply,
-                low_ply=low_ply,
                 png_path=session_dir / "distance_heatmap.png",
-                score_json=session_dir / "eval_score.json",
                 heatmap_channels=int(control_para.get("layup_heatmap_channels", 3)),
-                timeout_s=float(control_para["periodic_scan_compare_timeout_s"]),
             )
             if heatmap is not None:
                 env.set_latest_scan_heatmap(heatmap)

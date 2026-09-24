@@ -3,6 +3,15 @@ Official code base for UMI-FT.
 
 
 # Data collection
+
+Two collection paths live in this workspace:
+
+1. **Live wild (portable Robotiq + T265 + D405)** — current path. Full
+   runbook (PC ingest → Pi launcher → joystick → combine):
+   [`UMIFT_Data/README.md`](UMIFT_Data/README.md) § Live Wild Collection.
+2. **Classic CoinFT + iPhone** — steps below (also mirrored in
+   `UMIFT_Data/README.md`).
+
 UMI-FT lets you collect forceful manipulation data *without* a robot.
 Please refer to [UMI-FT Hardware Instructions](https://docs.google.com/document/d/e/2PACX-1vRrfSfjj3ct5u4bdyJYX92zH3QwZahU1D0nfb9wjb6GqDXqEZYVsaxwcCh1gwJgjRlq1fbgLJECGoPf/pub) for building UMI-FT.
 
@@ -71,7 +80,7 @@ Follow the instructions below in `{repo_root}/UMIFT_Data`.
 
 ### 1. Set Constants in Postprocessing Scripts
 Set user-specific variables such as `$raw_umi_data_dir` and `$session_name` in the following scripts for your collected data session:
-    - `bash/data_post_process_gopro_iphone.sh`
+    - `bash/data_post_process_iphone.sh`
     - `bash/data_post_process_multimodal.sh`
 
 - `$session_name`: Should match the session name set on the iPhone app.
