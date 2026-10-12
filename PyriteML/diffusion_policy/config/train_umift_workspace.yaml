@@ -112,6 +112,10 @@ policy:
     scan_heatmap_encoder_cfg:
       feature_dim: 128
       share_model: True
+      # avg | flatten | null. avg = global average pool (no spatial layout);
+      # flatten = keep spatial layout. null -> flatten if the scan key is cropped
+      # (shape_meta.obs.scan_heatmap_0.crop.enabled), else avg.
+      pooling: null
 
   num_inference_steps: 16 # 8
   diffusion_step_embed_dim: 32
@@ -184,6 +188,11 @@ training:
   # replace BatchNorm with GroupNorm.
   use_ema: True
   freeze_encoder: False
+  # Also optimise the non-pretrained parts of obs_encoder (scan_heatmap CNN, wrench
+  # encoders, modality-attention transformer, linear_projection, position_embedding).
+  # They were previously left out of the optimizer and stayed at random init.
+  # false = legacy behaviour.
+  train_obs_encoder_rest: True
   # training loop control
   # in epochs
   rollout_every: 10

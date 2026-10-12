@@ -7,6 +7,9 @@ from PyriteUtility.computer_vision.computer_vision_utility import (
     get_image_transform_with_border,
 )
 
+from PyriteConfig.tasks.umift.scan_crop import crop_scan_heatmap_egocentric
+from PyriteConfig.tasks.umift.workcell_frames import pose_frames_cfg, scan_crop_cfg
+
 ##
 ## raw: keys used in the dataset. Each key contains data for a whole episode
 ## obs: keys used in inference. Needs some pre-processing before sending to the policy NN.
@@ -555,6 +558,7 @@ def sparse_obs_to_obs_sample(
     reshape_mode: str,
     id_list: list,
     ignore_rgb: bool = False,
+    SE3_fixture_from_world=None,
 ):
     """Prepare a sample of sparse obs as inputs to policy network.
 
@@ -566,21 +570,61 @@ def sparse_obs_to_obs_sample(
         1. RGB: unpack, reshape, normalize, turn into float
         2. low dim: convert pose to relative pose, turn into float
 
+    Optional (all driven by shape_meta, so they ride along with a checkpoint):
+        * shape_meta.pose_frames.obs == "absolute": robot{id}_eef_pos/rot are given in the
+          fixture frame (origin at tag0) instead of relative to the newest pose.
+        * shape_meta.pose_frames.action == "absolute": the returned base pose is
+          world_from_fixture, so action labels/outputs are in the fixture frame
+          (identity in training, where the dataset poses already are fixture-frame).
+        * robot{id}_abs_eef_pos / _rot_axis_angle keys: extra fixture-frame pose inputs.
+        * shape_meta.obs.scan_heatmap_0.crop.enabled: replace the full heatmap by an
+          EE-centered, heading-aligned crop (see scan_crop.py).
+
     Args:
         obs_sparse: dict with keys from shape_meta['sample']['obs']['sparse']
         shape_meta: the shape_meta from task.yaml
         reshape_mode: One of 'reshape', 'check', or 'none'.
         ignore_rgb: if True, skip the rgb keys. Used when computing normalizers.
+        SE3_fixture_from_world: (4, 4) transform taking poses in the frame obs_sparse is
+            expressed in (the robot base on hardware) to the fixture frame. None means the
+            obs are already in the fixture frame (training on tag-tracked datasets).
     return:
         sparse_obs_processed: dict with keys from shape_meta['sample']['obs']['sparse']
         base_SE3: the initial pose used for relative pose calculation
     """
     sparse_obs_processed = {}
     assert len(obs_sparse) > 0
+
+    frames = pose_frames_cfg(shape_meta)
+    crop_cfg = scan_crop_cfg(shape_meta)
+    SE3_FW = (
+        np.eye(4)
+        if SE3_fixture_from_world is None
+        else np.asarray(SE3_fixture_from_world, dtype=np.float64)
+    )
+    SE3_WF = np.linalg.inv(SE3_FW)
+
     if not ignore_rgb:
+        obs_for_vision = obs_sparse
+        if crop_cfg is not None:
+            # EE-centered crop of the scan heatmap, using the newest pose of robot 0.
+            obs_for_vision = dict(obs_sparse)
+            pose9_last = np.concatenate(
+                [
+                    obs_sparse["robot0_eef_pos"][-1],
+                    obs_sparse["robot0_eef_rot_axis_angle"][-1],
+                ],
+                axis=-1,
+            ).astype(np.float64)
+            SE3_fixture_tool = SE3_FW @ su.pose9_to_SE3(pose9_last)
+            for key in shape_meta["obs"].keys():
+                if "scan_heatmap" in key and key in obs_for_vision:
+                    obs_for_vision[key] = crop_scan_heatmap_egocentric(
+                        np.asarray(obs_for_vision[key]), SE3_fixture_tool, crop_cfg
+                    )
         # obs_rgb_preprocess(obs_sparse, sparse_obs_processed, reshape_mode, shape_meta)
         obs_rgb_depth_preprocess(
-            obs_sparse, sparse_obs_processed, reshape_mode, shape_meta
+            obs_for_vision, sparse_obs_processed, reshape_mode, shape_meta
         )
 
     # copy all low dim keys
@@ -605,13 +649,39 @@ def sparse_obs_to_obs_sample(
             )
         )
 
-        # solve relative obs
-        base_SE3_WT.append(SE3_WT[-1])
-        SE3_base_i = su.SE3_inv(base_SE3_WT[id]) @ SE3_WT
+        # solve relative obs. Always computed: the wrench re-expression below uses it.
+        SE3_base_i = su.SE3_inv(SE3_WT[-1]) @ SE3_WT
 
-        pose9_relative = su.SE3_to_pose9(SE3_base_i)
-        sparse_obs_processed[f"robot{id}_eef_pos"] = pose9_relative[..., :3]
-        sparse_obs_processed[f"robot{id}_eef_rot_axis_angle"] = pose9_relative[..., 3:]
+        # base pose for action conversion (training labels / online post-processing)
+        if frames["action"] == "absolute":
+            base_SE3_WT.append(SE3_WF.astype(SE3_WT.dtype))
+        else:
+            base_SE3_WT.append(SE3_WT[-1])
+
+        if frames["obs"] == "absolute":
+            pose9_obs = su.SE3_to_pose9(SE3_FW @ SE3_WT)
+        else:
+            pose9_obs = su.SE3_to_pose9(SE3_base_i)
+        pose9_obs = pose9_obs.astype(np.float32)
+        sparse_obs_processed[f"robot{id}_eef_pos"] = pose9_obs[..., :3]
+        sparse_obs_processed[f"robot{id}_eef_rot_axis_angle"] = pose9_obs[..., 3:]
+
+        # optional extra absolute (fixture-frame) pose inputs
+        if f"robot{id}_abs_eef_pos" in sparse_obs_processed:
+            SE3_abs = su.pose9_to_SE3(
+                np.concatenate(
+                    [
+                        sparse_obs_processed[f"robot{id}_abs_eef_pos"],
+                        sparse_obs_processed[f"robot{id}_abs_eef_rot_axis_angle"],
+                    ],
+                    axis=-1,
+                )
+            )
+            pose9_abs = su.SE3_to_pose9(SE3_FW @ SE3_abs).astype(np.float32)
+            sparse_obs_processed[f"robot{id}_abs_eef_pos"] = pose9_abs[..., :3]
+            sparse_obs_processed[f"robot{id}_abs_eef_rot_axis_angle"] = pose9_abs[
+                ..., 3:
+            ]
 
         # solve relative wrench
         # Note:
@@ -742,6 +812,7 @@ def obs_to_obs_sample(
     reshape_mode: str,
     id_list: list,
     ignore_rgb: bool = False,
+    SE3_fixture_from_world=None,
 ):
     """Prepare a sample of obs as inputs to policy network.
 
@@ -764,9 +835,19 @@ def obs_to_obs_sample(
     """
     obs_processed = {"sparse": {}, "dense": {}}
     obs_processed["sparse"], base_pose_mat = sparse_obs_to_obs_sample(
-        obs_sparse, shape_meta, reshape_mode, id_list, ignore_rgb
+        obs_sparse,
+        shape_meta,
+        reshape_mode,
+        id_list,
+        ignore_rgb,
+        SE3_fixture_from_world=SE3_fixture_from_world,
     )
     if len(obs_dense) > 0:
+        frames = pose_frames_cfg(shape_meta)
+        if frames["obs"] == "absolute" or frames["action"] == "absolute":
+            raise NotImplementedError(
+                "shape_meta.pose_frames=absolute is not implemented for dense obs"
+            )
         obs_processed["dense"] = dense_obs_to_obs_sample(
             obs_dense, shape_meta, base_pose_mat, id_list
         )

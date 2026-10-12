@@ -43,7 +43,7 @@ print("Loading dataset from: ", dataset_path)
 buffer = zarr.open(dataset_path, mode="r+")
 
 # select which episode to visualize    
-ep = "episode_0"
+ep = "episode_74"
 print("Loading episode: ", ep)
 print(buffer.tree())
 

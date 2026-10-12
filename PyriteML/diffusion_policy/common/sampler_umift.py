@@ -186,6 +186,31 @@ def filter_rgb_ids_without_scan_gap_overlap(
     return np.asarray(kept, dtype=np.int64), n_discarded
 
 
+def filter_rgb_ids_near_bad_poses(
+    rgb_ids: np.ndarray,
+    rgb_times: np.ndarray,
+    bad_times: np.ndarray,
+    window_before_s: float,
+    window_after_s: float,
+) -> tuple[np.ndarray, int]:
+    """Drop rgb query ids with a corrupt pose within [t - before, t + after].
+
+    ``bad_times`` are the (sorted) robot timestamps whose pose/command is outside the
+    workspace (e.g. a lost-tag glitch that puts the tool several meters away). Needed
+    for absolute-pose observations/actions: relative training is insensitive to such
+    glitches, but they would blow up the absolute-position normalizer and labels.
+    """
+    rgb_ids = np.asarray(rgb_ids, dtype=np.int64).reshape(-1)
+    bad_times = np.sort(np.asarray(bad_times, dtype=np.float64).reshape(-1))
+    if rgb_ids.size == 0 or bad_times.size == 0:
+        return rgb_ids.copy(), 0
+    t = np.asarray(rgb_times, dtype=np.float64).reshape(-1)[rgb_ids]
+    lo = np.searchsorted(bad_times, t - window_before_s, side="left")
+    hi = np.searchsorted(bad_times, t + window_after_s, side="right")
+    keep = (hi - lo) == 0
+    return rgb_ids[keep], int((~keep).sum())
+
+
 def zero_fill_scan_heatmap(declared_shape, n_frames: int) -> np.ndarray:
     """Build a zero placeholder for scan_heatmap_{id} with `n_frames` steps.
 
@@ -243,7 +268,20 @@ class SequenceSamplerUmiFT:
         correction_horizon: int = 1,  # the times of action horizon to be counted as "start of correction"
         action_gap_threshold_mult: float = 3.0,
         scan_gap_filter_enabled: bool = True,
+        scan_pre_first_fill: str = "first",
+        max_abs_pos_m: Optional[float] = None,
     ):
+        # What to feed when map_to_scan_idx == -1 (no scan has completed yet):
+        #   "first": legacy behaviour, use scan 0 (a *future* scan -- never available
+        #            at inference time, where the heatmap slot is all zeros).
+        #   "zeros": all-zero heatmap, matching the robot runner's initial slot.
+        assert scan_pre_first_fill in ("first", "zeros"), scan_pre_first_fill
+        self.scan_pre_first_fill = scan_pre_first_fill
+        # If set, drop queries with a pose/command further than this (meters, per
+        # coordinate, in the dataset frame) from the origin within the obs/action
+        # window. Intended for the absolute-pose experiments (dataset frame = fixture
+        # frame, origin at tag0).
+        self.max_abs_pos_m = None if max_abs_pos_m is None else float(max_abs_pos_m)
         self.action_gap_threshold_mult = float(action_gap_threshold_mult)
         # Explicit filter that discards queries whose action-target window overlaps
         # a recorded scan-pause interval (scan_gap_intervals_0). Only has any effect
@@ -530,6 +568,7 @@ class SequenceSamplerUmiFT:
         scan_gap_discard_total = 0
         scan_gap_candidate_total = 0
         scan_gap_discard_by_episode = {}
+        bad_pose_discard_by_episode = {}
         action_horizon = shape_meta["sample"]["action"]["sparse"]["horizon"]
         action_rgb_frame_stride = shape_meta["sample"]["action"]["sparse"][
             "down_sample_steps"
@@ -571,6 +610,32 @@ class SequenceSamplerUmiFT:
                 scan_gap_intervals = np.asarray(scan_gap_intervals)
                 if scan_gap_intervals.size == 0:
                     scan_gap_intervals = None
+
+            # Corrupt-pose windows (only when max_abs_pos_m is set).
+            bad_times = np.empty(0)
+            bad_before_s = 1.0
+            bad_after_s = 0.0
+            if self.max_abs_pos_m is not None:
+                ep_obs = replay_buffer["data"][key]["obs"]
+                robot_times = np.asarray(
+                    np.squeeze(ep_obs["robot_time_stamps_0"]), dtype=np.float64
+                )
+                bad_obs = (
+                    np.abs(np.asarray(ep_obs["robot0_eef_pos"])[:, :3])
+                    > self.max_abs_pos_m
+                ).any(axis=1)
+                ep_action = np.asarray(replay_buffer["data"][key]["action"])
+                bad_act = (np.abs(ep_action[:, :3]) > self.max_abs_pos_m).any(axis=1)
+                bad_times = np.concatenate(
+                    [
+                        robot_times[: len(bad_obs)][bad_obs],
+                        np.asarray(action_times, dtype=np.float64)[: len(bad_act)][
+                            bad_act
+                        ],
+                    ]
+                )
+                rgb_dt_s = float(np.median(np.diff(rgb_times)))
+                bad_after_s = (action_horizon * action_rgb_frame_stride + 2) * rgb_dt_s
 
             if not has_mask:
                 # normal processing
@@ -615,6 +680,12 @@ class SequenceSamplerUmiFT:
                         n_scan_discarded,
                         scan_gap_candidate_count,
                     )
+
+                kept_rgb_ids, n_bad = filter_rgb_ids_near_bad_poses(
+                    kept_rgb_ids, rgb_times, bad_times, bad_before_s, bad_after_s
+                )
+                if n_bad > 0:
+                    bad_pose_discard_by_episode[episode_index] = n_bad
 
                 epi_id.extend([episode_index] * len(kept_rgb_ids))
                 ids.extend(kept_rgb_ids.tolist())
@@ -732,6 +803,13 @@ class SequenceSamplerUmiFT:
                                 prev[0] + add_scan_discarded,
                                 prev[1] + scan_add_candidate_count,
                             )
+                        additional_kept, _n_bad_add = filter_rgb_ids_near_bad_poses(
+                            additional_kept,
+                            rgb_times,
+                            bad_times,
+                            bad_before_s,
+                            bad_after_s,
+                        )
                         for _ in range(weighted_sampling):
                             ids.extend(additional_kept.tolist())
                             epi_id.extend([episode_index] * len(additional_kept))
@@ -784,10 +862,24 @@ class SequenceSamplerUmiFT:
                         scan_gap_candidate_count,
                     )
 
+                kept_rgb_ids, n_bad = filter_rgb_ids_near_bad_poses(
+                    kept_rgb_ids, rgb_times, bad_times, bad_before_s, bad_after_s
+                )
+                if n_bad > 0:
+                    bad_pose_discard_by_episode[episode_index] = n_bad
+
                 epi_id.extend([episode_index] * len(kept_rgb_ids))
                 ids.extend(kept_rgb_ids.tolist())
 
         indices = list(zip(epi_id, ids))
+
+        if self.max_abs_pos_m is not None:
+            print(
+                f"[SequenceSamplerUmiFT] bad-pose filter (|pos| > {self.max_abs_pos_m} m): "
+                f"discarded {sum(bad_pose_discard_by_episode.values())} queries"
+            )
+            for ep_idx, n_disc in sorted(bad_pose_discard_by_episode.items()):
+                print(f"  episode_{ep_idx}: {n_disc}")
 
         if self.action_gap_threshold_mult > 0:
             pct = (
@@ -951,8 +1043,13 @@ class SequenceSamplerUmiFT:
                         # episodes known to have scans will never hit this branch.
                         # See zero_fill_scan_heatmap() for why this can't just be
                         # np.zeros((len(rgb_indices), *declared_shape)).
+                        # Use the raw (pre-crop) shape: the egocentric crop, if enabled,
+                        # is applied later and maps raw -> obs shape.
                         output = zero_fill_scan_heatmap(
-                            self.shape_meta["obs"][key]["shape"], len(rgb_indices)
+                            self.shape_meta["raw"].get(
+                                key, self.shape_meta["obs"][key]
+                            )["shape"],
+                            len(rgb_indices),
                         )
                     else:
                         scan_indices = np.atleast_1d(
@@ -972,8 +1069,14 @@ class SequenceSamplerUmiFT:
                         # (index 0), matching that same "not yet available -> use
                         # index 0" convention rather than crashing on a negative
                         # index.
-                        scan_indices = np.where(scan_indices < 0, 0, scan_indices)
+                        pre_first = scan_indices < 0
+                        scan_indices = np.where(pre_first, 0, scan_indices)
                         output = input_arr[scan_indices]
+                        if self.scan_pre_first_fill == "zeros" and pre_first.any():
+                            # No scan yet -> same all-zero slot the robot runner
+                            # feeds before its first scan (no future-scan leak).
+                            output = np.array(output, copy=True)
+                            output[pre_first] = 0.0
 
             elif type == "low_dim":
                 output = input_arr[

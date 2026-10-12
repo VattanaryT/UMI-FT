@@ -1,0 +1,12 @@
+# Experiment 3a: replace the relative pose obs by absolute fixture-frame (tag0) poses.
+# Actions stay relative to the current pose.
+defaults:
+  - umift_ss_v2
+  - _self_
+
+name: UMIFT-SS-V2-ABS-OBS
+
+shape_meta:
+  pose_frames:
+    obs: absolute
+    action: relative

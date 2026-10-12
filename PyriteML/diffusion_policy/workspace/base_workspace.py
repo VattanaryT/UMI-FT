@@ -1,5 +1,7 @@
 import copy
 import pathlib
+import secrets
+import string
 import threading
 from typing import Optional
 
@@ -65,7 +67,13 @@ class BaseWorkspace:
         if run_id is None and wants_resume and run_id_path.is_file():
             run_id = run_id_path.read_text().strip() or None
         if run_id is None:
-            run_id = wandb.util.generate_id()
+            # `wandb.util` is no longer imported by `import wandb` in newer
+            # wandb releases, so don't rely on it; wandb ids are just short
+            # random lowercase alphanumeric strings.
+            run_id = "".join(
+                secrets.choice(string.ascii_lowercase + string.digits)
+                for _ in range(8)
+            )
 
         run_id_path.parent.mkdir(parents=True, exist_ok=True)
         run_id_path.write_text(run_id)

@@ -93,7 +93,7 @@ Same `stringer_scanner_v2` zarr (the real-scan `acp_replay_buffer.zarr`, not `_z
 | `task=` | What changes |
 |---|---|
 | `umift_ss_v2` | Baseline replica of the ss_v2 run (+ scan fill = zeros before the first scan). |
-| `umift_ss_v2_crop` | Scan heatmap replaced by an EE-centered, heading-aligned 16 cm / 64 px crop. Scan encoder switches to flatten pooling. |
+| `umift_ss_v2_crop` | Scan heatmap replaced by an EE-centered, heading-aligned 16 cm / 64 px crop, oriented like the wrist camera image (`crop.heading_axis: "-x"`, `crop.flip_v: true`: right = -tool x, down = -tool y, not mirrored). Scan encoder switches to flatten pooling. Checkpoints trained before these flags existed used heading `x`, no flip (a mirrored view); they keep working because the missing flag defaults to that. To reproduce that old orientation: `task.shape_meta.obs.scan_heatmap_0.crop.heading_axis=x task.shape_meta.obs.scan_heatmap_0.crop.flip_v=false`. |
 | `umift_ss_v2_abs_input` | Relative pose obs kept; absolute fixture-frame (tag0) pose added as extra input. |
 | `umift_ss_v2_abs_obs` | Pose obs absolute (fixture frame) instead of relative; actions still relative. |
 | `umift_ss_v2_abs_obs_action` | Obs and actions both absolute (fixture frame). |
@@ -110,6 +110,8 @@ TASK=umift_ss_v2_crop EXTRA_ARGS="logging.name=ss_v2_crop dataloader.batch_size=
 ```
 
 Frames: absolute poses are in the fixture frame (origin at tag0), so they survive moving the stringer if the tags move with it. On the robot the runner maps RTDE poses into that frame with `PyriteConfig/tasks/umift/layup_workcell_extrinsics.yaml` (`T_right_base_from_fixture`); point `UMIFT_WORKCELL_EXTRINSICS` at a re-measured yaml after moving the part. The crop additionally needs the heatmap extent and `T_scanner_base_from_fixture` of the *current* scan (same yaml). Flags live in `shape_meta` (`pose_frames`, `obs.scan_heatmap_0.crop`, `*_abs_eef_*` keys) and ship with the checkpoint, so the runner needs no extra switches. Code: `workcell_frames.py`, `scan_crop.py`, `umift_type_conversions.sparse_obs_to_obs_sample`.
+
+Inference diagnostics (`umift_env_runner.py`, `control_para`): `show_scan_panel` adds the heatmap / EE-centered crop the policy actually received (colour-mapped, cross = tool position for crops) to the rgb/depth popup, and `monitor_scan_encoder` hooks the scan CNN and prints a `[scan-enc] ...` line per policy query (also logged under `horizon_*/scan_encoder` in the control log, with the 128-d feature). Status: `ok`, `COLLAPSE?` (feature barely moves while the input does), `IGNORES-INPUT` (output equals the all-zero-input feature), `DEAD-RELU?`, `input-static` / `input-blank` (nothing to distinguish). Code: `PyriteUtility/planning_control/scan_encoder_monitor.py`.
 
 ## Scripts
 

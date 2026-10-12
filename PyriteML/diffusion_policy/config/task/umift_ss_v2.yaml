@@ -1,0 +1,291 @@
+# stringer_scanner_v2 baseline: umift_zucchini.yaml with the knobs the ss_v2 run used,
+# plus the switches for the scan-crop / absolute-pose experiments. Variants in this
+# folder extend it:
+#   umift_ss_v2_crop.yaml            EE-centered, heading-aligned scan crop
+#   umift_ss_v2_abs_input.yaml       + absolute fixture-frame (tag0) pose as extra obs
+#   umift_ss_v2_abs_obs.yaml         obs poses absolute instead of relative
+#   umift_ss_v2_abs_obs_action.yaml  obs AND actions absolute (fixture frame)
+# Everything is driven by shape_meta, so it travels with the checkpoint.
+name: UMIFT-SS-V2
+
+# rgb vs. low_dim: raw data are either rgb images or low_dim vectors. frames are aligned within each type.
+# obs vs. action: obs data are used as policy input; action are used as labels for policy output.
+
+# down_sample_steps: how many steps to skip in the raw data for the given usage
+# horizon: how many steps to look ahead(action) or back(obs) after downsample for the given usage
+sparse_obs_rgb_down_sample_steps: 4
+sparse_obs_rgb_horizon: 5
+
+# ultrawide is written as zeros in converters (schema/timestamps/maps only). Keep knobs for optional re-enable.
+sparse_obs_ultrawide_down_sample_steps: 5
+sparse_obs_ultrawide_horizon: 4
+
+# the depth horizon should be the same as rgb horizon, given the way the encoder is defined.
+sparse_obs_depth_down_sample_steps: 4
+sparse_obs_depth_horizon: 5
+
+# scan_heatmap is a laser-scan-derived surface-deviation heatmap, captured periodically
+# (~every 30s), NOT every timestep. A sampler resolves each query timestep to the most
+# recently completed scan via the map_to_scan_idx_0 index (mirrors how depth uses
+# map_to_d_idx_0). horizon=1 by design: only the single most-recently-completed scan is
+# used as context, there is no meaningful "history" the way rgb_0/depth_0 have.
+# down_sample_steps is irrelevant at horizon=1 but kept for convention/consistency.
+sparse_obs_scan_heatmap_down_sample_steps: 1
+sparse_obs_scan_heatmap_horizon: 1
+
+sparse_obs_low_dim_down_sample_steps: 16
+sparse_obs_low_dim_horizon: 5
+
+sparse_obs_gripper_down_sample_steps: 1
+sparse_obs_gripper_horizon: 1
+
+sparse_obs_wrench_down_sample_steps: 1
+# ForceEncoder (causalconv) uses 5x stride-2; T must be >= 32 or output time dim is 0.
+sparse_obs_wrench_horizon: 32
+
+sparse_action_down_sample_steps: 1
+sparse_action_horizon: 24
+
+depth_clip: 0.5  # in [m]
+
+# scan_heatmap values are in [mm], NaN where invalid. Clip range chosen larger than the
+# [0, 2]mm range used for human-viewable renders elsewhere, since this signal is meant to
+# capture "how much material deviation happened" for the policy, not just be visually legible.
+scan_heatmap_clip_mm: 5.0  # in [mm]
+
+# --- scan crop (used by umift_ss_v2_crop.yaml) ---
+# Window cut out of the scan heatmap around the tool, in meters / output pixels.
+# 0.16 m / 64 px = 2.5 mm per pixel, ~ the native heatmap resolution.
+scan_crop_size_m: 0.16
+scan_crop_pixels: 64
+
+# --- absolute-pose obs (used by umift_ss_v2_abs_input.yaml) ---
+# History of the extra absolute (fixture frame, origin at tag0) pose input. 1 = current pose only.
+sparse_obs_abs_down_sample_steps: 1
+sparse_obs_abs_horizon: 1
+
+shape_meta: &shape_meta
+  # relative: poses relative to the newest obs pose (original behaviour).
+  # absolute: poses in the dataset frame = fixture frame (origin at tag0). Only valid for
+  #   tag-tracked datasets (pose_source tag_fixture_tcp, e.g. stringer_scanner_v2).
+  # On the robot the runner maps RTDE poses into the fixture frame with
+  # PyriteConfig/tasks/umift/layup_workcell_extrinsics.yaml.
+  pose_frames:
+    obs: relative
+    action: relative
+  # acceptable types: rgb, low_dim
+  # fields under raw and obs must be consistent with FlipUpDataset.raw_to_obs_action()
+  id_list: [0]
+  raw: # describes what exists in data
+    rgb_0:
+      shape: [3, 224, 224]
+      type: rgb
+    # ultrawide_0:
+    #   shape: [3, 224, 224]
+    #   type: rgb
+    depth_0:
+      shape: [3, 224, 224]
+      type: rgb
+    # scan_heatmap_0: horizon=1 by design (see sparse_obs_scan_heatmap_horizon above).
+    # Unlike rgb_0/depth_0 this does NOT update every timestep -- it is only refreshed
+    # every ~30s. Replicated to 3 channels (like depth_0) to reuse the same pretrained
+    # RGB-style vision encoder without architecture changes.
+    scan_heatmap_0:
+      shape: [3, 80, 160]
+      type: rgb
+    ts_pose_fb_0:
+      shape: [7]
+      type: low_dim
+    ts_pose_virtual_target_0:
+      shape: [7]
+      type: low_dim
+    gripper_0:
+      shape: [1]
+      type: low_dim
+    stiffness_0:
+      shape: [1]
+      type: low_dim
+    wrench_left_0:
+      shape: [6]
+      type: low_dim
+    wrench_right_0:
+      shape: [6]
+      type: low_dim
+    rgb_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    ultrawide_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    depth_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    # scan_heatmap_time_stamps_0: timestamp of the scan that produced the heatmap
+    # (mirrors depth_time_stamps_0's role, kept for structural consistency / future use).
+    scan_heatmap_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    robot_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    gripper_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    wrench_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    map_to_uw_idx_0:
+      shape: [1]
+      type: index
+    map_to_d_idx_0:
+      shape: [1]
+      type: index
+    # map_to_scan_idx_0: maps each rgb-aligned timestep to the index of the most
+    # recently completed scan (mirrors map_to_d_idx_0 for depth_0).
+    map_to_scan_idx_0:
+      shape: [1]
+      type: index
+
+  obs: # describes observations loaded to memory
+    rgb_0:
+      shape: [3, 224, 224]
+      type: rgb
+    # ultrawide_0:
+    #   shape: [3, 224, 224]
+    #   type: rgb
+    depth_0:
+      shape: [3, 224, 224]
+      type: rgb
+      clip: ${task.depth_clip}
+    # scan_heatmap_0: horizon=1 by design -- infrequently-updated (~every 30s), single-frame
+    # context only, no "history" like rgb_0/depth_0. See sparse_obs_scan_heatmap_horizon.
+    scan_heatmap_0:
+      shape: [3, 80, 160]
+      type: rgb
+      clip: ${task.scan_heatmap_clip_mm}
+      # EE-centered crop (see PyriteConfig/tasks/umift/scan_crop.py). When enabled, set
+      # shape to [3, pixels, pixels]; raw.scan_heatmap_0 stays 80x160.
+      crop:
+        enabled: false
+        size_m: ${task.scan_crop_size_m}
+        pixels: ${task.scan_crop_pixels}
+        # tool axis (projected on the scan plane) = patch +col direction; a leading "-"
+        # negates it (e.g. "-x"). Legacy default: x. The umift_ss_v2_crop task uses "-x".
+        heading_axis: x
+        # false (legacy): patch rows run along +e_v (mirrored vs. a top-down view).
+        # true: patch up = +e_v, a proper top-down view. With heading_axis "-x" the patch
+        # is aligned with the wrist camera image (right = -tool x, down = -tool y).
+        flip_v: false
+        extent_key: scan_heatmap_extent_stringer_scanner_v2
+    robot0_eef_pos:
+      shape: [3]
+      type: low_dim
+    robot0_eef_rot_axis_angle:
+      shape: [6]
+      type: low_dim
+      rotation_rep: rotation_6d
+    # robot0_gripper:
+    #   shape: [1]
+    #   type: low_dim
+    robot0_eef_wrench_left:
+      shape: [6]
+      type: low_dim
+    robot0_eef_wrench_right:
+      shape: [6]
+      type: low_dim
+    # IMPORTANT: rgb_time_stampe must ALWAYS be in the UMIFTDataset. This is the basis of sampling. 
+    rgb_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    ultrawide_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    depth_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    scan_heatmap_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    robot_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    # gripper_time_stamps_0:
+    #   shape: [1]
+    #   type: timestamp
+    wrench_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    map_to_uw_idx_0:
+      shape: [1]
+      type: index
+    map_to_d_idx_0:
+      shape: [1]
+      type: index
+    map_to_scan_idx_0:
+      shape: [1]
+      type: index
+  action: # describes actions loaded to memory, computed from robot command
+    shape: [21] # 9 for reference pose, 9 for virtual target, 1 for stiffness, 1 for gripper, 1 for grasping force
+    rotation_rep: rotation_6d
+  sample: # describes samples used in a batch
+          # keys here must exist in obs/action above.
+          # shape, type and rotation_rep are inherited from obs/action above.
+    obs:
+      sparse:
+        rgb_0:
+          horizon: ${task.sparse_obs_rgb_horizon} # int
+          down_sample_steps: ${task.sparse_obs_rgb_down_sample_steps} # int
+        # ultrawide_0:
+        #   horizon: ${task.sparse_obs_ultrawide_horizon} # int
+        #   down_sample_steps: ${task.sparse_obs_ultrawide_down_sample_steps} # int
+        depth_0:
+          horizon: ${task.sparse_obs_depth_horizon} # int
+          down_sample_steps: ${task.sparse_obs_depth_down_sample_steps} # int
+        # scan_heatmap_0: horizon=1 by design (no history, see comment above the
+        # sparse_obs_scan_heatmap_horizon definition at the top of this file).
+        scan_heatmap_0:
+          horizon: ${task.sparse_obs_scan_heatmap_horizon} # int
+          down_sample_steps: ${task.sparse_obs_scan_heatmap_down_sample_steps} # int
+        robot0_eef_pos:
+          horizon: ${task.sparse_obs_low_dim_horizon} # int
+          down_sample_steps: ${task.sparse_obs_low_dim_down_sample_steps} # float
+        robot0_eef_rot_axis_angle: # exists in data
+          horizon: ${task.sparse_obs_low_dim_horizon} # int
+          down_sample_steps: ${task.sparse_obs_low_dim_down_sample_steps} # float
+        # robot0_gripper:
+        #   horizon: ${task.sparse_obs_gripper_horizon} # int
+        #   down_sample_steps: ${task.sparse_obs_gripper_down_sample_steps} # float
+        robot0_eef_wrench_left:
+          horizon: ${task.sparse_obs_wrench_horizon} # int
+          down_sample_steps: ${task.sparse_obs_wrench_down_sample_steps} # float
+        robot0_eef_wrench_right:
+          horizon: ${task.sparse_obs_wrench_horizon} # int
+          down_sample_steps: ${task.sparse_obs_wrench_down_sample_steps} # float
+    action:
+      sparse:
+        horizon: ${task.sparse_action_horizon}
+        down_sample_steps: ${task.sparse_action_down_sample_steps} # int
+    training_duration_per_sparse_query: 5.0 # longer than the action horizon
+
+task_name: &task_name
+
+dataset_path: /mnt/data/umidata/ft/datasets/stringer_scanner_v2/acp_replay_buffer.zarr  # real scans; _zero_scan.zarr has them zeroed
+
+dataset:
+  _target_: diffusion_policy.dataset.umift_dataset.UmiFTDataset
+  # interpolation (not the YAML anchor) so that variants overriding task.shape_meta apply here too
+  shape_meta: ${task.shape_meta}
+  dataset_path: ${task.dataset_path}
+  sparse_query_frequency_down_sample_steps: 2
+  action_padding: True
+  temporally_independent_normalization: False
+  seed: 42
+  val_ratio: 0.10
+  normalize_wrench: True
+  action_gap_threshold_mult: 3.0
+  # zeros: before the first scan completes feed an empty heatmap, like the robot does
+  # (legacy "first" leaks scan 0, a future scan, into early queries).
+  scan_pre_first_fill: zeros
+  # drop queries near corrupt tag poses (|x|,|y|,|z| > 2 m in the fixture frame, e.g. episode_27
+  # in stringer_scanner_v2). Required for absolute-pose variants; harmless otherwise.
+  max_abs_pos_m: 2.0

@@ -30,6 +30,7 @@ from einops import rearrange
 from omegaconf import OmegaConf
 
 from PyriteConfig.tasks.umift import umift_type_conversions as umift_task
+from PyriteConfig.tasks.umift.workcell_frames import pose_frames_cfg
 from PyriteML.diffusion_policy.common.pytorch_util import dict_apply
 from PyriteML.diffusion_policy.workspace.base_workspace import BaseWorkspace
 from PyriteUtility.planning_control.temporal_ensemble import PoseChunkEnsembler
@@ -175,6 +176,11 @@ def get_query_base_info(
         )
         pose9 = np.concatenate([pos, rot], axis=-1)
         base_se3.append(su.pose9_to_SE3(pose9))
+
+    # Absolute-action policies output poses in the dataset (fixture) frame, whose
+    # "base" is the identity (see sparse_obs_to_obs_sample, pose_frames.action).
+    if pose_frames_cfg(sampler.shape_meta)["action"] == "absolute":
+        base_se3 = [np.eye(4, dtype=base_se3[0].dtype) for _ in base_se3]
 
     base_pose7 = su.SE3_to_pose7(base_se3[0].reshape(1, 4, 4))[0]
     return {

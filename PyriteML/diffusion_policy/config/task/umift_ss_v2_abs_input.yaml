@@ -1,0 +1,26 @@
+# Experiment 2: keep the relative pose obs, add the absolute pose of the tool in the
+# fixture frame (origin at tag0) as an extra low-dim input (position + 6D rotation).
+defaults:
+  - umift_ss_v2
+  - _self_
+
+name: UMIFT-SS-V2-ABS-INPUT
+
+shape_meta:
+  obs:
+    robot0_abs_eef_pos:
+      shape: [3]
+      type: low_dim
+    robot0_abs_eef_rot_axis_angle:
+      shape: [6]
+      type: low_dim
+      rotation_rep: rotation_6d
+  sample:
+    obs:
+      sparse:
+        robot0_abs_eef_pos:
+          horizon: ${task.sparse_obs_abs_horizon}
+          down_sample_steps: ${task.sparse_obs_abs_down_sample_steps}
+        robot0_abs_eef_rot_axis_angle:
+          horizon: ${task.sparse_obs_abs_horizon}
+          down_sample_steps: ${task.sparse_obs_abs_down_sample_steps}

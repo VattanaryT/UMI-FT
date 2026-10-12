@@ -56,7 +56,15 @@ class UmiFTDataset(BaseImageDataset):
         weighted_sampling: int = 1,
         correction_horizon: int = 1,
         action_gap_threshold_mult: float = 3.0,
+        scan_pre_first_fill: str = "first",
+        max_abs_pos_m: float = None,
     ):
+        # scan_pre_first_fill: "first" (legacy: use scan 0 before the first scan completes)
+        #   or "zeros" (matches the robot runner, which feeds zeros until the first scan).
+        # max_abs_pos_m: drop queries near corrupt poses (|pos| > this, in the dataset
+        #   frame). Use with absolute-pose experiments (see SequenceSamplerUmiFT).
+        self.scan_pre_first_fill = scan_pre_first_fill
+        self.max_abs_pos_m = max_abs_pos_m
         # load into memory store
         print("[UmiFTDataset] loading data into store from", dataset_path)
         with zarr.DirectoryStore(dataset_path) as directory_store:
@@ -130,6 +138,8 @@ class UmiFTDataset(BaseImageDataset):
             weighted_sampling=weighted_sampling,
             correction_horizon=correction_horizon,
             action_gap_threshold_mult=action_gap_threshold_mult,
+            scan_pre_first_fill=scan_pre_first_fill,
+            max_abs_pos_m=max_abs_pos_m,
         )
 
         self.shape_meta = shape_meta
@@ -220,6 +230,8 @@ class UmiFTDataset(BaseImageDataset):
             action_to_action_sample=action_to_action_sample,
             id_list=self.id_list,
             action_gap_threshold_mult=self.action_gap_threshold_mult,
+            scan_pre_first_fill=self.scan_pre_first_fill,
+            max_abs_pos_m=self.max_abs_pos_m,
         )
         val_set.val_mask = ~self.val_mask
         return val_set

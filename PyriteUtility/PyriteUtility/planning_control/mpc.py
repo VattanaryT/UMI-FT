@@ -219,6 +219,12 @@ class ModelPredictiveController:
         self.obs_data = {}
         self.obs_last_timestamps = {}
         self.SE3_WBase = None
+        # (4, 4) transform from the obs/world frame (robot base on hardware) to the
+        # fixture frame (origin at tag0). Only needed for policies trained with
+        # absolute poses / EE-centered scan crops (shape_meta.pose_frames, *abs_eef*,
+        # obs.scan_heatmap_0.crop); None means obs are already in the fixture frame.
+        self.SE3_fixture_from_world = None
+        self.last_obs_policy = None
         self.verbose_level = -1
 
         print("[MPC] Done initializing")
@@ -250,6 +256,7 @@ class ModelPredictiveController:
             reshape_mode="reshape",
             id_list=self.id_list,
             ignore_rgb=ignore_rgb,
+            SE3_fixture_from_world=self.SE3_fixture_from_world,
         )
         return obs_policy, se3_w_base
 
@@ -274,6 +281,8 @@ class ModelPredictiveController:
             )
             obs_sample_np["sparse"] = obs_policy
             self.SE3_WBase = SE3_WBase
+            # kept for visualisation / diagnostics (e.g. the scan-crop popup)
+            self.last_obs_policy = obs_policy
             # add batch dimension
             obs_sample_np = dict_apply(
                 obs_sample_np, lambda x: rearrange(x, "... -> 1 ...")

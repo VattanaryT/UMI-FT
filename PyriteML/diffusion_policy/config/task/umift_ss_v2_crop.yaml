@@ -1,0 +1,23 @@
+# Experiment 1: EE-centered, heading-aligned scan crop.
+# The scan heatmap is cut around the tool (center pixel = tool x,z) using the
+# live/logged pose in the fixture frame. The patch is oriented like the wrist camera
+# image (right = -tool x, down = -tool y; a proper top-down view, not mirrored).
+# The scan encoder switches to flatten pooling automatically so the policy keeps the
+# spatial layout of the patch.
+# To reproduce the earlier (mirrored, +x heading) crop orientation use:
+#   task.shape_meta.obs.scan_heatmap_0.crop.heading_axis=x
+#   task.shape_meta.obs.scan_heatmap_0.crop.flip_v=false
+defaults:
+  - umift_ss_v2
+  - _self_
+
+name: UMIFT-SS-V2-CROP
+
+shape_meta:
+  obs:
+    scan_heatmap_0:
+      shape: [3, "${task.scan_crop_pixels}", "${task.scan_crop_pixels}"]
+      crop:
+        enabled: true
+        heading_axis: "-x"
+        flip_v: true

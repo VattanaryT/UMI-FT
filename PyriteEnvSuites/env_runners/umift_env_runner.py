@@ -16,8 +16,18 @@ import zarr
 
 # from PyriteConfig.tasks.common.common_type_conversions import raw_to_obs
 from PyriteConfig.tasks.umift.umift_type_conversions import raw_to_obs_inference
+from PyriteConfig.tasks.umift.workcell_frames import (
+    load_workcell_extrinsics,
+    scan_crop_cfg,
+    shape_meta_needs_fixture_frame,
+)
 from PyriteUtility.common import GracefulKiller
 from PyriteUtility.planning_control.mpc import ModelPredictiveController
+from PyriteUtility.planning_control.scan_encoder_monitor import (
+    ScanEncoderMonitor,
+    render_scan_panel,
+    stack_for_display,
+)
 from PyriteUtility.planning_control.temporal_ensemble import PoseChunkEnsembler
 from PyriteUtility.plotting.matplotlib_helpers import set_axes_equal
 from PyriteUtility.pytorch_utils.model_io import load_policy
@@ -580,6 +590,7 @@ def log_horizon(
     obs_task: dict,
     shape_meta: dict,
     log_policy_vision: bool,
+    scan_encoder_stats: Optional[dict] = None,
 ) -> None:
     """Write one MPC horizon to the episode control log (executed slice only)."""
     horizon_log = log.create_group(f"horizon_{horizon_count}")
@@ -622,6 +633,15 @@ def log_horizon(
             continue
         obs_policy_group.create_dataset(key, data=obs_policy[key])
 
+    if scan_encoder_stats is not None:
+        scan_enc_group = horizon_log.create_group("scan_encoder")
+        scan_enc_group.create_dataset(
+            "feature", data=np.asarray(scan_encoder_stats["feature"], dtype=np.float32)
+        )
+        scan_enc_group.attrs["status"] = str(scan_encoder_stats["status"])
+        for k, v in ScanEncoderMonitor.log_scalars(scan_encoder_stats).items():
+            scan_enc_group.attrs[k] = v
+
     obs_inference = horizon_log.create_group("obs_inference")
     obs_inference.attrs["hardware_time_s"] = float(env.current_hardware_time_s)
     for robot_id in id_list:
@@ -640,14 +660,14 @@ def main():
         "slow_down_factor": 2,  # slow down policy execution by this factor
         # Must be <= the loaded checkpoint's sparse_action_horizon (epoch=0170 is 12;
         # new 10 Hz yaml uses 32). With ensemble on, smaller => more overlap.
-        "sparse_execution_horizon": 14, # first step is at t=0, so this should be >1
+        "sparse_execution_horizon": 16, # first step is at t=0, so this should be >1
         # Zero-added-latency temporal ensembling of overlapping action chunks.
         # Lower sparse_execution_horizon with this on increases overlap/smoothing.
         "enable_ensemble_chunking": True,
         "ensemble_decay_m": 0.01,  # 0 = uniform; >0 trusts near-term steps more (exp)
         # Per-episode wall-clock cutoff (hardware time). Episode ends and
         # returns to the post-episode menu when exceeded. Default: 4 minutes.
-        "max_duration_s": 4 * 60,
+        "max_duration_s": 8 * 60,
         "gripper_action_scale": 1000,
         "use_audio": False,
         "gripper_lookahead_steps": 0,  # how many steps to look ahead for gripper action
@@ -664,7 +684,7 @@ def main():
         "keyence_ws": "/home/boeing/keyence_scan_ws",
         "keyence_python": "/home/boeing/keyence_scan_ws/.venv/bin/python",
         # Reference / "low" surface PLY for compare_pointcloud_distance --low
-        "layup_eval_low_ply": "/mnt/data/boeing/scans/scan_20260922_105516/merged.ply",
+        "layup_eval_low_ply": "/mnt/data/boeing/scans/scan_20261011_161311/merged.ply",
         # Right-arm IP for capturing episode-start joints (RTDE receive).
         "layup_eval_right_ip": "192.168.1.2",
         # Periodic mid-episode Keyence layup scan interrupts
@@ -674,10 +694,16 @@ def main():
         # seconds during an episode. Each call cold-starts run_layup_scan.py
         # (no persistent daemon) and resumes control only after the new
         # scan_heatmap_0 has been loaded, since the policy conditions on it.
-        "periodic_scan_enabled": False,
-        "periodic_scan_interval_s": 30.0,
+        "periodic_scan_enabled": True,
+        "periodic_scan_interval_s": 60.0,
         "periodic_scan_timeout_s": 90.0,
         "periodic_scan_compare_timeout_s": 30.0,
+        # Show the heatmap / EE-centered crop the policy actually received next to the
+        # rgb/depth popup (updated once per policy query).
+        "show_scan_panel": True,
+        # Hook the scan CNN and print/log per-query statistics to spot a collapsed
+        # encoder (see PyriteUtility/planning_control/scan_encoder_monitor.py).
+        "monitor_scan_encoder": True,
     }
     pipeline_para = {
         # Layup: D405 rgb (manip_server) + depth (pyrealsense2) + UR5e wrist FT.
@@ -686,7 +712,7 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        "ckpt_path": "/local_policies/2026.07.30_22.08.36_UMIFT-ZUCCHINI-AH3-DS8_UMIFT-ZUCCHINI/checkpoints/epoch=0040-train_loss=0.019.ckpt",
+        "ckpt_path": "/stringer_scanner_v2/og/epoch=0035-train_loss=0.019.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
@@ -817,7 +843,12 @@ def main():
     if pipeline_para["use_layup_env"]:
         OmegaConf.set_struct(shape_meta["sample"]["obs"]["sparse"], False)
         robot_corr = pipeline_para["robot_downsample_correction"]
-        for robot_key in ("robot0_eef_pos", "robot0_eef_rot_axis_angle"):
+        for robot_key in (
+            "robot0_eef_pos",
+            "robot0_eef_rot_axis_angle",
+            "robot0_abs_eef_pos",
+            "robot0_abs_eef_rot_axis_angle",
+        ):
             if robot_key in shape_meta["sample"]["obs"]["sparse"]:
                 ds = int(
                     shape_meta["sample"]["obs"]["sparse"][robot_key][
@@ -992,6 +1023,31 @@ def main():
     )
     controller.set_time_offset(env.current_hardware_time_s)
 
+    # Policies trained with absolute poses and/or the EE-centered scan crop work in the
+    # fixture frame (origin at tag0). Live RTDE poses are in the right-arm base frame,
+    # so hand the controller the base->fixture transform from the workcell extrinsics
+    # (override the file with $UMIFT_WORKCELL_EXTRINSICS after moving the part).
+    if shape_meta_needs_fixture_frame(shape_meta):
+        extrinsics = load_workcell_extrinsics()
+        controller.SE3_fixture_from_world = extrinsics.T_fixture_from_right_base
+        print(
+            "[frames] policy uses fixture-frame poses; extrinsics:",
+            extrinsics.path,
+            "\nT_fixture_from_right_base =\n",
+            controller.SE3_fixture_from_world,
+        )
+
+    # Diagnostics for the scan CNN branch (hooks only read tensors).
+    scan_monitor: Optional[ScanEncoderMonitor] = None
+    if control_para["monitor_scan_encoder"]:
+        scan_monitor = ScanEncoderMonitor(policy)
+        if not scan_monitor.enabled:
+            scan_monitor = None
+    scan_is_cropped = scan_crop_cfg(shape_meta) is not None
+    show_scan_panel = bool(control_para["show_scan_panel"]) and (
+        "scan_heatmap_0" in shape_meta["sample"]["obs"]["sparse"]
+    )
+
     # timestep_idx = 0
     # stiffness = None
     episode_initial_time_s = env.current_hardware_time_s
@@ -1049,8 +1105,7 @@ def main():
 
             images_to_stack.append(im)
 
-        stacked = np.hstack(images_to_stack)
-        cv2.imshow("image", stacked)
+        cv2.imshow("image", stack_for_display(images_to_stack))
 
         key = cv2.waitKey(10)
         if key == ord("q"):
@@ -1090,6 +1145,8 @@ def main():
 
         log = None
         horizon_count = 0
+        if scan_monitor is not None:
+            scan_monitor.reset()
         if control_para["enable_control_log"]:
             episode_log_path = os.path.join(
                 control_log_folder_path, f"episode_{int(time.time())}"
@@ -1195,9 +1252,11 @@ def main():
 
                 images_to_stack.append(im)
 
-            stacked = np.hstack(images_to_stack)
-            cv2.imshow("image", stacked)
-            cv2.waitKey(10)
+            # The popup is drawn after inference (below) so the scan panel shows exactly
+            # what the policy received for this query. Without the panel, draw it now.
+            if not show_scan_panel:
+                cv2.imshow("image", stack_for_display(images_to_stack))
+                cv2.waitKey(10)
 
             obs_task = dict()
 
@@ -1267,6 +1326,33 @@ def main():
                     action_stiffnesses,
                     action_eoat,
                 ) = controller.compute_one_horizon_action(obs_task["obs"], device)
+
+            # Scan-encoder diagnostics + popup (never allowed to interrupt control).
+            scan_encoder_stats = None
+            try:
+                if scan_monitor is not None:
+                    scan_encoder_stats = scan_monitor.update()
+                    if scan_encoder_stats is not None:
+                        print(scan_monitor.format_line(scan_encoder_stats))
+                if show_scan_panel:
+                    vision_img = stack_for_display(images_to_stack)
+                    scan_obs = (controller.last_obs_policy or {}).get("scan_heatmap_0")
+                    if scan_obs is not None:
+                        panel = render_scan_panel(
+                            scan_obs,
+                            height=vision_img.shape[0],
+                            crop=scan_is_cropped,
+                            text_lines=(
+                                scan_monitor.overlay_lines(scan_encoder_stats)
+                                if scan_encoder_stats is not None
+                                else None
+                            ),
+                        )
+                        vision_img = np.hstack([vision_img, panel])
+                    cv2.imshow("image", vision_img)
+                    cv2.waitKey(10)
+            except Exception as exc:
+                print(f"[scan-enc] display/monitor error (ignored): {exc}")
 
             outputs_ts_nominal_targets = [np.array] * len(id_list)
             outputs_ts_targets = [np.array] * len(id_list)
@@ -1512,6 +1598,7 @@ def main():
                     obs_task=obs_task,
                     shape_meta=shape_meta,
                     log_policy_vision=control_para["log_policy_vision"],
+                    scan_encoder_stats=scan_encoder_stats,
                 )
 
             action_start_time_s = env.current_hardware_time_s
@@ -1570,6 +1657,8 @@ def main():
                     )
                     break
 
+        if scan_monitor is not None:
+            print(scan_monitor.summary())
         printOrNot(vbs_h1, "End of episode.")
         finished_episode_id = episode_id
         episode_id += 1

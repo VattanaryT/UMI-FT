@@ -69,6 +69,30 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             {"params": self.model.model_sparse.parameters()},
             {"params": pretraiend_obs_encorder_params, "lr": obs_encorder_lr},
         ]
+        # Everything else in obs_encoder that is not a pretrained rgb/depth backbone
+        # (scan_heatmap CNN, wrench encoders, modality-attention transformer,
+        # linear_projection, position_embedding, ...) used to be missing from the
+        # optimizer, so it silently stayed at its random initialization. Train it at
+        # the base lr. Set training.train_obs_encoder_rest=false to get the old
+        # behaviour (e.g. to resume a run trained that way).
+        train_obs_encoder_rest = True
+        if "training" in cfg and "train_obs_encoder_rest" in cfg.training:
+            train_obs_encoder_rest = bool(cfg.training.train_obs_encoder_rest)
+        if train_obs_encoder_rest:
+            seen = {id(p) for p in pretraiend_obs_encorder_params}
+            rest_obs_encoder_params = []
+            for p in self.model.obs_encoder.parameters():
+                if p.requires_grad and id(p) not in seen:
+                    seen.add(id(p))
+                    rest_obs_encoder_params.append(p)
+            print(
+                "==> training non-pretrained obs_encoder params: "
+                f"{len(rest_obs_encoder_params)} tensors"
+            )
+            if rest_obs_encoder_params:
+                param_groups.append({"params": rest_obs_encoder_params})
+        else:
+            print("==> NOT training non-pretrained obs_encoder params (legacy)")
         if self.flag_has_dense:
             param_groups.append({"params": self.model.model_dense.parameters()})
         # self.optimizer = hydra.utils.instantiate(

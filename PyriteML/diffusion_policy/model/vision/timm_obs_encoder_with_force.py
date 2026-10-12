@@ -128,6 +128,7 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
 
         scan_feature_dim = 128
         scan_share_model = True
+        scan_pooling_cfg = None  # None -> "flatten" if the key is cropped else "avg"
         if scan_heatmap_encoder_cfg is not None:
             scan_feature_dim = scan_heatmap_encoder_cfg.get(
                 "feature_dim", scan_feature_dim
@@ -135,6 +136,7 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
             scan_share_model = scan_heatmap_encoder_cfg.get(
                 "share_model", scan_share_model
             )
+            scan_pooling_cfg = scan_heatmap_encoder_cfg.get("pooling", None)
         _shared_scan_heatmap_model = None
 
         model_list = []
@@ -268,16 +270,25 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
                 # entirely, route to the small dedicated ScanHeatmapEncoder branch.
                 scan_heatmap_keys.append(key)
                 in_channels = shape[0]
+                # An EE-centered crop (shape_meta.obs.<key>.crop.enabled) only makes
+                # sense if the encoder keeps spatial layout, so default to flatten
+                # pooling there; scan_heatmap_encoder_cfg.pooling overrides.
+                crop_attr = attr.get("crop", None)
+                crop_on = crop_attr is not None and bool(crop_attr.get("enabled", False))
+                scan_pooling = scan_pooling_cfg or ("flatten" if crop_on else "avg")
+                scan_kwargs = dict(
+                    in_channels=in_channels,
+                    feature_dim=scan_feature_dim,
+                    pooling=scan_pooling,
+                    input_hw=(shape[1], shape[2]),
+                )
+                print(f"scan_heatmap {key}: shape={shape} pooling={scan_pooling}")
                 if scan_share_model:
                     if _shared_scan_heatmap_model is None:
-                        _shared_scan_heatmap_model = ScanHeatmapEncoder(
-                            in_channels=in_channels, feature_dim=scan_feature_dim
-                        )
+                        _shared_scan_heatmap_model = ScanHeatmapEncoder(**scan_kwargs)
                     scan_model = _shared_scan_heatmap_model
                 else:
-                    scan_model = ScanHeatmapEncoder(
-                        in_channels=in_channels, feature_dim=scan_feature_dim
-                    )
+                    scan_model = ScanHeatmapEncoder(**scan_kwargs)
                 scan_heatmap_model_map[key] = scan_model
             elif type == "rgb":
                 rgb_keys.append(key)

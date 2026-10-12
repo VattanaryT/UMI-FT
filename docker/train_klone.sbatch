@@ -16,6 +16,10 @@ set -euo pipefail
 
 # --- paths on Klone (edit if needed) ---
 SIF="${SIF:-/gscratch/scrubbed/rzghosh/images/umift-train.sif}"
+# Hydra task config (see PyriteML/diffusion_policy/config/task/) and any extra overrides, e.g.
+#   TASK=umift_ss_v2_crop EXTRA_ARGS="logging.name=ss_v2_crop" sbatch docker/train_klone.sbatch
+TASK="${TASK:-umift_zucchini}"
+EXTRA_ARGS="${EXTRA_ARGS:-}"
 DATA_HOST="${DATA_HOST:-/gscratch/scrubbed/rzghosh/umidata}"
 CKPT_HOST="${CKPT_HOST:-/gscratch/weirdlab/rzghosh/training_outputs}"
 WANDB_ENV="${WANDB_ENV:-/gscratch/weirdlab/rzghosh/wandb.env}"  # export WANDB_API_KEY=...
@@ -50,4 +54,5 @@ fi
 apptainer exec "${APPTAINER_ARGS[@]}" "${SIF}" \
   accelerate launch --mixed_precision=bf16 --num_processes=1 \
     /opt/umift/PyriteML/train.py --config-name=train_umift_workspace \
-    task.dataset_path=/data/acp_replay_buffer.zarr
+    task="${TASK}" \
+    task.dataset_path=/data/acp_replay_buffer.zarr ${EXTRA_ARGS}

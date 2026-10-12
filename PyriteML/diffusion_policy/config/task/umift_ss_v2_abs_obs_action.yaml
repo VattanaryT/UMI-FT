@@ -1,0 +1,13 @@
+# Experiment 3b: absolute fixture-frame (tag0) poses for both the obs AND the actions
+# (command + virtual target). On the robot the runner maps the predicted fixture-frame
+# poses back to the right-arm base frame with T_right_base_from_fixture.
+defaults:
+  - umift_ss_v2
+  - _self_
+
+name: UMIFT-SS-V2-ABS-OBS-ACTION
+
+shape_meta:
+  pose_frames:
+    obs: absolute
+    action: absolute

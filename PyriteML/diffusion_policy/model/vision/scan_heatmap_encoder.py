@@ -17,22 +17,35 @@ class ScanHeatmapEncoder(nn.Module):
     scan_heatmap_0 gets this tiny, purpose-built CNN branch instead, kept entirely
     separate from the shared vision encoder.
 
-    Architecture: a few stride-2 Conv2d+ReLU layers followed by global average
-    pooling and a linear projection to a fixed-size feature vector. Global average
-    pooling (rather than a flatten + fixed-size Linear, as used in the
-    `multimodal_representation` DepthEncoder/ImageEncoder this mirrors) makes the
-    module agnostic to the exact input H/W, which is convenient since scan_heatmap
-    resolution is a task-config knob.
+    Architecture: a few stride-2 Conv2d+ReLU layers followed by a pooling step and a
+    linear projection to a fixed-size feature vector.
 
-    Input:  (N, in_channels, H, W) float tensor (any H, W; downsampled 16x total
-            by four stride-2 convs, then globally pooled).
+    pooling:
+        "avg":     global average pooling (default, original behaviour). Agnostic to
+                   the input H/W, but it throws away *where* in the image a feature
+                   is, so it can only describe "what is somewhere in the image".
+        "flatten": flatten the final (64, H/16, W/16) feature map into the linear
+                   layer. Keeps spatial layout, which is required for the
+                   EE-centered crop (the policy has to know whether a ridge is
+                   ahead of / behind / beside the tool). Needs ``input_hw``.
+
+    Input:  (N, in_channels, H, W) float tensor (downsampled 16x total by four
+            stride-2 convs).
     Output: (N, feature_dim) float tensor.
     """
 
-    def __init__(self, in_channels: int = 3, feature_dim: int = 128):
+    def __init__(
+        self,
+        in_channels: int = 3,
+        feature_dim: int = 128,
+        pooling: str = "avg",
+        input_hw=None,
+    ):
         super().__init__()
+        assert pooling in ("avg", "flatten"), f"unknown pooling {pooling}"
         self.in_channels = in_channels
         self.feature_dim = feature_dim
+        self.pooling = pooling
 
         self.backbone = nn.Sequential(
             nn.Conv2d(in_channels, 16, kernel_size=5, stride=2, padding=2),
@@ -44,8 +57,18 @@ class ScanHeatmapEncoder(nn.Module):
             nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1),
             nn.ReLU(inplace=True),
         )
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Linear(64, feature_dim)
+        if pooling == "avg":
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            proj_in = 64
+        else:
+            assert (
+                input_hw is not None
+            ), "ScanHeatmapEncoder(pooling='flatten') needs input_hw=(H, W)"
+            self.pool = nn.Flatten(1)
+            with torch.no_grad():
+                dummy = torch.zeros(1, in_channels, int(input_hw[0]), int(input_hw[1]))
+                proj_in = int(self.backbone(dummy).numel())
+        self.proj = nn.Linear(proj_in, feature_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         assert x.dim() == 4, f"ScanHeatmapEncoder expects (N,C,H,W), got {tuple(x.shape)}"
