@@ -126,6 +126,28 @@ Frames: absolute poses are in the fixture frame (origin at tag0), so they surviv
 | Train | `UMI-FT/PyriteML/train.py` (`train_umift_workspace`) |
 | Inference | `UMI-FT/PyriteEnvSuites/env_runners/umift_env_runner.py` |
 
+## View as LeRobot
+
+UMIFT training still uses zarr. For LeRobot episode viewing, convert:
+
+```bash
+# no-scan set
+python UMI-FT/UMIFT_Data/scripts/convert_umift_zarr_to_lerobot.py \
+  --input  /mnt/data/umidata/ft/datasets/stringer_data_v2_full/acp_replay_buffer_10hz_224.zarr \
+  --output /mnt/data/umidata/ft/datasets/stringer_data_v2_full/lerobot_acp_replay_buffer_10hz_224 \
+  --repo-id local/stringer_data_v2_full \
+  --overwrite
+
+# tag-pose scanner set (includes depth + scan_heatmap)
+python UMI-FT/UMIFT_Data/scripts/convert_umift_zarr_to_lerobot.py \
+  --input  /mnt/data/umidata/ft/datasets/stringer_scanner/acp_replay_buffer.zarr \
+  --output /mnt/data/umidata/ft/datasets/stringer_scanner/lerobot_acp_replay_buffer \
+  --repo-id local/stringer_scanner_tag \
+  --overwrite
+```
+
+Frames follow `rgb_time_stamps_0`. Depth and scan heatmaps are stored as viewable videos plus float arrays. Episode-level `scan_gap_intervals_0` is in `meta/umift_episode_extras.json`.
+
 ## Notes
 
 `dataset_path` in `PyriteML/diffusion_policy/config/task/umift_zucchini.yaml` still points at `stringer_teleop_merged_10hz_224`. Pass `task.dataset_path` (the sbatch job does).
