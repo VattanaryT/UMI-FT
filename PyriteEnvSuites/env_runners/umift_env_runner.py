@@ -712,7 +712,7 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        "ckpt_path": "/stringer_scanner_v2/og/epoch=0035-train_loss=0.019.ckpt",
+        "ckpt_path": "/stringer_scanner_v2/flatten_crop/epoch=0030-train_loss=0.020.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
@@ -969,7 +969,18 @@ def main():
     # control_para["periodic_scan_*"] above). run_layup_scan_periodic() is
     # called directly from the main loop below -- no persistent
     # daemon/controller object to construct or tear down per episode.
-    periodic_scan_enabled = bool(control_para.get("periodic_scan_enabled", False))
+    # A checkpoint trained with task=umift_ss_v2_no_scan has no scan_heatmap
+    # input; do not pause the robot for scans that policy will never see.
+    policy_uses_scan = any(
+        "scan_heatmap" in key for key in shape_meta["sample"]["obs"]["sparse"]
+    )
+    periodic_scan_enabled = (
+        bool(control_para.get("periodic_scan_enabled", False)) and policy_uses_scan
+    )
+    if control_para.get("periodic_scan_enabled", False) and not policy_uses_scan:
+        print(
+            "[layup] periodic scans off: this checkpoint has no scan_heatmap input"
+        )
     next_scan_id = 0
 
     p_timestep_s = control_para["raw_time_step_s"]

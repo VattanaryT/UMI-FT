@@ -127,11 +127,12 @@ def raw_to_obs(
 
         # scan_gap_intervals_0: [start,end] per completed scan, used by
         # SequenceSamplerUmiFT (training-time-only) to filter out windows that fall
-        # inside a scan pause. Guarded on presence in raw_data too (not just
-        # shape_meta), since an episode with zero completed scans never gets this key
-        # at all (see convert_unified_t265_wild_to_umift_zarr.py's `scans` group
-        # no-op convention) -- must not raise KeyError for such episodes.
-        if "scan_heatmap_0" in shape_meta["obs"].keys() and "scan_gap_intervals_0" in raw_data:
+        # inside a scan pause. Copied whenever the episode has it, including when
+        # the policy does not take scan_heatmap as input (umift_ss_v2_no_scan),
+        # so pause windows are still dropped. An episode with zero completed scans
+        # never gets this key (convert_unified_t265_wild_to_umift_zarr.py writes
+        # no `scans` group) -- absence must not raise KeyError.
+        if "scan_gap_intervals_0" in raw_data:
             episode_data["obs"]["scan_gap_intervals_0"] = raw_data["scan_gap_intervals_0"][:]
 
 

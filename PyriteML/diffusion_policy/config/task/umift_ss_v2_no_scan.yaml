@@ -1,0 +1,21 @@
+# Policy with no laser-scan input.
+#
+# Hydra merges this file onto umift_ss_v2, so the scan keys cannot be deleted
+# here. drop_scan_inputs is applied in train.py (before the config is resolved)
+# and strips scan_heatmap_* / map_to_scan_idx_* from shape_meta. The scan CNN
+# is built only for those keys, so the checkpoint has no scan branch.
+#
+# Collect without scans by not starting the Keyence scan orchestrator and
+# leaving ROBOTIQ_INGEST_HOST unset on the Pi. Those episodes have no scan
+# arrays, and this config does not ask for them. A zarr that already contains
+# scan arrays can be trained the same way: the arrays are ignored, and
+# scan-pause windows are still dropped when scan_gap_intervals_0 is present.
+#
+#   task=umift_ss_v2_no_scan
+defaults:
+  - umift_ss_v2
+  - _self_
+
+name: UMIFT-SS-V2-NO-SCAN
+
+drop_scan_inputs: true

@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader
 
 # from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
+from diffusion_policy.common.drop_scan_inputs import apply_drop_scan_inputs
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply
 
@@ -34,6 +35,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     exclude_keys = tuple()
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
+        # Covers the workspace hydra entry, which does not go through train.py.
+        # A no-op when train.py already stripped the keys.
+        apply_drop_scan_inputs(cfg)
         super().__init__(cfg, output_dir=output_dir)
 
         # set seed
