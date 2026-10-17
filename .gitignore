@@ -23,4 +23,5 @@ figs/
 output.log
 scripts/profile_data_loader.py 
 *.sif
+*.mp4
 wandb/
