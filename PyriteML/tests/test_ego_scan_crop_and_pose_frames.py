@@ -14,6 +14,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 import PyriteUtility.spatial_math.spatial_utilities as su
+from diffusion_policy.common.drop_scan_inputs import apply_drop_scan_inputs
 from diffusion_policy.common.sampler_umift import filter_rgb_ids_near_bad_poses
 from diffusion_policy.model.vision.scan_heatmap_encoder import ScanHeatmapEncoder
 from PyriteConfig.tasks.umift import umift_type_conversions as tc
@@ -355,6 +356,63 @@ def test_task_configs_flags():
     assert pose_frames_cfg(_shape_meta("umift_zucchini")) == {"obs": "relative", "action": "relative"}
 
 
+def _compose(task: str):
+    with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
+        cfg = compose(config_name="train_umift_workspace", overrides=[f"task={task}"])
+    apply_drop_scan_inputs(cfg)
+    OmegaConf.resolve(cfg)
+    apply_drop_scan_inputs(cfg)
+    return cfg
+
+
+def test_no_scan_task_drops_scan_inputs():
+    cfg = _compose("umift_ss_v2_no_scan")
+    assert cfg.task.name == "UMIFT-SS-V2-NO-SCAN"
+    assert cfg.task.drop_scan_inputs is True
+    for shape_meta in (
+        cfg.task.shape_meta,
+        cfg.policy.shape_meta,
+        cfg.policy.obs_encoder.shape_meta,
+        cfg.task.dataset.shape_meta,
+    ):
+        for section in ("raw", "obs"):
+            assert not any("scan" in key for key in shape_meta[section])
+        assert not any(
+            "scan" in key for key in shape_meta["sample"]["obs"]["sparse"]
+        )
+        assert "rgb_0" in shape_meta["obs"]
+        assert "depth_0" in shape_meta["sample"]["obs"]["sparse"]
+        assert "robot0_eef_wrench_left" in shape_meta["obs"]
+
+    # The baseline task is unchanged: no flag, scan input stays.
+    base = _compose("umift_ss_v2")
+    assert "scan_heatmap_0" in base.policy.shape_meta["obs"]
+    assert "scan_heatmap_0" in base.policy.shape_meta["sample"]["obs"]["sparse"]
+
+
+def test_scan_gap_intervals_copied_without_scan_obs():
+    pose = np.zeros((2, 7), dtype=np.float64)
+    pose[:, 3] = 1.0
+    stamps = np.arange(2, dtype=np.float64).reshape(-1, 1)
+    base = {
+        "ts_pose_fb_0": pose,
+        "rgb_time_stamps_0": stamps,
+        "robot_time_stamps_0": stamps,
+    }
+    shape_meta = {"id_list": [0], "raw": {}, "obs": {}}
+    episode = {}
+    tc.raw_to_obs(
+        {**base, "scan_gap_intervals_0": np.array([[0.0, 1.5]], dtype=np.float32)},
+        episode,
+        shape_meta,
+    )
+    np.testing.assert_allclose(episode["obs"]["scan_gap_intervals_0"], [[0.0, 1.5]])
+
+    episode = {}
+    tc.raw_to_obs(base, episode, shape_meta)
+    assert "scan_gap_intervals_0" not in episode["obs"]
+
+
 def test_filter_near_bad_poses():
     rgb_times = np.arange(0, 20, 1 / 15)
     ids = np.arange(len(rgb_times))
@@ -382,3 +440,83 @@ def test_scan_encoder_pooling_modes():
     assert not torch.allclose(flat(a), flat(b), atol=1e-4)
     with pytest.raises(AssertionError):
         ScanHeatmapEncoder(3, 128, pooling="flatten")
+
+
+# ------------------------------------------------------- spatial softmax pooling
+def test_spatial_softmax_shapes_and_state_dict_compat():
+    ss = ScanHeatmapEncoder(3, 128, pooling="spatial_softmax", num_keypoints=16)
+    for hw in [(64, 64), (80, 160)]:
+        assert ss(torch.randn(2, 3, *hw)).shape == (2, 128)
+    # 16 keypoints -> 32 coords + 64 avg features
+    assert ss.proj.weight.shape == (128, 32 + 64)
+    no_avg = ScanHeatmapEncoder(3, 128, pooling="spatial_softmax", num_keypoints=16, include_avg=False)
+    assert no_avg.proj.weight.shape == (128, 32)
+    # feature map is input/8 with the default 3 stride-2 convs
+    assert ss.backbone(torch.zeros(1, 3, 64, 64)).shape[-2:] == (8, 8)
+    # the original modes are untouched (same backbone layout / parameter names)
+    avg = ScanHeatmapEncoder(3, 128)
+    assert avg.proj.weight.shape == (128, 64)
+    assert avg.backbone(torch.zeros(1, 3, 64, 64)).shape[-2:] == (4, 4)
+    assert "keypoint_conv.weight" not in avg.state_dict()
+    assert ScanHeatmapEncoder(3, 128, pooling="avg", num_downsample=3).backbone(
+        torch.zeros(1, 3, 64, 64)
+    ).shape[-2:] == (8, 8)
+
+
+def test_spatial_softmax_returns_expected_coordinates():
+    enc = ScanHeatmapEncoder(3, 8, pooling="spatial_softmax", num_keypoints=2)
+    h, w = 8, 16
+    feat = torch.zeros(1, 64, h, w)
+    feat[0, 0, 2, 12] = 1.0  # channel 0 peaks at row 2, col 12
+    feat[0, 1, 6, 3] = 1.0  # channel 1 peaks at row 6, col 3
+    with torch.no_grad():
+        enc.keypoint_conv.weight.zero_()
+        enc.keypoint_conv.bias.zero_()
+        enc.keypoint_conv.weight[0, 0, 0, 0] = 200.0  # sharp -> ~argmax
+        enc.keypoint_conv.weight[1, 1, 0, 0] = 200.0
+    out = enc._spatial_softmax(feat)  # (1, 4) = [x0, x1, y0, y1]
+    xs = torch.linspace(-1, 1, w)
+    ys = torch.linspace(-1, 1, h)
+    want = torch.stack([xs[12], xs[3], ys[2], ys[6]])
+    assert torch.allclose(out[0], want, atol=1e-3)
+
+
+def test_spatial_softmax_is_position_sensitive_and_trainable():
+    torch.manual_seed(0)
+    a = torch.zeros(1, 3, 64, 64)
+    a[:, :, 10:20, 10:20] = 1
+    b = torch.roll(a, shifts=24, dims=-1)
+    ss = ScanHeatmapEncoder(3, 128, pooling="spatial_softmax")
+
+    # Position information that actually reaches the pooled features: the keypoint
+    # coordinates move with the blob, the avg-pooled features barely do.
+    with torch.no_grad():
+        kp_change = (ss._spatial_softmax(ss.backbone(a)) - ss._spatial_softmax(ss.backbone(b))).norm()
+        avg_change = (ss.pool(ss.backbone(a)) - ss.pool(ss.backbone(b))).norm()  # same backbone
+    assert kp_change > 5 * avg_change
+    assert not torch.allclose(ss(a), ss(b), atol=1e-5)
+    # gradients reach the keypoint head and the temperature
+    ss(torch.randn(2, 3, 64, 64)).sum().backward()
+    assert ss.temperature.grad is not None and ss.temperature.grad.abs().sum() > 0
+    assert ss.keypoint_conv.weight.grad.abs().sum() > 0
+    # works under bf16 autocast (softmax is done in fp32 internally)
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        out = ss(torch.randn(2, 3, 64, 64))
+    assert torch.isfinite(out.float()).all()
+
+
+def test_spatial_softmax_via_policy_config():
+    from hydra.utils import instantiate
+
+    with initialize_config_dir(version_base=None, config_dir=CONFIG_DIR):
+        cfg = compose(
+            config_name="train_umift_workspace",
+            overrides=[
+                "task=umift_ss_v2_crop",
+                "policy.obs_encoder.scan_heatmap_encoder_cfg.pooling=spatial_softmax",
+                "policy.obs_encoder.scan_heatmap_encoder_cfg.num_keypoints=24",
+            ],
+        )
+    enc_cfg = cfg.policy.obs_encoder.scan_heatmap_encoder_cfg
+    assert enc_cfg.pooling == "spatial_softmax" and enc_cfg.num_keypoints == 24
+    assert enc_cfg.num_downsample is None and enc_cfg.include_avg is None

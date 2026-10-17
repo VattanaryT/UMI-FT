@@ -112,10 +112,19 @@ policy:
     scan_heatmap_encoder_cfg:
       feature_dim: 128
       share_model: True
-      # avg | flatten | null. avg = global average pool (no spatial layout);
-      # flatten = keep spatial layout. null -> flatten if the scan key is cropped
-      # (shape_meta.obs.scan_heatmap_0.crop.enabled), else avg.
+      # avg | flatten | spatial_softmax | null. avg = global average pool (no spatial
+      # layout); flatten = keep spatial layout; spatial_softmax = learned keypoint
+      # (x, y) coordinates + avg-pooled features. null -> flatten if the scan key is
+      # cropped (shape_meta.obs.scan_heatmap_0.crop.enabled), else avg.
       pooling: null
+      # Optional (null = encoder defaults): number of stride-2 convs (default 4, or 3
+      # for spatial_softmax), number of keypoints (default 32, spatial_softmax only),
+      # and whether to concatenate avg-pooled features to the keypoints (default true).
+      num_downsample: null
+      num_keypoints: null
+      include_avg: null
+      # initial softmax temperature for spatial_softmax (default 0.1; learnable)
+      init_temperature: null
 
   num_inference_steps: 16 # 8
   diffusion_step_embed_dim: 32

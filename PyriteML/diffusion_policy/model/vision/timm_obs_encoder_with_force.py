@@ -129,6 +129,7 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
         scan_feature_dim = 128
         scan_share_model = True
         scan_pooling_cfg = None  # None -> "flatten" if the key is cropped else "avg"
+        scan_extra_kwargs = {}
         if scan_heatmap_encoder_cfg is not None:
             scan_feature_dim = scan_heatmap_encoder_cfg.get(
                 "feature_dim", scan_feature_dim
@@ -137,6 +138,11 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
                 "share_model", scan_share_model
             )
             scan_pooling_cfg = scan_heatmap_encoder_cfg.get("pooling", None)
+            # optional extras (None -> ScanHeatmapEncoder defaults)
+            for _k in ("num_downsample", "num_keypoints", "include_avg", "init_temperature"):
+                _v = scan_heatmap_encoder_cfg.get(_k, None)
+                if _v is not None:
+                    scan_extra_kwargs[_k] = _v
         _shared_scan_heatmap_model = None
 
         model_list = []
@@ -281,8 +287,12 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
                     feature_dim=scan_feature_dim,
                     pooling=scan_pooling,
                     input_hw=(shape[1], shape[2]),
+                    **scan_extra_kwargs,
                 )
-                print(f"scan_heatmap {key}: shape={shape} pooling={scan_pooling}")
+                print(
+                    f"scan_heatmap {key}: shape={shape} pooling={scan_pooling}"
+                    + (f" {scan_extra_kwargs}" if scan_extra_kwargs else "")
+                )
                 if scan_share_model:
                     if _shared_scan_heatmap_model is None:
                         _shared_scan_heatmap_model = ScanHeatmapEncoder(**scan_kwargs)

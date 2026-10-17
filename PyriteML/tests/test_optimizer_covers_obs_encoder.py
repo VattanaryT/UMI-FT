@@ -72,3 +72,22 @@ def test_legacy_flag_restores_old_behaviour():
         if "scan_heatmap_model_map" in n
     ]
     assert scan and not any(id(p) in ids for p in scan)
+
+
+def test_spatial_softmax_params_in_optimizer_and_update():
+    ws = _workspace(
+        "umift_ss_v2_crop",
+        "policy.obs_encoder.scan_heatmap_encoder_cfg.pooling=spatial_softmax",
+    )
+    enc = ws.model.obs_encoder.scan_heatmap_model_map["scan_heatmap_0"]
+    assert enc.pooling == "spatial_softmax"
+    ids = _opt_ids(ws)
+    names = {n for n, _ in enc.named_parameters()}
+    assert {"keypoint_conv.weight", "temperature"} <= names
+    assert all(id(p) in ids for p in enc.parameters())
+    t0 = enc.temperature.detach().clone()
+    kp0 = enc.keypoint_conv.weight.detach().clone()
+    enc(torch.rand(4, 3, 64, 64)).pow(2).mean().backward()
+    ws.optimizer.step()
+    assert (enc.temperature.detach() - t0).abs().max() > 0
+    assert (enc.keypoint_conv.weight.detach() - kp0).abs().max() > 0
