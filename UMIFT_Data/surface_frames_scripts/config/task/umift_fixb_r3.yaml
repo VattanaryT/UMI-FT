@@ -1,0 +1,24 @@
+# Fix B run 3: surface-frame obs + local curvature. Action is the same Fix B
+# label as run 2. Curvature is the only observation run 2 does not have.
+defaults:
+  - umift_mold_aware
+  - _self_
+
+name: FIXB-R3-SURFACE-FIXB
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_data_v2_full_fixb/r3_surface_fixb/acp_replay_buffer.zarr
+
+dataset:
+  _target_: fixb_dataset.UmiFTDatasetFixB
+
+shape_meta:
+  obs:
+    robot0_mold_curv:
+      shape: [4]
+      type: low_dim
+  sample:
+    obs:
+      sparse:
+        robot0_mold_curv:
+          horizon: ${task.sparse_obs_mold_horizon}
+          down_sample_steps: ${task.sparse_obs_mold_down_sample_steps}

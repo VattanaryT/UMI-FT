@@ -1,0 +1,8 @@
+# Fix B run 2: fixture-frame obs, Fix B action (v_par, delta_n) in the command slot.
+defaults:
+  - umift_mold_aware
+  - _self_
+
+name: FIXB-R2-WORLD-FIXB
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_data_v2_full_fixb/r2_world_fixb/acp_replay_buffer.zarr

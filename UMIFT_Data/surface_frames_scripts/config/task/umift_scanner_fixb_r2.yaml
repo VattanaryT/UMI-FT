@@ -1,0 +1,8 @@
+# Fix B on stringer_scanner_v2 (September). Laser scan is not a policy input.
+defaults:
+  - umift_mold_aware
+  - _self_
+
+name: SCANNER-FIXB-R2-WORLD-FIXB
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/r2_world_fixb/acp_replay_buffer.zarr

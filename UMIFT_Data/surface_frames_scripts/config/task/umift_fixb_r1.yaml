@@ -1,0 +1,8 @@
+# Fix B run 1: fixture-frame obs, fixture-frame actions, same mold channels.
+defaults:
+  - umift_mold_aware
+  - _self_
+
+name: FIXB-R1-WORLD-WORLD
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_data_v2_full_fixb/r1_world_world/acp_replay_buffer.zarr

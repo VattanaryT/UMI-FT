@@ -18,6 +18,7 @@ intermediate_umi_output_gripper_test/
 intermediate_umi_output_before_detect_acuro/
 intermediate_umi_output/
 figs/
+UMIFT_Data/surface_frames_scripts/eval/
 
 # miscellaneous
 output.log
