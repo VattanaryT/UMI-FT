@@ -76,6 +76,27 @@ def raw_to_obs(
             episode_data["obs"][f"robot{id}_abs_eef_pos"] = pose9_fb[..., :3]
             episode_data["obs"][f"robot{id}_abs_eef_rot_axis_angle"] = pose9_fb[..., 3:]
 
+        # optional: mold geom (signed dist + normal + R_field rot6d), robot-rate
+        if f"robot{id}_mold_geom" in shape_meta["obs"].keys():
+            signed = np.asarray(
+                raw_data[f"mold_signed_distance_{id}"], dtype=np.float32
+            ).reshape(-1, 1)
+            normal = np.asarray(raw_data[f"mold_normal_{id}"], dtype=np.float32).reshape(
+                -1, 3
+            )
+            rot6d = np.asarray(
+                raw_data[f"mold_R_field_rot6d_{id}"], dtype=np.float32
+            ).reshape(-1, 6)
+            episode_data["obs"][f"robot{id}_mold_geom"] = np.concatenate(
+                [signed, normal, rot6d], axis=-1
+            )
+
+        # optional: mold curvature (r3), robot-rate
+        if f"robot{id}_mold_curv" in shape_meta["obs"].keys():
+            episode_data["obs"][f"robot{id}_mold_curv"] = np.asarray(
+                raw_data[f"mold_curvature_{id}"], dtype=np.float32
+            ).reshape(-1, 4)
+
         # optional: gripper
         if "robot0_gripper" in shape_meta["obs"].keys():
             episode_data["obs"][f"robot{id}_gripper"] = raw_data[f"gripper_{id}"][:]
@@ -180,6 +201,27 @@ def raw_to_obs_inference(
         if "robot0_abs_eef_pos" in shape_meta["obs"].keys():
             episode_data["obs"][f"robot{id}_abs_eef_pos"] = pose9_fb[..., :3]
             episode_data["obs"][f"robot{id}_abs_eef_rot_axis_angle"] = pose9_fb[..., 3:]
+
+        # optional: mold geom (signed dist + normal + R_field rot6d), robot-rate
+        if f"robot{id}_mold_geom" in shape_meta["obs"].keys():
+            signed = np.asarray(
+                raw_data[f"mold_signed_distance_{id}"], dtype=np.float32
+            ).reshape(-1, 1)
+            normal = np.asarray(raw_data[f"mold_normal_{id}"], dtype=np.float32).reshape(
+                -1, 3
+            )
+            rot6d = np.asarray(
+                raw_data[f"mold_R_field_rot6d_{id}"], dtype=np.float32
+            ).reshape(-1, 6)
+            episode_data["obs"][f"robot{id}_mold_geom"] = np.concatenate(
+                [signed, normal, rot6d], axis=-1
+            )
+
+        # optional: mold curvature (r3), robot-rate
+        if f"robot{id}_mold_curv" in shape_meta["obs"].keys():
+            episode_data["obs"][f"robot{id}_mold_curv"] = np.asarray(
+                raw_data[f"mold_curvature_{id}"], dtype=np.float32
+            ).reshape(-1, 4)
 
         # optional: gripper
         if "robot0_gripper" in shape_meta["obs"].keys():

@@ -222,7 +222,7 @@ def main() -> int:
     if rows:
         with (out / "metrics.csv").open("w", newline="") as f:
             fields = list(dict.fromkeys(k for row in rows for k in row))
-        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
     if pooled:

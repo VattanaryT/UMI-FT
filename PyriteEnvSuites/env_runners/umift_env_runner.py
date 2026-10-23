@@ -2,17 +2,25 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
+import dill
 import yaml
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import zarr
+from scipy.spatial.transform import Rotation
+
+# Fix B / mold-aware runtime (shared with offline eval scripts)
+_SURFACE_SCRIPTS = Path(__file__).resolve().parents[2] / "UMIFT_Data" / "surface_frames_scripts"
+if str(_SURFACE_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SURFACE_SCRIPTS))
 
 # from PyriteConfig.tasks.common.common_type_conversions import raw_to_obs
 from PyriteConfig.tasks.umift.umift_type_conversions import raw_to_obs_inference
@@ -36,6 +44,10 @@ from PyriteUtility.spatial_math import spatial_utilities as su
 from PyriteEnvSuites.envs.task.manip_server_layup_env import ManipServerLayupEnv
 # from PyriteEnvSuites.envs.task.manip_server_umift_env import ManipServerUMIFTEnv
 from PyriteEnvSuites.envs.task.run_layup_scan_periodic import run_layup_scan_periodic
+from PyriteEnvSuites.env_runners.rollout_cam_recorder import (
+    DEFAULT_ORBBEC_V4L,
+    RolloutCamRecorder,
+)
 
 from PyriteEnvSuites.utils.env_utils import (
     pose9g1_to_traj,
@@ -275,6 +287,127 @@ def run_compare_pointcloud(
     return result
 
 
+def make_rollout_id(ckpt_path: str, episode_id: int, ts: Optional[int] = None) -> str:
+    """policy_e{epoch}_rollout{N}_{unix_ts} from ckpt path."""
+    p = Path(ckpt_path)
+    policy = p.parent.name or "policy"
+    m = re.search(r"epoch[=_]?(\d+)", p.stem, flags=re.IGNORECASE)
+    epoch = int(m.group(1)) if m else -1
+    ts = int(time.time()) if ts is None else int(ts)
+    return f"{policy}_e{epoch}_rollout{int(episode_id)}_{ts}"
+
+
+def tool_tilt_deg(R_tool: np.ndarray, R_field: np.ndarray, R_off: np.ndarray) -> float:
+    """Acute post-R_off tilt (demo median ~28°). R_* are 3x3."""
+    M = (R_field.T @ R_tool) @ R_off.T
+    tilt = float(np.degrees(np.arccos(np.clip(M[2, 2], -1.0, 1.0))))
+    return min(tilt, 180.0 - tilt)
+
+
+def pose7_batch_to_fixture(pose7: np.ndarray, T_fixture_from_base: np.ndarray) -> np.ndarray:
+    """Map pose7 batch (…,7) from right_base → fixture (mold / FixB frame)."""
+    from fixb_labels import Rp_to_pose7, pose7_to_Rp
+
+    pose7 = np.asarray(pose7, dtype=np.float64)
+    flat = pose7.reshape(-1, 7)
+    R, p = pose7_to_Rp(flat)
+    T = np.asarray(T_fixture_from_base, dtype=np.float64)
+    Rf = np.einsum("ij,njk->nik", T[:3, :3], R)
+    pf = (T[:3, :3] @ p.T).T + T[:3, 3]
+    return Rp_to_pose7(Rf, pf).reshape(pose7.shape)
+
+
+def se3_batch_fixture_to_base(
+    R: np.ndarray, p: np.ndarray, T_fixture_from_base: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Map decoded (R,p) from fixture → right_base for robot commands."""
+    T_WF = np.linalg.inv(np.asarray(T_fixture_from_base, dtype=np.float64))
+    Rb = np.einsum("ij,njk->nik", T_WF[:3, :3], R)
+    pb = (T_WF[:3, :3] @ np.asarray(p, dtype=np.float64).T).T + T_WF[:3, 3]
+    return Rb, pb
+
+
+def summarize_mold_rollout(
+    *,
+    sd: np.ndarray,
+    force: np.ndarray,
+    tilt: np.ndarray,
+    seam_mm: List[float],
+    seam_deg: List[float],
+    n_clamp_steps: int,
+    n_action_steps: int,
+    n_safety_stops: int,
+    safety_stop_reasons: List[str],
+    demo_tilt_median_deg: float = 28.0,
+    contact_sd_m: float = 0.003,
+) -> Dict[str, Any]:
+    sd = np.asarray(sd, dtype=np.float64).reshape(-1)
+    force = np.asarray(force, dtype=np.float64).reshape(-1)
+    tilt = np.asarray(tilt, dtype=np.float64).reshape(-1)
+    contact = sd < contact_sd_m if sd.size else np.zeros(0, dtype=bool)
+    sd_c = sd[contact] if contact.any() else np.array([], dtype=np.float64)
+    tilt_c = tilt[contact] if contact.any() else tilt
+    return {
+        "contact_fraction": float(contact.mean()) if contact.size else 0.0,
+        "sd_contact_mean_m": float(sd_c.mean()) if sd_c.size else None,
+        "sd_contact_std_m": float(sd_c.std()) if sd_c.size else None,
+        "force_mean_n": float(force.mean()) if force.size else None,
+        "force_peak_n": float(force.max()) if force.size else None,
+        "tilt_contact_median_deg": float(np.median(tilt_c)) if tilt_c.size else None,
+        "tilt_vs_demo_median_deg": (
+            float(np.median(tilt_c) - demo_tilt_median_deg) if tilt_c.size else None
+        ),
+        "demo_tilt_median_deg": float(demo_tilt_median_deg),
+        "seam_jump_max_mm": float(np.max(seam_mm)) if seam_mm else None,
+        "seam_jump_max_deg": float(np.max(seam_deg)) if seam_deg else None,
+        "clamp_fraction": (
+            float(n_clamp_steps) / float(n_action_steps) if n_action_steps > 0 else 0.0
+        ),
+        "n_clamp_steps": int(n_clamp_steps),
+        "n_action_steps": int(n_action_steps),
+        "n_safety_stops": int(n_safety_stops),
+        "safety_stop_reasons": list(safety_stop_reasons),
+        "n_samples": int(sd.size),
+    }
+
+
+def print_mold_rollout_summary(summary: Dict[str, Any], rollout_id: str) -> None:
+    def _f(key: str, unit: str = "", scale: float = 1.0) -> str:
+        v = summary.get(key)
+        if v is None:
+            return "n/a"
+        return f"{float(v) * scale:.4g}{unit}"
+
+    print(f"\n========== Rollout summary ({rollout_id}) ==========")
+    print(f"  contact_fraction:     {_f('contact_fraction')}")
+    print(
+        f"  sd_contact mean/std:  {_f('sd_contact_mean_m', ' m')} / "
+        f"{_f('sd_contact_std_m', ' m')}"
+    )
+    print(
+        f"  force mean/peak:      {_f('force_mean_n', ' N')} / "
+        f"{_f('force_peak_n', ' N')}"
+    )
+    print(
+        f"  tilt_contact median:  {_f('tilt_contact_median_deg', ' deg')} "
+        f"(vs demo {_f('demo_tilt_median_deg', ' deg')}: "
+        f"{_f('tilt_vs_demo_median_deg', ' deg')})"
+    )
+    print(
+        f"  seam_jump max:        {_f('seam_jump_max_mm', ' mm')} / "
+        f"{_f('seam_jump_max_deg', ' deg')}"
+    )
+    print(
+        f"  clamp_fraction:       {_f('clamp_fraction')} "
+        f"({summary.get('n_clamp_steps', 0)}/{summary.get('n_action_steps', 0)} steps)"
+    )
+    print(
+        f"  safety_stops:         {summary.get('n_safety_stops', 0)} "
+        f"{summary.get('safety_stop_reasons', [])}"
+    )
+    print("===================================================\n")
+
+
 def run_layup_scan_eval(
     *,
     env,
@@ -282,6 +415,8 @@ def run_layup_scan_eval(
     control_para: dict,
     right_return_joints: List[float],
     compare_executor: ThreadPoolExecutor,
+    session_name: Optional[str] = None,
+    output_dir: Optional[Path] = None,
 ) -> Future:
     """Pause RTDE, scan + restore right, resume RTDE, compare in background.
 
@@ -302,7 +437,8 @@ def run_layup_scan_eval(
             f"right_return_joints must be length 6, got {len(right_return_joints)}"
         )
 
-    session_name = f"inference_ep{episode_id}_{int(time.time())}"
+    if session_name is None:
+        session_name = f"inference_ep{episode_id}_{int(time.time())}"
     scan_script = keyence_ws / "scripts" / "run_layup_scan.py"
     compare_script = keyence_ws / "utils" / "compare_pointcloud_distance.py"
     zones_config = keyence_ws / "config" / "layup_scan.yaml"
@@ -323,14 +459,19 @@ def run_layup_scan_eval(
             )
             # Use --flag=value so joint values starting with '-' are not
             # parsed as new argparse options.
+            scan_cmd = [
+                str(keyence_python),
+                str(scan_script),
+                "--session-name",
+                session_name,
+                f"--right-return-joints={joints_csv}",
+            ]
+            if output_dir is not None:
+                output_dir = Path(output_dir)
+                output_dir.mkdir(parents=True, exist_ok=True)
+                scan_cmd.extend(["--output-dir", str(output_dir)])
             scan_proc = subprocess.run(
-                [
-                    str(keyence_python),
-                    str(scan_script),
-                    "--session-name",
-                    session_name,
-                    f"--right-return-joints={joints_csv}",
-                ],
+                scan_cmd,
                 cwd=str(keyence_ws),
                 capture_output=True,
                 text=True,
@@ -704,6 +845,18 @@ def main():
         # Hook the scan CNN and print/log per-query statistics to spot a collapsed
         # encoder (see PyriteUtility/planning_control/scan_encoder_monitor.py).
         "monitor_scan_encoder": True,
+        # ---- Mold-aware / Fix B (r1,r2,r3) ----
+        # When the checkpoint has robot0_mold_geom, live mold obs + Fix B decode
+        # are enabled automatically. dry_run forces δn to a positive hover height.
+        "mold_aware_dry_run": False,
+        "mold_aware_field_npz": (
+            "/mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/"
+            "shared/fixb_field.npz"
+        ),
+        "mold_aware_abort_on_safety": True,
+        # Per-rollout MP4s next to the control log: wrist D405 + center Orbbec.
+        "record_rollout_cameras": True,
+        "orbbec_v4l_device": DEFAULT_ORBBEC_V4L,
     }
     pipeline_para = {
         # Layup: D405 rgb (manip_server) + depth (pyrealsense2) + UR5e wrist FT.
@@ -712,7 +865,11 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        "ckpt_path": "/stringer_scanner_v2/flatten_crop/epoch=0030-train_loss=0.020.ckpt",
+        # Mold-aware scanner Fix B (matched epoch-35). Override for other runs:
+        #   /scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt
+        #   /scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt
+        #   /scanner_fixb/r3_surface_fixb/epoch=0035-train_loss=0.016.ckpt
+        "ckpt_path": "/scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
@@ -770,6 +927,47 @@ def main():
     print("Loading policy: ", ckpt_full_path)
     device = torch.device(control_para["device"])
     policy, shape_meta = load_policy(str(ckpt_full_path), device)
+
+    # Mold-aware / Fix B: detect run type from checkpoint task name.
+    mold_runtime = None
+    mold_run_type = "none"
+    try:
+        _payload = torch.load(
+            open(ckpt_full_path, "rb"), map_location="cpu", pickle_module=dill
+        )
+        _task_name = str(getattr(_payload["cfg"].task, "name", ""))
+    except Exception as exc:
+        print(f"[mold] could not read task name from ckpt ({exc}); mold_aware off")
+        _task_name = ""
+    # Mold field + FixB labels live in the fixture frame. Live RTDE tip is
+    # right_base; keep T_fixture_from_right_base for mold obs/decode.
+    mold_T_fixture_from_base: Optional[np.ndarray] = None
+    if "robot0_mold_geom" in shape_meta["obs"]:
+        from mold_aware_runtime import MoldAwareRuntime, infer_run_type
+
+        mold_run_type = infer_run_type(_task_name, shape_meta)
+        mold_runtime = MoldAwareRuntime.from_assets(
+            run_type=mold_run_type,
+            field_path=Path(control_para["mold_aware_field_npz"]),
+            dry_run=bool(control_para["mold_aware_dry_run"]),
+        )
+        mold_T_fixture_from_base = load_workcell_extrinsics().T_fixture_from_right_base
+        # Mold-aware policies were trained with real depth.
+        control_para["set_depth_to_zero"] = False
+        # No scan heatmap in scanner Fix B checkpoints.
+        control_para["periodic_scan_enabled"] = False
+        control_para["show_scan_panel"] = False
+        control_para["monitor_scan_encoder"] = False
+        print(
+            f"[mold] enabled run_type={mold_run_type} dry_run={mold_runtime.dry_run} "
+            f"field={control_para['mold_aware_field_npz']}"
+        )
+        print(
+            "[mold] set_depth_to_zero=False, periodic_scan_enabled=False; "
+            "mold obs/decode use fixture frame via workcell extrinsics"
+        )
+    else:
+        print("[mold] checkpoint has no robot0_mold_geom; mold_aware off")
 
     # image size
     (image_width, image_height) = get_real_obs_resolution(shape_meta)
@@ -848,6 +1046,8 @@ def main():
             "robot0_eef_rot_axis_angle",
             "robot0_abs_eef_pos",
             "robot0_abs_eef_rot_axis_angle",
+            "robot0_mold_geom",
+            "robot0_mold_curv",
         ):
             if robot_key in shape_meta["sample"]["obs"]["sparse"]:
                 ds = int(
@@ -1156,12 +1356,45 @@ def main():
 
         log = None
         horizon_count = 0
+        episode_ts = int(time.time())
+        rollout_id = make_rollout_id(
+            pipeline_para["ckpt_path"], episode_id, ts=episode_ts
+        )
+        episode_log_path = os.path.join(control_log_folder_path, rollout_id)
+        # Per-episode mold metrics (filled when mold_runtime is on).
+        ep_sd: List[float] = []
+        ep_force: List[float] = []
+        ep_tilt: List[float] = []
+        ep_seam_mm: List[float] = []
+        ep_seam_deg: List[float] = []
+        ep_n_clamp_steps = 0
+        ep_n_action_steps = 0
+        ep_n_safety_stops = 0
+        ep_safety_reasons: List[str] = []
+        prev_seam_x: Optional[np.ndarray] = None
+        prev_seam_R: Optional[np.ndarray] = None
+        cam_rec: Optional[RolloutCamRecorder] = None
+        if control_para.get("record_rollout_cameras", False) and isinstance(
+            env, ManipServerLayupEnv
+        ):
+            try:
+                cam_rec = RolloutCamRecorder(
+                    Path(episode_log_path) / "cameras",
+                    orbbec_v4l=str(
+                        control_para.get("orbbec_v4l_device", DEFAULT_ORBBEC_V4L)
+                    ),
+                )
+                cam_rec.start()
+                env.set_wrist_raw_rgb_sink(cam_rec.push_wrist_rgb)
+                printOrNot(vbs_h1, "Rollout cameras →", cam_rec.out_dir)
+            except Exception as exc:
+                print(f"[rollout-cam] start failed (continuing without): {exc}")
+                cam_rec = None
         if scan_monitor is not None:
             scan_monitor.reset()
+        if mold_runtime is not None:
+            mold_runtime.reset()
         if control_para["enable_control_log"]:
-            episode_log_path = os.path.join(
-                control_log_folder_path, f"episode_{int(time.time())}"
-            )
             log_store = zarr.DirectoryStore(path=episode_log_path)
             log = zarr.open(store=log_store, mode="w")
             log.attrs["sparse_execution_horizon"] = int(
@@ -1174,11 +1407,22 @@ def main():
                 control_para.get("ensemble_decay_m", 0.0)
             )
             log.attrs["episode_id"] = int(episode_id)
+            log.attrs["rollout_id"] = rollout_id
             log.attrs["episode_data_folder"] = env.get_episode_folder()
             log.attrs["ckpt_path"] = pipeline_para["ckpt_path"]
             log.attrs["hardware_config_path"] = pipeline_para["hardware_config_path"]
+            if mold_runtime is not None:
+                log.attrs["mold_run_type"] = mold_run_type
+                log.attrs["mold_aware_dry_run"] = bool(mold_runtime.dry_run)
+                log.attrs["mold_aware_field_npz"] = str(
+                    control_para["mold_aware_field_npz"]
+                )
+                log.attrs["max_tangential_speed_mps"] = float(
+                    mold_runtime.limits.max_tangential_speed_mps
+                )
             log.attrs["log_policy_vision"] = bool(control_para["log_policy_vision"])
             printOrNot(vbs_h1, "Control log:", episode_log_path)
+            printOrNot(vbs_h1, "Rollout ID:", rollout_id)
 
         # Fresh temporal ensemblers for each episode (zero-added-latency blending).
         action_ensemblers = None
@@ -1280,6 +1524,51 @@ def main():
                     ]
             # import pdb; pdb.set_trace()
 
+            # Mold-aware: fill mold_* from tip in *fixture* frame (field frame).
+            # Live ts_pose_fb is right_base; restore it after fill so eef packing
+            # still sees base poses (preprocess applies T_fixture_from_base).
+            mold_fill = None
+            if mold_runtime is not None:
+                assert mold_T_fixture_from_base is not None
+                pose_base = np.asarray(obs_raw["ts_pose_fb_0"], dtype=np.float64)
+                obs_raw["ts_pose_fb_0"] = pose7_batch_to_fixture(
+                    pose_base, mold_T_fixture_from_base
+                )
+                mold_fill = mold_runtime.fill_obs_raw(obs_raw, robot_id=0)
+                pose_fix = np.asarray(obs_raw["ts_pose_fb_0"], dtype=np.float64)
+                obs_raw["ts_pose_fb_0"] = pose_base
+                hard_obs = mold_runtime.last_hard_triggers
+                if hard_obs:
+                    print(f"[mold][safety] obs hard_triggers={hard_obs}")
+                    ep_n_safety_stops += 1
+                    ep_safety_reasons.extend(hard_obs)
+                    if control_para["mold_aware_abort_on_safety"]:
+                        print("[mold] aborting episode due to safety trigger")
+                        break
+                # Live contact / tilt / force samples (one per policy query).
+                if mold_fill:
+                    sd_now = float(mold_fill["sd"][-1])
+                    ep_sd.append(sd_now)
+                    R_now = mold_fill["R"][-1]
+                    from fixb_labels import pose7_to_Rp as _pose7_tilt
+
+                    R_tool, _ = _pose7_tilt(pose_fix[-1].reshape(1, 7))
+                    ep_tilt.append(
+                        tool_tilt_deg(R_tool[0], R_now, mold_runtime.R_off)
+                    )
+                    if horizon_count == 0:
+                        print(
+                            f"[mold][frames] tip_base={pose_base[-1,:3]} "
+                            f"tip_fix={pose_fix[-1,:3]} sd={sd_now:.4f} m "
+                            f"n={mold_fill['normal'][-1]}"
+                        )
+                wkey = "wrench_left_0" if "wrench_left_0" in obs_raw else None
+                if wkey is None and "wrench_0" in obs_raw:
+                    wkey = "wrench_0"
+                if wkey is not None:
+                    w = np.asarray(obs_raw[wkey][-1], dtype=np.float64).reshape(-1)
+                    ep_force.append(float(np.linalg.norm(w[:3])))
+
             raw_to_obs_inference(obs_raw, obs_task, shape_meta)
 
             # hacks for UMIFT
@@ -1337,6 +1626,100 @@ def main():
                     action_stiffnesses,
                     action_eoat,
                 ) = controller.compute_one_horizon_action(obs_task["obs"], device)
+
+            # Fix B r2/r3: replace SE3 targets with anchored decode from raw action.
+            # Decode in fixture (same as training field); map commands back to base.
+            # r1 keeps action21_postprocess (absolute fixture poses → base via SE3_WF).
+            if (
+                mold_runtime is not None
+                and mold_run_type in ("r2_world_fixb", "r3_surface_fixb")
+                and controller.last_raw_action is not None
+            ):
+                from fixb_labels import pose7_to_Rp as _pose7_to_Rp
+
+                assert mold_T_fixture_from_base is not None
+                pose7_fix = pose7_batch_to_fixture(
+                    np.asarray(obs_raw["ts_pose_fb_0"][-1], dtype=np.float64),
+                    mold_T_fixture_from_base,
+                )
+                R0, p0 = _pose7_to_Rp(pose7_fix.reshape(1, 7))
+                raw_a = np.asarray(controller.last_raw_action, dtype=np.float64)
+                H = raw_a.shape[0]
+                dt = np.full(
+                    H,
+                    sparse_action_down_sample_steps
+                    * p_timestep_s
+                    * control_para["slow_down_factor"],
+                    dtype=np.float64,
+                )
+                decoded = mold_runtime.decode_chunk(raw_a, p0[0], R0[0], dt)
+                # Robot schedule_controls expects right_base SE3.
+                R_base, p_base = se3_batch_fixture_to_base(
+                    decoded["R_d"], decoded["x_d"], mold_T_fixture_from_base
+                )
+                R_field_base, x_s_base = se3_batch_fixture_to_base(
+                    decoded["R_field"], decoded["x_s"], mold_T_fixture_from_base
+                )
+                decoded = dict(decoded)
+                decoded["R_d"] = R_base
+                decoded["x_d"] = p_base
+                decoded["R_field"] = R_field_base
+                decoded["x_s"] = x_s_base
+                exe_h_preview = int(control_para["sparse_execution_horizon"])
+                exe_h_preview = min(exe_h_preview, decoded["x_d"].shape[0])
+                # Per-step clamp flags (speed / step / δn) over the executed slice.
+                for i in range(exe_h_preview):
+                    flags = []
+                    if bool(decoded["clamp_speed"][i]):
+                        flags.append("speed")
+                    if bool(decoded["clamp_step"][i]):
+                        flags.append("step")
+                    if bool(decoded["clamp_dn"][i]):
+                        flags.append("dn")
+                    ep_n_action_steps += 1
+                    if flags:
+                        ep_n_clamp_steps += 1
+                        print(
+                            f"[mold][clamp] h={horizon_count} step={i} flags={flags}"
+                        )
+                soft = mold_runtime.last_soft_triggers
+                hard = mold_runtime.last_hard_triggers
+                if soft:
+                    print(f"[mold][clamp] chunk soft_triggers={soft}")
+                if hard:
+                    print(f"[mold][safety] hard_triggers={hard}")
+                    ep_n_safety_stops += 1
+                    ep_safety_reasons.extend(hard)
+                    if control_para["mold_aware_abort_on_safety"]:
+                        print("[mold] aborting episode due to safety trigger")
+                        break
+                # Chunk-seam jump vs previous executed endpoint.
+                if prev_seam_x is not None:
+                    dx = float(np.linalg.norm(decoded["x_d"][0] - prev_seam_x) * 1e3)
+                    rel = prev_seam_R.T @ decoded["R_d"][0]
+                    ang = float(
+                        np.degrees(
+                            np.linalg.norm(
+                                Rotation.from_matrix(rel).as_rotvec()
+                            )
+                        )
+                    )
+                    ep_seam_mm.append(dx)
+                    ep_seam_deg.append(ang)
+                prev_seam_x = decoded["x_d"][exe_h_preview - 1].copy()
+                prev_seam_R = decoded["R_d"][exe_h_preview - 1].copy()
+                tgt, vt = mold_runtime.decoded_to_action_mats(decoded)
+                action_sparse_target_mats = [tgt]
+                action_sparse_vt_mats = [vt]
+                action_stiffnesses = [decoded["stiffness"]]
+                action_eoat = [decoded["eoat"]]
+                # stash for control log
+                obs_raw["_mold_decode_x_d"] = decoded["x_d"]
+                obs_raw["_mold_decode_x_s"] = decoded["x_s"]
+                obs_raw["_mold_decode_sd"] = decoded["sd"]
+                obs_raw["_mold_clamp_speed"] = decoded["clamp_speed"]
+                obs_raw["_mold_clamp_step"] = decoded["clamp_step"]
+                obs_raw["_mold_clamp_dn"] = decoded["clamp_dn"]
 
             # Scan-encoder diagnostics + popup (never allowed to interrupt control).
             scan_encoder_stats = None
@@ -1672,9 +2055,56 @@ def main():
             print(scan_monitor.summary())
         printOrNot(vbs_h1, "End of episode.")
         finished_episode_id = episode_id
+        finished_rollout_id = rollout_id
+        finished_episode_log_path = episode_log_path
         episode_id += 1
 
         env.stop_saving_data()
+
+        if cam_rec is not None:
+            try:
+                if isinstance(env, ManipServerLayupEnv):
+                    env.set_wrist_raw_rgb_sink(None)
+                cam_info = cam_rec.stop()
+                print(
+                    f"[rollout-cam] saved wrist_frames={cam_info['wrist_frames']} "
+                    f"orbbec_frames={cam_info['orbbec_frames']} "
+                    f"dir={cam_rec.out_dir}"
+                )
+            except Exception as exc:
+                print(f"[rollout-cam] stop failed: {exc}")
+            cam_rec = None
+
+        # Per-rollout summary (print + save next to control log).
+        if mold_runtime is not None:
+            summary = summarize_mold_rollout(
+                sd=np.asarray(ep_sd, dtype=np.float64),
+                force=np.asarray(ep_force, dtype=np.float64),
+                tilt=np.asarray(ep_tilt, dtype=np.float64),
+                seam_mm=ep_seam_mm,
+                seam_deg=ep_seam_deg,
+                n_clamp_steps=ep_n_clamp_steps,
+                n_action_steps=ep_n_action_steps,
+                n_safety_stops=ep_n_safety_stops,
+                safety_stop_reasons=ep_safety_reasons,
+            )
+            summary["rollout_id"] = finished_rollout_id
+            summary["episode_id"] = int(finished_episode_id)
+            summary["ckpt_path"] = pipeline_para["ckpt_path"]
+            summary["mold_run_type"] = mold_run_type
+            summary["mold_aware_dry_run"] = bool(mold_runtime.dry_run)
+            summary["control_log"] = finished_episode_log_path
+            print_mold_rollout_summary(summary, finished_rollout_id)
+            summary_path = Path(finished_episode_log_path).with_name(
+                f"{finished_rollout_id}_summary.json"
+            )
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            print(f"[mold] summary saved: {summary_path}")
+            if log is not None:
+                for k, v in summary.items():
+                    if isinstance(v, (int, float, str, bool)) or v is None:
+                        log.attrs[f"summary_{k}"] = v if v is not None else "null"
 
         print("Options:")
         print("     c: continue to next episode.")
@@ -1701,14 +2131,22 @@ def main():
                 )
             else:
                 try:
+                    # Save Keyence session next to this rollout's control log,
+                    # named with the same rollout ID.
                     fut = run_layup_scan_eval(
                         env=env,
                         episode_id=finished_episode_id,
                         control_para=control_para,
                         right_return_joints=right_start_joints,
                         compare_executor=compare_executor,
+                        session_name=f"{finished_rollout_id}_layup",
+                        output_dir=Path(control_log_folder_path),
                     )
                     layup_eval_futures.append(fut)
+                    print(
+                        f"[layup-eval] session will land under "
+                        f"{control_log_folder_path}/{finished_rollout_id}_layup/"
+                    )
                 except Exception as exc:
                     print(f"[layup-eval] FAILED: {exc}")
                     print(

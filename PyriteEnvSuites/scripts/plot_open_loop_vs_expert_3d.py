@@ -785,7 +785,8 @@ def build_window_update_script() -> str:
 
   function onSliderChange() {
     var startIdx = gd.layout.sliders[0].active || 0;
-    var endIdx = gd.layout.sliders[1].active || (DATA.sliderTimes.length - 1);
+    var endActive = gd.layout.sliders[1].active;
+    var endIdx = (endActive === undefined || endActive === null) ? DATA.sliderTimes.length - 1 : endActive;
     applyWindow(startIdx, endIdx);
   }
 
@@ -1465,7 +1466,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     write_figure_html(fig, out_html, payload)
     print(f"[plot] Wrote {out_html}")
     if args.show:
-        fig.show()
+        # fig.show() omits the post_script JS that makes the sliders work.
+        # Serve over http (file:// has no handler on remote/headless sessions).
+        import functools
+        import http.server
+
+        out_abs = os.path.abspath(out_html)
+        handler = functools.partial(
+            http.server.SimpleHTTPRequestHandler, directory=os.path.dirname(out_abs)
+        )
+        with http.server.ThreadingHTTPServer(("127.0.0.1", 8000), handler) as srv:
+            print(
+                f"[plot] Open http://localhost:8000/{os.path.basename(out_abs)} "
+                "(Ctrl-C to stop)"
+            )
+            try:
+                srv.serve_forever()
+            except KeyboardInterrupt:
+                pass
     return 0
 
 

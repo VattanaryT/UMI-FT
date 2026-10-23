@@ -225,6 +225,7 @@ class ModelPredictiveController:
         # obs.scan_heatmap_0.crop); None means obs are already in the fixture frame.
         self.SE3_fixture_from_world = None
         self.last_obs_policy = None
+        self.last_raw_action = None  # pre-postprocess policy output (H, D)
         self.verbose_level = -1
 
         print("[MPC] Done initializing")
@@ -297,6 +298,7 @@ class ModelPredictiveController:
                 raw_action = result["sparse"][0].detach().to("cpu").numpy()
             else:
                 raw_action = result["action"][0].detach().to("cpu").numpy()
+            self.last_raw_action = raw_action
 
             action = self.action_postprocess(
                 raw_action, SE3_WBase, self.id_list, self.fix_orientation
