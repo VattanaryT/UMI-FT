@@ -171,6 +171,58 @@ def heading_branch(R_field: np.ndarray, R_tool: np.ndarray, R_off: np.ndarray) -
     return np.where(flip[:, None, None], (RZ_PI @ R_off)[None], R_off[None])
 
 
+def rot_angle_deg(Ra: np.ndarray, Rb: np.ndarray) -> np.ndarray:
+    """Geodesic angle (deg) between rotation batches (...3,3)."""
+    rel = np.einsum("...ji,...jk->...ik", Ra, Rb)
+    rv = Rotation.from_matrix(rel.reshape(-1, 3, 3)).as_rotvec()
+    return np.degrees(np.linalg.norm(rv, axis=-1)).reshape(rel.shape[:-2])
+
+
+def delta_R_from_field_tool(R_field: np.ndarray, R_tool: np.ndarray) -> np.ndarray:
+    """ΔR = R(x_s)^T R_tool (N,3,3)."""
+    return np.einsum("nji,njk->nik", R_field, R_tool)
+
+
+def make_delta_R_continuous(dR: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Pick the 180°-about-n branch of each ΔR closest to the previous step.
+
+    Candidates at step t: ΔR_t and RZ_PI @ ΔR_t. Returns (dR_cont, flipped_mask).
+    """
+    dR = np.asarray(dR, dtype=np.float64).reshape(-1, 3, 3)
+    out = dR.copy()
+    flipped = np.zeros(len(dR), dtype=bool)
+    for t in range(1, len(dR)):
+        cand = dR[t]
+        alt = RZ_PI @ cand
+        if float(rot_angle_deg(alt[None], out[t - 1 : t])[0]) < float(
+            rot_angle_deg(cand[None], out[t - 1 : t])[0]
+        ):
+            out[t] = alt
+            flipped[t] = True
+        else:
+            out[t] = cand
+    return out, flipped
+
+
+def pad_symmetric_under_twist(dR: np.ndarray, R_off: np.ndarray, thresh_deg: float = 15.0) -> bool:
+    """True if folding every ΔR onto the closer of {R_off, RZ_PI@R_off} leaves
+    residuals mostly below thresh (pad≈180°-symmetric about n)."""
+    dR = np.asarray(dR, dtype=np.float64).reshape(-1, 3, 3)
+    keep = np.einsum("ij,nij->n", R_off, dR)
+    flip = np.einsum("ij,nij->n", RZ_PI @ R_off, dR) > keep
+    folded = np.where(flip[:, None, None], np.einsum("ij,njk->nik", RZ_PI, dR), dR)
+    err = rot_angle_deg(folded, np.broadcast_to(R_off, folded.shape))
+    return float(np.median(err)) < thresh_deg
+
+
+def fold_delta_R_to_R_off_branch(dR: np.ndarray, R_off: np.ndarray) -> np.ndarray:
+    """Map each ΔR to the branch closer to R_off (left-multiply by RZ_PI if needed)."""
+    dR = np.asarray(dR, dtype=np.float64).reshape(-1, 3, 3)
+    keep = np.einsum("ij,nij->n", R_off, dR)
+    flip = np.einsum("ij,nij->n", RZ_PI @ R_off, dR) > keep
+    return np.where(flip[:, None, None], np.einsum("ij,njk->nik", RZ_PI, dR), dR)
+
+
 def fixb_pose7_command(v_par: np.ndarray, delta_n: np.ndarray) -> np.ndarray:
     """Pack (v_par, delta_n) into the ts_pose_command_0 slot (identity rotation)."""
     n = len(v_par)

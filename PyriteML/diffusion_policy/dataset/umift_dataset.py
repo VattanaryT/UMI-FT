@@ -97,6 +97,9 @@ class UmiFTDataset(BaseImageDataset):
         elif (
             shape_meta["action"]["shape"][0] == 21
             or shape_meta["action"]["shape"][0] == 42
+            # Fix B r4: action21 + ΔR rot6d
+            or shape_meta["action"]["shape"][0] == 27
+            or shape_meta["action"]["shape"][0] == 54
         ):
             action_type = "pose9pose9s1g2"
         else:
@@ -309,7 +312,9 @@ class UmiFTDataset(BaseImageDataset):
         elif self.action_type == "pose9pose9s1":
             AL = 19
         elif self.action_type == "pose9pose9s1g2":
-            AL = 21
+            # 21 (r1–r3) or 27 (r4: + ΔR rot6d)
+            AL = int(data_cache_sparse["action"].shape[-1] // max(len(self.id_list), 1))
+            assert AL in (21, 27), f"unexpected per-arm action dim {AL}"
         else:
             raise RuntimeError("unsupported")
 
@@ -378,6 +383,14 @@ class UmiFTDataset(BaseImageDataset):
                     )
                 )
             )  # grasping force
+            if AL >= 27:
+                sparse_action_normalizers.append(
+                    get_identity_normalizer_from_stat(
+                        array_to_stats(
+                            data_cache_sparse["action"][..., i * AL + 21 : i * AL + 27]
+                        )
+                    )
+                )  # Fix B r4 ΔR rot6d
 
         sparse_normalizer["action"] = concatenate_normalizer(sparse_action_normalizers)
 

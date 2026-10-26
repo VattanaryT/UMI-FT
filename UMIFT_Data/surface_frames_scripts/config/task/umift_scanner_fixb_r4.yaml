@@ -1,0 +1,18 @@
+# Fix B r4: r2 obs + Fix B (v_par, δn) + learned ΔR = R(x_s)^T R_tool (rot6d).
+# Same observations / val split / horizons as r2; only action dim changes (21 → 27).
+defaults:
+  - umift_mold_aware
+  - _self_
+
+name: SCANNER-FIXB-R4-WORLD-FIXB-TILT
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/r4_world_fixb_tilt/acp_replay_buffer.zarr
+
+shape_meta:
+  action:
+    shape: [27]
+    rotation_rep: rotation_6d
+  raw:
+    fixb_delta_R_rot6d_0:
+      shape: [6]
+      type: low_dim

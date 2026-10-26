@@ -52,9 +52,9 @@ class ModelPredictiveControllerHybrid():
             action_type = "pose9pose9s1"
         elif shape_meta['action']['shape'][0] == 38:
             action_type = "pose9pose9s1"
-        elif shape_meta["action"]["shape"][0] == 21:
+        elif shape_meta["action"]["shape"][0] in (21, 27):
             action_type = "pose9pose9s1a2"
-        elif shape_meta["action"]["shape"][0] == 42:
+        elif shape_meta["action"]["shape"][0] in (42, 54):
             action_type = "pose9pose9s1a2"
         else:
             raise RuntimeError('unsupported')
@@ -189,9 +189,9 @@ class ModelPredictiveController:
             action_type = "pose9pose9s1"
         elif shape_meta["action"]["shape"][0] == 38:
             action_type = "pose9pose9s1"
-        elif shape_meta["action"]["shape"][0] == 21:
+        elif shape_meta["action"]["shape"][0] in (21, 27):
             action_type = "pose9pose9s1a2"
-        elif shape_meta["action"]["shape"][0] == 42:
+        elif shape_meta["action"]["shape"][0] in (42, 54):
             action_type = "pose9pose9s1a2"
         else:
             raise RuntimeError("unsupported")

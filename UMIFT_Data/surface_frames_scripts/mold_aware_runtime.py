@@ -52,8 +52,11 @@ def infer_run_type(task_name: str, shape_meta) -> str:
     name = (task_name or "").upper()
     has_geom = "robot0_mold_geom" in shape_meta["obs"]
     has_curv = "robot0_mold_curv" in shape_meta["obs"]
+    action_dim = int(shape_meta.get("action", {}).get("shape", [21])[0])
     if not has_geom:
         return "none"
+    if "R4" in name or "FIXB-TILT" in name or "WORLD_FIXB_TILT" in name or action_dim == 27:
+        return "r4_world_fixb_tilt"
     if "R3" in name or "SURFACE_FIXB" in name or has_curv:
         return "r3_surface_fixb"
     if "R2" in name or "WORLD_FIXB" in name:
@@ -75,11 +78,60 @@ class SafetyLimits:
     max_distance_from_mesh_m: float = 0.030
     max_foot_hop_m: float = 0.020
     stop_on_normal_flip: bool = True
+    max_tilt_from_normal_deg: float = 45.0
+    max_rot_rate_deg_per_step: float = 20.0
 
 
 # Soft clamps (applied / flagged) vs hard stops (abort-worthy).
-SOFT_CLAMP_KEYS = ("max_tangential_speed", "max_step", "delta_n")
+SOFT_CLAMP_KEYS = (
+    "max_tangential_speed",
+    "max_step",
+    "delta_n",
+    "max_tilt",
+    "max_rot_rate",
+)
 HARD_STOP_KEYS = ("normal_flip", "max_distance_from_mesh")
+
+
+def _clamp_tilt_to_normal(R_d: np.ndarray, n: np.ndarray, max_deg: float) -> tuple:
+    """Keep tool-z within max_deg of −n (press into mold). Returns (R_out, clamp_mask)."""
+    R = np.asarray(R_d, dtype=np.float64).reshape(-1, 3, 3).copy()
+    n = np.asarray(n, dtype=np.float64).reshape(-1, 3)
+    n = n / np.clip(np.linalg.norm(n, axis=-1, keepdims=True), 1e-9, None)
+    target = -n
+    z = R[:, :, 2]
+    cos = np.clip(np.sum(z * target, axis=-1), -1.0, 1.0)
+    ang = np.degrees(np.arccos(cos))
+    hit = ang > max_deg
+    if not np.any(hit):
+        return R, hit
+    # Rotate z toward target about z×target to land exactly at max_deg.
+    for i in np.flatnonzero(hit):
+        axis = np.cross(z[i], target[i])
+        an = np.linalg.norm(axis)
+        if an < 1e-9:
+            continue
+        axis = axis / an
+        excess = np.radians(ang[i] - max_deg)
+        dR = Rotation.from_rotvec(axis * excess).as_matrix()
+        R[i] = dR @ R[i]
+    return R, hit
+
+
+def _clamp_rot_rate(R_d: np.ndarray, max_deg: float) -> tuple:
+    """Cap geodesic step between consecutive R_d. Returns (R_out, clamp_mask)."""
+    R = np.asarray(R_d, dtype=np.float64).reshape(-1, 3, 3).copy()
+    hit = np.zeros(len(R), dtype=bool)
+    if len(R) < 2 or max_deg <= 0:
+        return R, hit
+    for i in range(1, len(R)):
+        rel = R[i - 1].T @ R[i]
+        rv = Rotation.from_matrix(rel).as_rotvec()
+        ang = float(np.degrees(np.linalg.norm(rv)))
+        if ang > max_deg and ang > 1e-9:
+            hit[i] = True
+            R[i] = R[i - 1] @ Rotation.from_rotvec(rv * (max_deg / ang)).as_matrix()
+    return R, hit
 
 
 @dataclass
@@ -96,6 +148,8 @@ class MoldAwareRuntime:
     last_clamp_speed: Optional[np.ndarray] = None
     last_clamp_step: Optional[np.ndarray] = None
     last_clamp_dn: Optional[np.ndarray] = None
+    last_clamp_tilt: Optional[np.ndarray] = None
+    last_clamp_rot_rate: Optional[np.ndarray] = None
 
     @classmethod
     def from_assets(
@@ -122,6 +176,8 @@ class MoldAwareRuntime:
         self.last_clamp_speed = None
         self.last_clamp_step = None
         self.last_clamp_dn = None
+        self.last_clamp_tilt = None
+        self.last_clamp_rot_rate = None
 
     @property
     def last_hard_triggers(self) -> list:
@@ -217,6 +273,8 @@ class MoldAwareRuntime:
         self.last_clamp_speed = np.zeros(H, dtype=bool)
         self.last_clamp_step = np.zeros(H, dtype=bool)
         self.last_clamp_dn = np.zeros(H, dtype=bool)
+        self.last_clamp_tilt = np.zeros(H, dtype=bool)
+        self.last_clamp_rot_rate = np.zeros(H, dtype=bool)
 
         if self.run_type == "r1_world_world":
             pos = raw_action[:, 0:3].astype(np.float64)
@@ -240,6 +298,8 @@ class MoldAwareRuntime:
                 "clamp_speed": self.last_clamp_speed,
                 "clamp_step": self.last_clamp_step,
                 "clamp_dn": self.last_clamp_dn,
+                "clamp_tilt": self.last_clamp_tilt,
+                "clamp_rot_rate": self.last_clamp_rot_rate,
             }
 
         v_par, delta_n, stiff, eoat, raw, clamp_dn = self.unpack_fixb_action(
@@ -269,10 +329,38 @@ class MoldAwareRuntime:
             delta_n[None],
             dt[None],
         )
-        B = heading_branch(dec["R"][:, 0], np.asarray(R0, dtype=np.float64).reshape(1, 3, 3), self.R_off)
-        R_d = np.einsum("hij,jk->hik", dec["R"][0], B[0])
+        R_field = dec["R"][0]
         x_d = dec["x_d"][0]
         x_s = dec["x_s"][0]
+
+        if self.run_type == "r4_world_fixb_tilt":
+            # Learned ΔR in action[..., 21:27]; project rot6d → SO(3).
+            # Hover keeps the predicted ΔR (only δn is overridden in unpack).
+            if raw_action.shape[-1] < 27:
+                raise ValueError(
+                    f"r4 decode needs action dim >= 27, got {raw_action.shape[-1]}"
+                )
+            dR = rot6d_rows_to_R(raw_action[:, 21:27])
+            R_d = np.einsum("hij,hjk->hik", R_field, dR)
+        else:
+            B = heading_branch(
+                R_field[0:1],
+                np.asarray(R0, dtype=np.float64).reshape(1, 3, 3),
+                self.R_off,
+            )
+            R_d = np.einsum("hij,jk->hik", R_field, B[0])
+
+        if apply_safety:
+            R_d, tilt_hit = _clamp_tilt_to_normal(
+                R_d, R_field[:, :, 2], self.limits.max_tilt_from_normal_deg
+            )
+            self.last_clamp_tilt = tilt_hit
+            if np.any(tilt_hit):
+                self.last_triggers.append("max_tilt")
+            R_d, rate_hit = _clamp_rot_rate(R_d, self.limits.max_rot_rate_deg_per_step)
+            self.last_clamp_rot_rate = rate_hit
+            if np.any(rate_hit):
+                self.last_triggers.append("max_rot_rate")
 
         if apply_safety and H > 1:
             steps = np.linalg.norm(np.diff(x_d, axis=0), axis=1)
@@ -289,8 +377,8 @@ class MoldAwareRuntime:
             "x_d": x_d,
             "R_d": R_d,
             "x_s": x_s,
-            "R_field": dec["R"][0],
-            "sd": np.sum((x_d - x_s) * dec["R"][0, :, :, 2], axis=1),
+            "R_field": R_field,
+            "sd": np.sum((x_d - x_s) * R_field[:, :, 2], axis=1),
             "stiffness": stiff,
             "eoat": eoat,
             "raw": raw,
@@ -299,6 +387,8 @@ class MoldAwareRuntime:
             "clamp_speed": self.last_clamp_speed,
             "clamp_step": self.last_clamp_step,
             "clamp_dn": self.last_clamp_dn,
+            "clamp_tilt": self.last_clamp_tilt,
+            "clamp_rot_rate": self.last_clamp_rot_rate,
         }
 
     def decoded_to_action_mats(

@@ -869,6 +869,7 @@ def main():
         #   /scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt
         #   /scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt
         #   /scanner_fixb/r3_surface_fixb/epoch=0035-train_loss=0.016.ckpt
+        #   /scanner_fixb/r4_world_fixb_tilt/epoch=0035-....ckpt  (after Hyak train)
         "ckpt_path": "/scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
@@ -1627,12 +1628,13 @@ def main():
                     action_eoat,
                 ) = controller.compute_one_horizon_action(obs_task["obs"], device)
 
-            # Fix B r2/r3: replace SE3 targets with anchored decode from raw action.
+            # Fix B r2/r3/r4: replace SE3 targets with anchored decode from raw action.
             # Decode in fixture (same as training field); map commands back to base.
             # r1 keeps action21_postprocess (absolute fixture poses → base via SE3_WF).
             if (
                 mold_runtime is not None
-                and mold_run_type in ("r2_world_fixb", "r3_surface_fixb")
+                and mold_run_type
+                in ("r2_world_fixb", "r3_surface_fixb", "r4_world_fixb_tilt")
                 and controller.last_raw_action is not None
             ):
                 from fixb_labels import pose7_to_Rp as _pose7_to_Rp

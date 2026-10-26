@@ -393,26 +393,26 @@ def raw_to_action21(
             indices, 0, len(wrench_timestamps) - 1
         )  # Ensure indices are valid
         downsampled_grasping_force = grasping_force[indices]
-        action.append(
-            np.concatenate(
-                [
-                    ts_pose9_command,
-                    ts_pose9_virtual_target,
-                    stiffness,
-                    gripper,
-                    downsampled_grasping_force,
-                ],
-                axis=-1,
-            )
-        )
+        parts = [
+            ts_pose9_command,
+            ts_pose9_virtual_target,
+            stiffness,
+            gripper,
+            downsampled_grasping_force,
+        ]
+        # Optional Fix B r4: ΔR rot6d appended after action21 (same robot-rate grid).
+        dR_key = f"fixb_delta_R_rot6d_{id}"
+        if dR_key in raw_data:
+            dR = np.asarray(raw_data[dR_key][:], dtype=np.float32).reshape(-1, 6)
+            parts.append(dR)
+        action.append(np.concatenate(parts, axis=-1))
     # action: trim to the shortest length
     action_len = min(action_lens)
     action = [x[:action_len] for x in action]
 
     episode_data["action"] = np.concatenate(action, axis=-1)
-    assert (
-        episode_data["action"].shape[1] == 21 or episode_data["action"].shape[1] == 42
-    )
+    D = episode_data["action"].shape[1]
+    assert D in (21, 27, 42, 54), f"unexpected action dim {D}"
 
     # action timestamps is set according to robot 0
     episode_data["action_time_stamps"] = raw_data["robot_time_stamps_0"][:action_len]
@@ -1074,7 +1074,7 @@ def action19_to_action_sample(
 
 
 def action21_to_action_sample(
-    action_sparse: np.ndarray,  # (T, D), D = 21 or 42
+    action_sparse: np.ndarray,  # (T, D), D = 21, 27 (r4), 42, or 54
     action_dense: np.ndarray,  # (H, T, D) not used
     id_list: list,
     base_pose: list,
@@ -1084,13 +1084,14 @@ def action21_to_action_sample(
     This function is used in training. It takes a sample of actions (len = action_horizon)
     and convert the poses in it to be relative to the current pose (id = 0).
 
+    Trailing ΔR rot6d (dims 21:27 per arm, Fix B r4) is left as-is (field-relative).
     """
     action_processed = {"sparse": {}, "dense": {}}
     T, D = action_sparse.shape
     if len(id_list) == 1:
-        assert D == 21
+        assert D in (21, 27), f"unexpected action dim {D}"
     else:
-        assert D == 42
+        assert D in (42, 54), f"unexpected action dim {D}"
 
     def action21_preprocess(action: np.ndarray, SE3_WBase: np.ndarray):
         # generate relative pose
@@ -1110,18 +1111,23 @@ def action21_to_action_sample(
         pose9_relative = su.SE3_to_pose9(SE3_relative)
         pose9_vt_relative = su.SE3_to_pose9(SE3_vt_relative)
 
-        return np.concatenate(
+        core = np.concatenate(
             [pose9_relative, pose9_vt_relative, stiffness, gripper, grasping_force],
             axis=-1,
         )
+        if action.shape[1] > 21:
+            # ΔR rot6d (r4): already relative to the field frame — do not SE3-transform.
+            core = np.concatenate([core, action[:, 21:27]], axis=-1)
+        return core
 
     if len(id_list) == 1:
         action_processed["sparse"] = action21_preprocess(action_sparse, base_pose[0])
     else:
+        per = D // 2
         action_processed["sparse"] = np.concatenate(
             [
-                action21_preprocess(action_sparse[:, :21], base_pose[0]),
-                action21_preprocess(action_sparse[:, 21:42], base_pose[1]),
+                action21_preprocess(action_sparse[:, :per], base_pose[0]),
+                action21_preprocess(action_sparse[:, per : 2 * per], base_pose[1]),
             ],
             axis=-1,
         )
@@ -1226,7 +1232,10 @@ def action21_postprocess(
     action: np.ndarray, current_SE3: list, id_list: list, fix_orientation=False
 ):
     """Convert policy outputs from relative pose to world frame pose
-    Used in online inference
+    Used in online inference.
+
+    Supports action dim 21 or 27 (r4 ΔR rot6d trailing); trailing dims are ignored
+    here — mold-aware decode reads them from the raw action.
     """
 
     action_SE3_absolute = [np.array] * len(id_list)
@@ -1234,11 +1243,13 @@ def action21_postprocess(
     stiffness = [0] * len(id_list)
     eoat = [np.array] * len(id_list)
 
+    D = int(action.shape[-1] // max(len(id_list), 1))
     for id in id_list:
-        action_pose9 = action[..., 21 * id + 0 : 21 * id + 9]
-        action_pose9_vt = action[..., 21 * id + 9 : 21 * id + 18]
-        stiffness[id] = action[..., 21 * id + 18]
-        eoat[id] = action[..., 21 * id + 19 : 21 * id + 21]
+        base = D * id
+        action_pose9 = action[..., base + 0 : base + 9]
+        action_pose9_vt = action[..., base + 9 : base + 18]
+        stiffness[id] = action[..., base + 18]
+        eoat[id] = action[..., base + 19 : base + 21]
         action_SE3 = su.pose9_to_SE3(action_pose9)
         action_SE3_vt = su.pose9_to_SE3(action_pose9_vt)
 

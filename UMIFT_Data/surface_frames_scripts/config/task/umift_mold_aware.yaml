@@ -1,0 +1,186 @@
+# Mold-aware stringer_data_v2_full baseline (no scan_heatmap).
+# Same ss_v2 horizons; fixture world; identical mold obs in all three ablation variants:
+#   umift_mold_world_world.yaml
+#   umift_mold_world_surface.yaml
+#   umift_mold_surface_surface.yaml
+#
+# robot0_mold_geom = [signed_m(1), normal_xyz(3), R_field_rot6d(6)]  # 10-d
+name: UMIFT-MOLD-AWARE
+
+sparse_obs_rgb_down_sample_steps: 4
+sparse_obs_rgb_horizon: 5
+
+sparse_obs_ultrawide_down_sample_steps: 5
+sparse_obs_ultrawide_horizon: 4
+
+sparse_obs_depth_down_sample_steps: 4
+sparse_obs_depth_horizon: 5
+
+sparse_obs_low_dim_down_sample_steps: 16
+sparse_obs_low_dim_horizon: 5
+
+sparse_obs_gripper_down_sample_steps: 1
+sparse_obs_gripper_horizon: 1
+
+sparse_obs_wrench_down_sample_steps: 1
+sparse_obs_wrench_horizon: 32
+
+# mold channels share the low-dim (robot-rate) horizon
+sparse_obs_mold_down_sample_steps: 16
+sparse_obs_mold_horizon: 5
+
+sparse_action_down_sample_steps: 1
+sparse_action_horizon: 24
+
+depth_clip: 0.5  # in [m]
+
+shape_meta: &shape_meta
+  # absolute = fixture frame for tag-tracked data (and for surface_* zarrs the
+  # pose streams are already rewritten; absolute still means "as stored").
+  pose_frames:
+    obs: absolute
+    action: absolute
+  id_list: [0]
+  raw:
+    rgb_0:
+      shape: [3, 224, 224]
+      type: rgb
+    depth_0:
+      shape: [3, 224, 224]
+      type: rgb
+    ts_pose_fb_0:
+      shape: [7]
+      type: low_dim
+    ts_pose_virtual_target_0:
+      shape: [7]
+      type: low_dim
+    gripper_0:
+      shape: [1]
+      type: low_dim
+    stiffness_0:
+      shape: [1]
+      type: low_dim
+    wrench_left_0:
+      shape: [6]
+      type: low_dim
+    wrench_right_0:
+      shape: [6]
+      type: low_dim
+    mold_signed_distance_0:
+      shape: [1]
+      type: low_dim
+    mold_normal_0:
+      shape: [3]
+      type: low_dim
+    mold_R_field_rot6d_0:
+      shape: [6]
+      type: low_dim
+    rgb_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    depth_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    robot_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    gripper_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    wrench_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    map_to_d_idx_0:
+      shape: [1]
+      type: index
+
+  obs:
+    rgb_0:
+      shape: [3, 224, 224]
+      type: rgb
+    depth_0:
+      shape: [3, 224, 224]
+      type: rgb
+      clip: ${task.depth_clip}
+    robot0_eef_pos:
+      shape: [3]
+      type: low_dim
+    robot0_eef_rot_axis_angle:
+      shape: [6]
+      type: low_dim
+      rotation_rep: rotation_6d
+    robot0_eef_wrench_left:
+      shape: [6]
+      type: low_dim
+    robot0_eef_wrench_right:
+      shape: [6]
+      type: low_dim
+    # [signed_m, n_x, n_y, n_z, R_field rot6d(6)] — identical across the 3 variants
+    robot0_mold_geom:
+      shape: [10]
+      type: low_dim
+    rgb_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    depth_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    robot_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    wrench_time_stamps_0:
+      shape: [1]
+      type: timestamp
+    map_to_d_idx_0:
+      shape: [1]
+      type: index
+  action:
+    shape: [21]
+    rotation_rep: rotation_6d
+  sample:
+    obs:
+      sparse:
+        rgb_0:
+          horizon: ${task.sparse_obs_rgb_horizon}
+          down_sample_steps: ${task.sparse_obs_rgb_down_sample_steps}
+        depth_0:
+          horizon: ${task.sparse_obs_depth_horizon}
+          down_sample_steps: ${task.sparse_obs_depth_down_sample_steps}
+        robot0_eef_pos:
+          horizon: ${task.sparse_obs_low_dim_horizon}
+          down_sample_steps: ${task.sparse_obs_low_dim_down_sample_steps}
+        robot0_eef_rot_axis_angle:
+          horizon: ${task.sparse_obs_low_dim_horizon}
+          down_sample_steps: ${task.sparse_obs_low_dim_down_sample_steps}
+        robot0_eef_wrench_left:
+          horizon: ${task.sparse_obs_wrench_horizon}
+          down_sample_steps: ${task.sparse_obs_wrench_down_sample_steps}
+        robot0_eef_wrench_right:
+          horizon: ${task.sparse_obs_wrench_horizon}
+          down_sample_steps: ${task.sparse_obs_wrench_down_sample_steps}
+        robot0_mold_geom:
+          horizon: ${task.sparse_obs_mold_horizon}
+          down_sample_steps: ${task.sparse_obs_mold_down_sample_steps}
+    action:
+      sparse:
+        horizon: ${task.sparse_action_horizon}
+        down_sample_steps: ${task.sparse_action_down_sample_steps}
+    training_duration_per_sparse_query: 5.0
+
+task_name: &task_name
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_data_v2_full/world_world/acp_replay_buffer.zarr
+
+dataset:
+  _target_: diffusion_policy.dataset.umift_dataset.UmiFTDataset
+  shape_meta: ${task.shape_meta}
+  dataset_path: ${task.dataset_path}
+  sparse_query_frequency_down_sample_steps: 2
+  action_padding: True
+  temporally_independent_normalization: False
+  seed: 42
+  val_ratio: 0.10
+  normalize_wrench: True
+  action_gap_threshold_mult: 3.0
+  scan_pre_first_fill: zeros
+  max_abs_pos_m: 2.0
