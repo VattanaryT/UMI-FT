@@ -89,6 +89,7 @@ SOFT_CLAMP_KEYS = (
     "delta_n",
     "max_tilt",
     "max_rot_rate",
+    "mesh_jump_hold",
 )
 HARD_STOP_KEYS = ("normal_flip", "max_distance_from_mesh")
 
@@ -150,6 +151,8 @@ class MoldAwareRuntime:
     last_clamp_dn: Optional[np.ndarray] = None
     last_clamp_tilt: Optional[np.ndarray] = None
     last_clamp_rot_rate: Optional[np.ndarray] = None
+    last_mesh_jump_hold: Optional[np.ndarray] = None
+    max_mesh_jump_deg: float = 30.0
 
     @classmethod
     def from_assets(
@@ -178,6 +181,7 @@ class MoldAwareRuntime:
         self.last_clamp_dn = None
         self.last_clamp_tilt = None
         self.last_clamp_rot_rate = None
+        self.last_mesh_jump_hold = None
 
     @property
     def last_hard_triggers(self) -> list:
@@ -275,6 +279,7 @@ class MoldAwareRuntime:
         self.last_clamp_dn = np.zeros(H, dtype=bool)
         self.last_clamp_tilt = np.zeros(H, dtype=bool)
         self.last_clamp_rot_rate = np.zeros(H, dtype=bool)
+        self.last_mesh_jump_hold = np.zeros(H, dtype=bool)
 
         if self.run_type == "r1_world_world":
             pos = raw_action[:, 0:3].astype(np.float64)
@@ -300,6 +305,7 @@ class MoldAwareRuntime:
                 "clamp_dn": self.last_clamp_dn,
                 "clamp_tilt": self.last_clamp_tilt,
                 "clamp_rot_rate": self.last_clamp_rot_rate,
+                "mesh_jump_hold": self.last_mesh_jump_hold,
             }
 
         v_par, delta_n, stiff, eoat, raw, clamp_dn = self.unpack_fixb_action(
@@ -344,6 +350,22 @@ class MoldAwareRuntime:
                 )
             dR = rot6d_rows_to_R(raw_action[:, 21:27])
             R_d = np.einsum("hij,hjk->hik", R_field, dR)
+            # If mesh R_f jumps mid-chunk, hold previous R_d (then rate-clamp).
+            if H > 1:
+                from scipy.spatial.transform import Rotation as _Rot
+
+                hold = np.zeros(H, dtype=bool)
+                for t in range(1, H):
+                    rel = R_field[t - 1].T @ R_field[t]
+                    ang = float(
+                        np.degrees(np.linalg.norm(_Rot.from_matrix(rel).as_rotvec()))
+                    )
+                    if ang > self.max_mesh_jump_deg:
+                        R_d[t] = R_d[t - 1]
+                        hold[t] = True
+                self.last_mesh_jump_hold = hold
+                if np.any(hold):
+                    self.last_triggers.append("mesh_jump_hold")
         else:
             B = heading_branch(
                 R_field[0:1],
@@ -391,6 +413,7 @@ class MoldAwareRuntime:
             "clamp_dn": self.last_clamp_dn,
             "clamp_tilt": self.last_clamp_tilt,
             "clamp_rot_rate": self.last_clamp_rot_rate,
+            "mesh_jump_hold": self.last_mesh_jump_hold,
         }
 
     def decoded_to_action_mats(

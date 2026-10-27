@@ -1,6 +1,7 @@
-"""r4-only: drop training chunks with off-edge k0 or a field-frame jump inside.
+"""r4-only helpers: per-sample off-edge / field-jump masks + optional analysis filter.
 
-Used by UmiFTDatasetR4. Does not affect r1/r2/r3.
+UmiFTDatasetR4 keeps the same chunks as r2 and uses build_episode_mask_table only
+for the ΔR loss mask (not filter_sampler_indices). Does not affect r1/r2/r3.
 """
 
 from __future__ import annotations

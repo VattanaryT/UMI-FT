@@ -474,7 +474,21 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
         # smoothness_loss *= args['normalization_weight']
         smoothness_loss = 0
 
-        sparse_loss = F.mse_loss(pred_sparse, target, reduction="mean")
+        # Optional per-dim weights (r4): zero ΔR dims after a field-frame jump.
+        # r1/r2/r3 omit action_loss_weight and keep plain mean MSE.
+        per = F.mse_loss(pred_sparse, target, reduction="none")
+        if "action_loss_weight" in batch and "sparse" in batch["action_loss_weight"]:
+            w = batch["action_loss_weight"]["sparse"].to(
+                device=per.device, dtype=per.dtype
+            )
+            if w.shape != per.shape:
+                raise ValueError(
+                    f"action_loss_weight.sparse shape {tuple(w.shape)} != "
+                    f"pred shape {tuple(per.shape)}"
+                )
+            sparse_loss = (per * w).sum() / w.sum().clamp_min(1.0)
+        else:
+            sparse_loss = per.mean()
         self.sparse_loss = sparse_loss
         self.smoothness_loss = smoothness_loss
 

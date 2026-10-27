@@ -8,8 +8,8 @@ integrate_fixb at decode. No field-frame rewrite: flipping R_f without
 negating v_par would reverse the slide direction.
 
 Twist continuity: pad is not 180°-symmetric, so we keep the raw ΔR (exact
-round-trip with mesh R_f). Remaining >30° ΔR jumps are mesh/normal
-discontinuities — drop those chunks at train time (same class as off-edge).
+round-trip with mesh R_f). Remaining >30° jumps are mesh R_f discontinuities;
+training keeps r2 chunks and zeros ΔR loss after a jump (runtime holds R_d).
 
 Action packing (via raw_to_action21 append): action27 =
   [v_t1, v_t2, δn, id_rot6d(6), vt_unused(9), stiff, grip, grasp, ΔR_rot6d(6)]
@@ -187,8 +187,9 @@ def build(out: Path = R4, relabel_only: bool = False) -> dict:
             "R_d = R_mesh project(delta_R_rot6d); hover keeps predicted delta_R"
         ),
         "train_filter_note": (
-            f"Drop chunks with off-edge (in-plane>{OFF_EDGE_M*1e3:.0f}mm at k0) "
-            "or any >30° ΔR jump inside the chunk — not yet applied in the zarr."
+            "Same sampler chunks as r2 (scan-gap + action-gap + end pads). "
+            "UmiFTDatasetR4 zeros ΔR loss (dims 21:27) after a >30° mesh R_f jump "
+            f"inside the chunk; off-edge (in-plane>{OFF_EDGE_M*1e3:.0f}mm) is not filtered."
         ),
     }
     root.attrs.update(
@@ -307,8 +308,8 @@ def run_checks(out: Path = R4) -> dict:
             "n_steps": int(n_steps),
             "pass_no_gt30": n_jump_gt30 == 0,
             "note": (
-                "Mesh-R_f ΔR; jumps are field discontinuities. Drop jump/off-edge "
-                "chunks at train time — not all jumps are off-edge."
+                "Mesh-R_f ΔR; jumps are field discontinuities. Train: same chunks "
+                "as r2; mask ΔR loss after jump. Runtime: hold R_d on mesh jump."
             ),
         },
         "rotate_mold": {

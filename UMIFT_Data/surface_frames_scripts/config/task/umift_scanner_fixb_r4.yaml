@@ -4,8 +4,8 @@
 #   RUN=r4_world_fixb_tilt sbatch fixb_train_scanner_klone.sbatch
 # Eval matched ckpt at epoch 35.
 #
-# r4-only sampler filter (UmiFTDatasetR4): drop chunks with off-edge at k0
-# (in-plane > 5 mm) OR any field-frame jump > 30° inside the action window.
+# Chunks: identical to r2 (UmiFTDatasetR4 does not drop queries).
+# Loss: mask ΔR dims (21:27) after a field-frame jump within the chunk.
 defaults:
   - umift_mold_aware
   - _self_
@@ -16,11 +16,9 @@ dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/
 
 dataset:
   _target_: fixb_dataset.UmiFTDatasetR4
-  drop_off_edge_and_field_jumps: true
-  off_edge_m: 0.005
+  mask_delta_R_after_field_jumps: true
   field_jump_deg: 30.0
-  # Written at dataset init (also printed to training log).
-  filter_stats_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/r4_world_fixb_tilt/checks/r4_chunk_filter_stats.json
+  filter_stats_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/r4_world_fixb_tilt/checks/r4_delta_R_mask_stats.json
 
 shape_meta:
   action:

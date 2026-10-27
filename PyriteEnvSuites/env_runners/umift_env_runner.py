@@ -1684,6 +1684,9 @@ def main():
                     cr = decoded.get("clamp_rot_rate")
                     if cr is not None and bool(cr[i]):
                         flags.append("rot_rate")
+                    mj = decoded.get("mesh_jump_hold")
+                    if mj is not None and bool(mj[i]):
+                        flags.append("mesh_jump_hold")
                     ep_n_action_steps += 1
                     if flags:
                         ep_n_clamp_steps += 1
@@ -1730,6 +1733,7 @@ def main():
                 obs_raw["_mold_clamp_dn"] = decoded["clamp_dn"]
                 obs_raw["_mold_clamp_tilt"] = decoded.get("clamp_tilt")
                 obs_raw["_mold_clamp_rot_rate"] = decoded.get("clamp_rot_rate")
+                obs_raw["_mold_mesh_jump_hold"] = decoded.get("mesh_jump_hold")
 
             # Scan-encoder diagnostics + popup (never allowed to interrupt control).
             scan_encoder_stats = None
