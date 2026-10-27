@@ -6,8 +6,10 @@
 #SBATCH --ntasks=1
 #SBATCH --gpus-per-node=1
 #SBATCH --cpus-per-task=20
-#SBATCH --mem=256G
+#SBATCH --mem=320G
 #SBATCH --time=24:00:00
+# checkpoint_every=5 → epoch 35 is written after that epoch finishes (before 36).
+# Extra RAM vs prior OOMs; keep batch_size=160. Lower workers if still OOM.
 #SBATCH --chdir=/gscratch/scrubbed/vtevy
 #SBATCH --output=/gscratch/weirdlab/vtevy/logs/fixb/%j.out
 #SBATCH --error=/gscratch/weirdlab/vtevy/logs/fixb/%j.err
@@ -74,8 +76,8 @@ apptainer exec "${APPTAINER_ARGS[@]}" "${SIF}" \
     task="${TASK}" \
     task.dataset_path=/data/acp_replay_buffer.zarr \
     dataloader.batch_size=160 \
-    dataloader.prefetch_factor=8 \
-    dataloader.num_workers=32 \
+    dataloader.prefetch_factor=4 \
+    dataloader.num_workers=16 \
     val_dataloader.batch_size=64 \
     training.num_epochs=200 \
     training.checkpoint_every=5 \

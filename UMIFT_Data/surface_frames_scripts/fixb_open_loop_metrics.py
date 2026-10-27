@@ -35,7 +35,7 @@ import zarr
 from scipy.spatial.transform import Rotation
 
 from fixb_field import FixBMoldField, integrate_fixb
-from fixb_labels import heading_branch, make_R_field_continuous, pose7_to_Rp
+from fixb_labels import heading_branch, pose7_to_Rp
 
 TOOL_Z = 2
 STEP_METRICS = (
@@ -106,12 +106,8 @@ def decode(run, action, times, p0, R0, field, R_off):
         if D < 27:
             raise ValueError(f"r4 decode needs action dim >= 27, got {D}")
         dR = rot6d_rows_to_R(action[..., 21:27])
-        R_f = dec["R"]
-        # Per-query field continuity (same rule as labels / runtime).
-        R_out = np.empty_like(R_f)
-        for qi in range(Q):
-            R_out[qi], _ = make_R_field_continuous(R_f[qi])
-        R = np.einsum("qhij,qhjk->qhik", R_out, dR)
+        # Mesh R_f from integrate_fixb — same frame as labels / v_par.
+        R = np.einsum("qhij,qhjk->qhik", dec["R"], dR)
         return dec["x_d"], R
     B = heading_branch(dec["R"][:, 0], R0, R_off)
     R = np.einsum("qhij,qjk->qhik", dec["R"], B)

@@ -16,7 +16,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from fixb_field import FixBMoldField, integrate_fixb
-from fixb_labels import heading_branch, make_R_field_continuous, pose7_to_Rp, so3_to_rot6d_rows
+from fixb_labels import heading_branch, pose7_to_Rp, so3_to_rot6d_rows
 from fixb_labels_tracked import HOP_EXCESS_M, tracked_project
 
 DEFAULT_FIELD = Path(
@@ -143,7 +143,6 @@ class MoldAwareRuntime:
     dry_run: bool = True
     _prev_foot: Optional[np.ndarray] = None
     _prev_n: Optional[np.ndarray] = None
-    _prev_R_field: Optional[np.ndarray] = None
     last_triggers: list = field(default_factory=list)
     # Per-step bool masks from the latest decode_chunk (length H).
     last_clamp_speed: Optional[np.ndarray] = None
@@ -173,7 +172,6 @@ class MoldAwareRuntime:
     def reset(self) -> None:
         self._prev_foot = None
         self._prev_n = None
-        self._prev_R_field = None
         self.last_triggers = []
         self.last_clamp_speed = None
         self.last_clamp_step = None
@@ -211,18 +209,8 @@ class MoldAwareRuntime:
         self._prev_foot = x[-1].copy()
 
         q = self.field.query(x, with_curvature=True)
-        R_f = q["R"]
-        # r4 labels bake twist-continuous field frames; keep live obs consistent.
-        if self.run_type == "r4_world_fixb_tilt":
-            if self._prev_R_field is not None and len(R_f) > 0:
-                seed = np.concatenate([self._prev_R_field[None], R_f], axis=0)
-                seed_c, _ = make_R_field_continuous(seed)
-                R_f = seed_c[1:]
-            else:
-                R_f, _ = make_R_field_continuous(R_f)
-            self._prev_R_field = R_f[-1].copy()
         # sd of the *tool* vs foot (same as training labels)
-        n = R_f[..., 2]
+        n = q["R"][..., 2]
         sd = np.sum((p_fb - x) * n, axis=1)
         if self._prev_n is not None and self.limits.stop_on_normal_flip:
             if float(np.dot(self._prev_n, n[-1])) < 0:
@@ -231,7 +219,7 @@ class MoldAwareRuntime:
 
         signed = sd.reshape(-1, 1).astype(np.float32)
         normal = n.astype(np.float32)
-        rot6d = so3_to_rot6d_rows(R_f).astype(np.float32)
+        rot6d = so3_to_rot6d_rows(q["R"]).astype(np.float32)
         curv = q["curv"].astype(np.float32)
 
         obs_raw[f"mold_signed_distance_{robot_id}"] = signed
@@ -243,7 +231,7 @@ class MoldAwareRuntime:
             "sd": sd,
             "normal": n,
             "x_s": x,
-            "R": R_f,
+            "R": q["R"],
             "curv": q["curv"],
         }
 
@@ -347,13 +335,13 @@ class MoldAwareRuntime:
 
         if self.run_type == "r4_world_fixb_tilt":
             # Learned ΔR in action[..., 21:27]; project rot6d → SO(3).
-            # Match label convention: resolve 180°-about-n on R_field first.
+            # Same mesh R_f as integrate_fixb / r2 labels — no twist re-resolution
+            # (flipping R_f here without flipping v_par would reverse the slide).
             # Hover keeps the predicted ΔR (only δn is overridden in unpack).
             if raw_action.shape[-1] < 27:
                 raise ValueError(
                     f"r4 decode needs action dim >= 27, got {raw_action.shape[-1]}"
                 )
-            R_field, _ = make_R_field_continuous(R_field)
             dR = rot6d_rows_to_R(raw_action[:, 21:27])
             R_d = np.einsum("hij,hjk->hik", R_field, dR)
         else:
