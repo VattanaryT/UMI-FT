@@ -183,25 +183,36 @@ def delta_R_from_field_tool(R_field: np.ndarray, R_tool: np.ndarray) -> np.ndarr
     return np.einsum("nji,njk->nik", R_field, R_tool)
 
 
-def make_delta_R_continuous(dR: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Pick the 180°-about-n branch of each ΔR closest to the previous step.
+def make_R_field_continuous(R_field: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Resolve 180°-about-n flips so consecutive field frames stay close.
 
-    Candidates at step t: ΔR_t and RZ_PI @ ΔR_t. Returns (dR_cont, flipped_mask).
+    Candidate at t: R_t or R_t @ RZ_PI (flips t1,t2, keeps n). Returns (R_cont, flipped).
     """
-    dR = np.asarray(dR, dtype=np.float64).reshape(-1, 3, 3)
-    out = dR.copy()
-    flipped = np.zeros(len(dR), dtype=bool)
-    for t in range(1, len(dR)):
-        cand = dR[t]
-        alt = RZ_PI @ cand
-        if float(rot_angle_deg(alt[None], out[t - 1 : t])[0]) < float(
-            rot_angle_deg(cand[None], out[t - 1 : t])[0]
+    R = np.asarray(R_field, dtype=np.float64).reshape(-1, 3, 3).copy()
+    flipped = np.zeros(len(R), dtype=bool)
+    for t in range(1, len(R)):
+        cand = R[t]
+        alt = cand @ RZ_PI
+        if float(rot_angle_deg(alt[None], R[t - 1 : t])[0]) < float(
+            rot_angle_deg(cand[None], R[t - 1 : t])[0]
         ):
-            out[t] = alt
+            R[t] = alt
             flipped[t] = True
-        else:
-            out[t] = cand
-    return out, flipped
+    return R, flipped
+
+
+def make_delta_R_continuous(
+    R_field: np.ndarray, R_tool: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Twist-continuous ΔR via a continuous field frame.
+
+    R_f_cont resolves 180° about n; ΔR = R_f_cont^T R_tool. Always
+    R_f_cont @ ΔR = R_tool (exact round-trip). Decode must use the same
+    continuity on R(x_s) before composing with ΔR.
+    """
+    R_f, flipped = make_R_field_continuous(R_field)
+    dR = delta_R_from_field_tool(R_f, R_tool)
+    return dR, flipped, R_f
 
 
 def pad_symmetric_under_twist(dR: np.ndarray, R_off: np.ndarray, thresh_deg: float = 15.0) -> bool:

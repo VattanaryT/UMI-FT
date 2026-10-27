@@ -15,17 +15,19 @@
 # Fix B retrain on stringer_scanner_v2 (September, fixb_v4_tracked feet).
 # One GPU job per run. weirdlab L40S.
 #
-#   RUN=r1_world_world  sbatch fixb_train_scanner_klone.sbatch
-#   RUN=r2_world_fixb   sbatch fixb_train_scanner_klone.sbatch
-#   RUN=r3_surface_fixb sbatch fixb_train_scanner_klone.sbatch
+#   RUN=r1_world_world      sbatch fixb_train_scanner_klone.sbatch
+#   RUN=r2_world_fixb       sbatch fixb_train_scanner_klone.sbatch
+#   RUN=r3_surface_fixb     sbatch fixb_train_scanner_klone.sbatch
+#   RUN=r4_world_fixb_tilt  sbatch fixb_train_scanner_klone.sbatch
 
 set -euo pipefail
 
-RUN="${RUN:?set RUN=r1_world_world|r2_world_fixb|r3_surface_fixb}"
+RUN="${RUN:?set RUN=r1_world_world|r2_world_fixb|r3_surface_fixb|r4_world_fixb_tilt}"
 case "${RUN}" in
   r1_world_world) TASK=umift_scanner_fixb_r1 ;;
   r2_world_fixb) TASK=umift_scanner_fixb_r2 ;;
   r3_surface_fixb) TASK=umift_scanner_fixb_r3 ;;
+  r4_world_fixb_tilt) TASK=umift_scanner_fixb_r4 ;;
   *) echo "bad RUN=${RUN}"; exit 1 ;;
 esac
 

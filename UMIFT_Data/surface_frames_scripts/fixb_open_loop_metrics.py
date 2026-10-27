@@ -35,7 +35,7 @@ import zarr
 from scipy.spatial.transform import Rotation
 
 from fixb_field import FixBMoldField, integrate_fixb
-from fixb_labels import heading_branch, pose7_to_Rp
+from fixb_labels import heading_branch, make_R_field_continuous, pose7_to_Rp
 
 TOOL_Z = 2
 STEP_METRICS = (
@@ -46,8 +46,9 @@ STEP_METRICS = (
     "normal_angle_deg",
     "pos_mm",
     "rot_deg",
+    "tilt_err_deg",
 )
-RUNS = ("r1_world_world", "r2_world_fixb", "r3_surface_fixb")
+RUNS = ("r1_world_world", "r2_world_fixb", "r3_surface_fixb", "r4_world_fixb_tilt")
 
 
 def rot6d_rows_to_R(r6: np.ndarray) -> np.ndarray:
@@ -92,8 +93,8 @@ def rms_jerk(p, t) -> float:
 
 
 def decode(run, action, times, p0, R0, field, R_off):
-    """action (Q,H,21), times (Q,H), p0/R0 measured tool at the chunk start."""
-    Q, H, _ = action.shape
+    """action (Q,H,21|27), times (Q,H), p0/R0 measured tool at the chunk start."""
+    Q, H, D = action.shape
     if run == "r1_world_world":
         pos = action[..., 0:3]
         R = rot6d_rows_to_R(action[..., 3:9])
@@ -101,9 +102,25 @@ def decode(run, action, times, p0, R0, field, R_off):
     dt = np.diff(times, axis=1)
     dt = np.concatenate([dt, dt[:, -1:]], axis=1)
     dec = integrate_fixb(field, p0, action[..., 0:2], action[..., 2], dt)
+    if run == "r4_world_fixb_tilt":
+        if D < 27:
+            raise ValueError(f"r4 decode needs action dim >= 27, got {D}")
+        dR = rot6d_rows_to_R(action[..., 21:27])
+        R_f = dec["R"]
+        # Per-query field continuity (same rule as labels / runtime).
+        R_out = np.empty_like(R_f)
+        for qi in range(Q):
+            R_out[qi], _ = make_R_field_continuous(R_f[qi])
+        R = np.einsum("qhij,qhjk->qhik", R_out, dR)
+        return dec["x_d"], R
     B = heading_branch(dec["R"][:, 0], R0, R_off)
     R = np.einsum("qhij,qjk->qhik", dec["R"], B)
     return dec["x_d"], R
+
+
+def _tilt_from_minus_n(R, n) -> np.ndarray:
+    z = R[..., TOOL_Z]
+    return np.degrees(np.arccos(np.clip(np.sum(z * (-n), axis=-1), -1.0, 1.0)))
 
 
 def step_metrics(pos, R, pos_e, R_e, field):
@@ -122,6 +139,9 @@ def step_metrics(pos, R, pos_e, R_e, field):
         "normal_angle_deg": np.abs(ang(z_p, n_p) - ang(z_e, n_e)),
         "pos_mm": np.linalg.norm(e, axis=-1) * 1e3,
         "rot_deg": rot_angle_deg(R, R_e),
+        "tilt_err_deg": np.abs(
+            _tilt_from_minus_n(R, n_p) - _tilt_from_minus_n(R_e, n_e)
+        ),
     }
 
 
@@ -226,12 +246,22 @@ def main() -> int:
             w.writeheader()
             w.writerows(rows)
     if pooled:
-        keys = ["sd_err_mm_k0", "sd_err_mm_full", "tangential_mm_full", "normal_angle_deg_full", "seam_mm", "chunk_jerk_rms"]
-        fig, axs = plt.subplots(2, 3, figsize=(12, 6))
+        keys = [
+            "sd_err_mm_k0",
+            "sd_err_mm_full",
+            "tangential_mm_full",
+            "normal_angle_deg_full",
+            "tilt_err_deg_full",
+            "seam_mm",
+            "chunk_jerk_rms",
+        ]
+        fig, axs = plt.subplots(2, 4, figsize=(14, 6))
         for ax, key in zip(axs.ravel(), keys):
             ax.bar(list(pooled), [pooled[r].get(key, np.nan) for r in pooled])
             ax.set_title(key)
             ax.tick_params(axis="x", labelrotation=15)
+        for ax in axs.ravel()[len(keys) :]:
+            ax.axis("off")
         fig.tight_layout()
         fig.savefig(out / "bars.png", dpi=110)
     print(json.dumps(pooled, indent=2))

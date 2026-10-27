@@ -1,5 +1,8 @@
 # Fix B r4: r2 obs + Fix B (v_par, δn) + learned ΔR = R(x_s)^T R_tool (rot6d).
-# Same observations / val split / horizons as r2; only action dim changes (21 → 27).
+# Same observations / val split (seed=42, val_ratio=0.1) / horizons as r2;
+# only action dim changes (21 → 27). Train like r2:
+#   RUN=r4_world_fixb_tilt sbatch fixb_train_scanner_klone.sbatch
+# Eval matched ckpt at epoch 35.
 defaults:
   - umift_mold_aware
   - _self_

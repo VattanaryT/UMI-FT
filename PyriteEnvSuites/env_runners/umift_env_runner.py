@@ -1669,7 +1669,7 @@ def main():
                 decoded["x_s"] = x_s_base
                 exe_h_preview = int(control_para["sparse_execution_horizon"])
                 exe_h_preview = min(exe_h_preview, decoded["x_d"].shape[0])
-                # Per-step clamp flags (speed / step / δn) over the executed slice.
+                # Per-step clamp flags (speed / step / δn / tilt / rot_rate).
                 for i in range(exe_h_preview):
                     flags = []
                     if bool(decoded["clamp_speed"][i]):
@@ -1678,6 +1678,12 @@ def main():
                         flags.append("step")
                     if bool(decoded["clamp_dn"][i]):
                         flags.append("dn")
+                    ct = decoded.get("clamp_tilt")
+                    if ct is not None and bool(ct[i]):
+                        flags.append("tilt")
+                    cr = decoded.get("clamp_rot_rate")
+                    if cr is not None and bool(cr[i]):
+                        flags.append("rot_rate")
                     ep_n_action_steps += 1
                     if flags:
                         ep_n_clamp_steps += 1
@@ -1722,6 +1728,8 @@ def main():
                 obs_raw["_mold_clamp_speed"] = decoded["clamp_speed"]
                 obs_raw["_mold_clamp_step"] = decoded["clamp_step"]
                 obs_raw["_mold_clamp_dn"] = decoded["clamp_dn"]
+                obs_raw["_mold_clamp_tilt"] = decoded.get("clamp_tilt")
+                obs_raw["_mold_clamp_rot_rate"] = decoded.get("clamp_rot_rate")
 
             # Scan-encoder diagnostics + popup (never allowed to interrupt control).
             scan_encoder_stats = None
