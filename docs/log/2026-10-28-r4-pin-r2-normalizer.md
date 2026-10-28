@@ -2,7 +2,7 @@
 date: 2026-10-28
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: 6a8d90b
 status: done
 artifacts: [/mnt/data/umidata/ft/training_outputs/scanner_fixb/r2_world_fixb/sparse_normalizer.pkl, /mnt/data/umidata/ft/training_outputs/scanner_fixb/r4_world_fixb_tilt/sparse_normalizer.pkl, /mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/r4_world_fixb_tilt/checks/viz/, /mnt/data/umidata/ft/training_outputs/scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt]
 ---
