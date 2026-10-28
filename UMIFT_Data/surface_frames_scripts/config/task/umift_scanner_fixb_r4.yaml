@@ -18,7 +18,9 @@ dataset:
   _target_: fixb_dataset.UmiFTDatasetR4
   mask_delta_R_after_field_jumps: true
   field_jump_deg: 30.0
-  filter_stats_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/r4_world_fixb_tilt/checks/r4_delta_R_mask_stats.json
+  # Optional; on Hyak override to a writable path (e.g. /checkpoints/...).
+  # Default null so a geodude-only path cannot crash train on a RO mount.
+  filter_stats_path: null
 
 shape_meta:
   action:

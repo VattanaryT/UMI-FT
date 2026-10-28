@@ -1,4 +1,4 @@
-# Mold-aware rollout (r1 / r2 / r3)
+# Mold-aware rollout (r1 / r2 / r3 / r4)
 
 Branch: `surface_frame`. Reuses the September stringer Fix B field
 (`stringer_scanner_v2_fixb/shared/fixb_field.npz`). Full mold-package builder
@@ -44,14 +44,29 @@ Edit `pipeline_para["ckpt_path"]` in `umift_env_runner.py`:
 | r1 | `/scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt` |
 | r2 | `/scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt` |
 | r3 | `/scanner_fixb/r3_surface_fixb/epoch=0035-train_loss=0.016.ckpt` |
+| r4 | `/scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt` (epoch-35 pruned by top-k) |
 
 Contact later: set `control_para["mold_aware_dry_run"] = False`.
 
 ## What the runner does
 
-1. Detects `robot0_mold_geom` → loads Fix B field, infers r1/r2/r3 from task name.
+1. Detects `robot0_mold_geom` → loads Fix B field, infers r1/r2/r3/r4 from task name.
 2. Each step: fills `mold_*` from tip pose (tracked foot) → `raw_to_obs_inference`.
 3. r1: absolute fixture poses via existing `action21_postprocess`.
 4. r2/r3: anchored Fix B decode (`integrate_fixb` + heading) from `MPC.last_raw_action`.
-5. Safety triggers (press depth, speed, step, mesh distance, normal flip) abort if
+5. r4: same as r2 plus predicted tilt ΔR from action dims 21:27.
+6. Safety triggers (press depth, speed, step, mesh distance, normal flip) abort if
    `mold_aware_abort_on_safety` is True.
+
+## Open-loop compare (offline)
+
+```bash
+# export (r4 only if r1–r3 already done):
+bash UMIFT_Data/surface_frames_scripts/run_scanner_fixb_exports.sh r4_world_fixb_tilt
+
+# score matched = r1–r3@35 + r4@60:
+cd UMIFT_Data/surface_frames_scripts
+python scanner_fixb_posttrain_eval.py --ckpt matched
+```
+
+Artifacts: `training_outputs/scanner_fixb/eval/matched/`.

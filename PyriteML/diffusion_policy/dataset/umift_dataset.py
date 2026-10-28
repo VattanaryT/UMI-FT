@@ -410,6 +410,9 @@ class UmiFTDataset(BaseImageDataset):
                         this_normalizer = get_identity_normalizer_from_stat(stat)
                 elif "gripper" in key:
                     this_normalizer = get_range_normalizer_from_stat(stat)
+                elif "mold" in key:
+                    # robot0_mold_geom / mold_curv (signed dist, normal, R_field, curv)
+                    this_normalizer = get_range_normalizer_from_stat(stat)
                 else:
                     raise RuntimeError("unsupported")
                 sparse_normalizer[key] = this_normalizer

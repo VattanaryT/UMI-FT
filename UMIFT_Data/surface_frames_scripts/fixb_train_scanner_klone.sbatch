@@ -69,6 +69,14 @@ else
   echo "WARNING: ${WANDB_ENV} not found; wandb may be offline."
 fi
 
+EXTRA_OVERRIDES=()
+if [[ "${RUN}" == "r4_world_fixb_tilt" ]]; then
+  # Writable mask-stats dump (dataset zarr mount is read-only).
+  EXTRA_OVERRIDES+=(
+    "task.dataset.filter_stats_path=/checkpoints/${RUN_TITLE}/r4_delta_R_mask_stats.json"
+  )
+fi
+
 apptainer exec "${APPTAINER_ARGS[@]}" "${SIF}" \
   accelerate launch --mixed_precision=bf16 --num-processes=1 \
     /opt/umift/PyriteML/train.py --config-name=train_umift_workspace \
@@ -84,4 +92,5 @@ apptainer exec "${APPTAINER_ARGS[@]}" "${SIF}" \
     logging.name="${RUN_TITLE}" \
     logging.group="scanner_fixb_v4tracked_scan20261008" \
     "logging.tags=[scanner_fixb,${RUN},fixb_v4_tracked,stringer_scanner_v2,scan_20261008,weirdlab,l40s,e200,bs160]" \
-    hydra.run.dir="/checkpoints/${RUN_TITLE}"
+    hydra.run.dir="/checkpoints/${RUN_TITLE}" \
+    "${EXTRA_OVERRIDES[@]}"

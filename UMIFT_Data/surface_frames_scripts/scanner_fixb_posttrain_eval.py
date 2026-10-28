@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
-"""Post-training open-loop eval for scanner_v2 Fix B runs (r1/r2/r3).
+"""Post-training open-loop eval for scanner_v2 Fix B runs (r1/r2/r3/r4).
 
 Reads mold_aware_open_loop_export.py outputs. Anchored decode only:
   r1  absolute fixture pose from the command slot
   r2/r3  integrate (v∥, δn) from the measured pose at each chunk start
+  r4  same as r2 + predicted tilt ΔR from action[..., 21:27]
 
 Skips chunks that are off-edge (in-plane foot offset > 5 mm) or have a normal
 flip inside the observation window. Scores first step and full horizon.
 
+Matched compare uses r1–r3 @ epoch0035 and r4 @ epoch0060 (earlier r4
+epochs were pruned by top-k).
+
 Usage:
   python scanner_fixb_posttrain_eval.py --ckpt epoch0035
   python scanner_fixb_posttrain_eval.py --ckpt epoch0020
+  python scanner_fixb_posttrain_eval.py --ckpt matched
 """
 
 from __future__ import annotations
@@ -45,11 +50,25 @@ def _ensure_fixb():
 TOOL_Z = 2
 OFF_EDGE_M = 0.005
 OBS_H, OBS_DS = 5, 16
-RUNS = ("r1_world_world", "r2_world_fixb", "r3_surface_fixb")
+RUNS = ("r1_world_world", "r2_world_fixb", "r3_surface_fixb", "r4_world_fixb_tilt")
 RUN_COLORS = {
     "r1_world_world": "#1f77b4",
     "r2_world_fixb": "#ff7f0e",
     "r3_surface_fixb": "#2ca02c",
+    "r4_world_fixb_tilt": "#d62728",
+}
+RUN_SHORT = {
+    "r1_world_world": "r1",
+    "r2_world_fixb": "r2",
+    "r3_surface_fixb": "r3",
+    "r4_world_fixb_tilt": "r4",
+}
+# Matched open-loop: earliest kept comparable ckpts (r4 has no epoch20/35).
+MATCHED_CKPTS = {
+    "r1_world_world": "epoch0035",
+    "r2_world_fixb": "epoch0035",
+    "r3_surface_fixb": "epoch0035",
+    "r4_world_fixb_tilt": "epoch0060",
 }
 STEP_METRICS = (
     "sd_err_mm",
@@ -59,6 +78,7 @@ STEP_METRICS = (
     "normal_angle_deg",
     "pos_mm",
     "rot_deg",
+    "tilt_err_deg",
 )
 
 
@@ -116,14 +136,26 @@ def std(x) -> float:
 
 
 def decode(run, action, times, p0, R0, field, R_off):
+    _, _, D = action.shape
     if run == "r1_world_world":
         return action[..., 0:3], rot6d_rows_to_R(action[..., 3:9])
     dt = np.diff(times, axis=1)
     dt = np.concatenate([dt, dt[:, -1:]], axis=1)
     dec = integrate_fixb(field, p0, action[..., 0:2], action[..., 2], dt)
+    if run == "r4_world_fixb_tilt":
+        if D < 27:
+            raise ValueError(f"r4 decode needs action dim >= 27, got {D}")
+        dR = rot6d_rows_to_R(action[..., 21:27])
+        R = np.einsum("qhij,qhjk->qhik", dec["R"], dR)
+        return dec["x_d"], R
     B = heading_branch(dec["R"][:, 0], R0, R_off)
     R = np.einsum("qhij,qjk->qhik", dec["R"], B)
     return dec["x_d"], R
+
+
+def _tilt_from_minus_n(R, n) -> np.ndarray:
+    z = R[..., TOOL_Z]
+    return np.degrees(np.arccos(np.clip(np.sum(z * (-n), axis=-1), -1.0, 1.0)))
 
 
 def step_metrics(pos, R, pos_e, R_e, field):
@@ -142,7 +174,16 @@ def step_metrics(pos, R, pos_e, R_e, field):
         "normal_angle_deg": np.abs(ang(z_p, n_p) - ang(z_e, n_e)),
         "pos_mm": np.linalg.norm(e, axis=-1) * 1e3,
         "rot_deg": rot_angle_deg(R, R_e),
+        "tilt_err_deg": np.abs(_tilt_from_minus_n(R, n_p) - _tilt_from_minus_n(R_e, n_e)),
     }
+
+
+def _export_label_for(run: str, ckpt_label: str, run_ckpts: dict | None) -> str:
+    if run_ckpts and run in run_ckpts:
+        return run_ckpts[run]
+    if ckpt_label == "matched":
+        return MATCHED_CKPTS[run]
+    return ckpt_label
 
 
 def chunk_keep_mask(g, q_robot: np.ndarray, field: FixBMoldField) -> np.ndarray:
@@ -195,12 +236,15 @@ def evaluate_ckpt(args, ckpt_label: str, out: Path):
     filter_stats = {}
     path_bags = {r: {} for r in RUNS}  # for overlays
 
+    run_ckpts = getattr(args, "run_ckpts", None)
     for run in RUNS:
-        ck = args.exports_root / run / ckpt_label
+        label = _export_label_for(run, ckpt_label, run_ckpts)
+        ck = args.exports_root / run / label
         if not (ck / "meta.json").exists():
             print(f"[eval] missing {ck}")
             continue
         exp_meta, episodes = load_episodes(ck)
+        print(f"[eval] {run} using export label {label}")
         bag = {m: {"k0": [], "full": []} for m in STEP_METRICS}
         bag.update(
             {
@@ -217,8 +261,9 @@ def evaluate_ckpt(args, ckpt_label: str, out: Path):
         n_total = n_keep = n_off = n_flip = 0
         ep_metric_lists = {k: [] for k in [
             "sd_err_mm_k0", "sd_err_mm_full", "tangential_mm_k0", "tangential_mm_full",
-            "normal_angle_deg_k0", "normal_angle_deg_full", "seam_mm", "seam_deg",
-            "chunk_jerk_rms", "chunk_sparc", "stiffness_mse", "gripper_err", "grasp_force_err",
+            "normal_angle_deg_k0", "normal_angle_deg_full", "tilt_err_deg_k0", "tilt_err_deg_full",
+            "seam_mm", "seam_deg", "chunk_jerk_rms", "chunk_sparc", "stiffness_mse",
+            "gripper_err", "grasp_force_err",
         ]}
 
         for ep in episodes:
@@ -349,17 +394,21 @@ def evaluate_ckpt(args, ckpt_label: str, out: Path):
         rows.append({"run": run, "episode": "pooled", **pooled[run]})
 
     out.mkdir(parents=True, exist_ok=True)
+    used_labels = {run: _export_label_for(run, ckpt_label, run_ckpts) for run in RUNS}
     payload = {
         "ckpt": ckpt_label,
+        "export_labels": used_labels,
         "val_episodes": sorted({r["episode"] for r in rows if isinstance(r.get("episode"), int)}),
         "filter": filter_stats,
         "pooled": pooled,
         "rows": rows,
         "notes": [
             "Anchored decode only.",
+            "r4 uses predicted tilt ΔR (action 21:27); r2/r3 use heading_branch.",
             "Skipped off-edge (in-plane > 5 mm) and obs-window normal flips.",
             "Val shares the mold with training — fit, not transfer.",
             "Force contact quality cannot be compared offline.",
+            "Matched = r1–r3 @ epoch0035 + r4 @ epoch0060.",
         ],
     }
     (out / "metrics.json").write_text(json.dumps(payload, indent=2, default=float))
@@ -392,6 +441,7 @@ def plot_bars(pooled, per_ep, out: Path):
         ("stiffness_mse", "Stiffness MSE"),
         ("gripper_err", "Gripper |err|"),
         ("grasp_force_err", "Grasp force |err| (N)"),
+        ("tilt_err_deg_full", "Tilt err full (°)"),
     ]
     runs = [r for r in RUNS if r in pooled]
     fig, axs = plt.subplots(3, 4, figsize=(14, 9))
@@ -404,7 +454,7 @@ def plot_bars(pooled, per_ep, out: Path):
             errs.append(std(ep_vals) if len(ep_vals) > 1 else 0.0)
         ax.bar(range(len(runs)), means, yerr=errs, color=[RUN_COLORS[r] for r in runs], capsize=3)
         ax.set_xticks(range(len(runs)))
-        ax.set_xticklabels(["r1", "r2", "r3"], rotation=0)
+        ax.set_xticklabels([RUN_SHORT[r] for r in runs], rotation=0)
         ax.set_title(title, fontsize=10)
     for ax in axs[len(keys) :]:
         ax.axis("off")
@@ -486,7 +536,7 @@ def plot_overlay_and_heatmap(path_bags, field: FixBMoldField, args, out: Path):
                 name=run,
             )
         )
-    fig.update_layout(title="Three-run overlay (color = SD error mm)", height=800, scene=dict(aspectmode="data"))
+    fig.update_layout(title="r1–r4 overlay (color = SD error mm)", height=800, scene=dict(aspectmode="data"))
     fig.write_html(out / "overlay_mesh.html", include_plotlyjs="cdn")
 
     # heatmap: project SD error onto mold vertices (nearest path point)
@@ -574,36 +624,47 @@ def plot_r3_curvature(path_bags, out: Path):
 
 
 def plot_training_curves(ckpt_root: Path, out: Path):
-    fig, axs = plt.subplots(1, 3, figsize=(12, 3.5), sharey=True)
+    n = len(RUNS)
+    fig, axs = plt.subplots(1, n, figsize=(3.2 * n, 3.5), sharey=True)
+    if n == 1:
+        axs = [axs]
     summary = {}
     for ax, run in zip(axs, RUNS):
         log = ckpt_root / run / "logs.json.txt"
         epochs, train, val = [], [], []
         best = None
-        for line in log.read_text().splitlines():
-            if not line.strip():
-                continue
-            try:
-                r = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if "train_loss" in r and "epoch" in r:
-                epochs.append(r["epoch"])
-                train.append(r["train_loss"])
-                val.append(r.get("val_loss", np.nan))
-                if r.get("val_loss") is not None and np.isfinite(r["val_loss"]):
-                    if best is None or r["val_loss"] < best[0]:
-                        best = (r["val_loss"], r["epoch"])
-        ax.plot(epochs, train, label="train", lw=1)
-        ax.plot(epochs, val, label="val", lw=1)
+        if log.exists():
+            for line in log.read_text().splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if "train_loss" in r and "epoch" in r:
+                    epochs.append(r["epoch"])
+                    train.append(r["train_loss"])
+                    val.append(r.get("val_loss", np.nan))
+                    if r.get("val_loss") is not None and np.isfinite(r["val_loss"]):
+                        if best is None or r["val_loss"] < best[0]:
+                            best = (r["val_loss"], r["epoch"])
+            ax.plot(epochs, train, label="train", lw=1)
+            ax.plot(epochs, val, label="val", lw=1)
+        else:
+            ax.text(0.5, 0.5, "no logs.json.txt", ha="center", va="center", transform=ax.transAxes)
         if best:
             ax.axvline(best[1], color="gray", ls="--", lw=1, label=f"best val @{best[1]}")
-            # late rise?
             late = [v for e, v in zip(epochs, val) if e >= best[1] and np.isfinite(v)]
             rose = bool(late) and mean(late[-max(1, len(late)//5):]) > best[0] * 1.05
         else:
             rose = None
-        summary[run] = {"best_val_loss": best[0] if best else None, "best_epoch": best[1] if best else None, "val_rose_after_best": rose, "last_epoch": max(epochs) if epochs else None}
+        summary[run] = {
+            "best_val_loss": best[0] if best else None,
+            "best_epoch": best[1] if best else None,
+            "val_rose_after_best": rose,
+            "last_epoch": max(epochs) if epochs else None,
+            "logs_missing": not log.exists(),
+        }
         ax.set_title(run.replace("_", "\n"), fontsize=9)
         ax.set_xlabel("epoch")
         ax.legend(fontsize=7)
@@ -617,45 +678,53 @@ def plot_training_curves(ckpt_root: Path, out: Path):
 
 
 def write_report(out_root: Path, results: dict, train_summary: dict):
+    export_labels = results.get("export_labels") or MATCHED_CKPTS
     lines = [
         "# Scanner Fix B post-training open-loop eval",
         "",
         "## Setup",
         "- Dataset: `stringer_scanner_v2_fixb` (September).",
-        "- Primary ckpt: `epoch0035` (matched). Best-val check: `epoch0020` (lowest val_loss in all three logs).",
-        "- Decode: anchored only. r1 = fixture cmd pose; r2/r3 = integrate (v∥, δn) from measured pose at chunk start.",
+        "- Matched compare: r1–r3 @ `epoch0035`, r4 @ `epoch0060` (r4 epoch-20/35 pruned by top-k).",
+        "- Also: `epoch0020` for r1–r3 best-val check (r4 absent).",
+        "- Decode: anchored. r1 = fixture cmd pose; r2/r3 = integrate (v∥, δn) + heading_branch; "
+        "r4 = integrate (v∥, δn) + predicted tilt ΔR.",
         "- Val episodes (from training `get_validation_dataset`, seed=42, val_ratio=0.1, 75 eps, lexicographic buffer order):",
         f"  `{results.get('val_episodes')}`",
         "- Filters: drop off-edge (in-plane > 5 mm) and obs-window normal flips.",
+        f"- Export labels used: `{export_labels}`",
         "",
         "## Context",
         "- Val shares the mold with training → measures **fit**, not transfer.",
         "- Force / contact quality cannot be compared offline; hardware + profilometer still decide.",
-        "- All three Hyak jobs died `OUT_OF_MEMORY` before epoch 200 (r1@35, r3@55, r2@65).",
+        "- Hyak jobs OOM before epoch 200 (r1@35, r3@55, r2@65; r4 kept epoch60).",
         "",
         "## Training curves",
     ]
     for run, s in train_summary.items():
+        if s.get("logs_missing"):
+            lines.append(f"- **{run}**: no `logs.json.txt` on disk (ckpt only).")
+            continue
         lines.append(
             f"- **{run}**: best val_loss={s['best_val_loss']} at epoch {s['best_epoch']}; "
             f"last epoch {s['last_epoch']}; val rose after best={s['val_rose_after_best']}"
         )
-    lines += ["", "## Filter counts (epoch0035)", ""]
+    primary_name = results.get("ckpt", "matched")
+    lines += ["", f"## Filter counts ({primary_name})", ""]
     for run, f in results.get("filter", {}).items():
         lines.append(
             f"- **{run}**: kept {f['n_chunks_kept']}/{f['n_chunks_total']} "
             f"(off-edge {f['n_off_edge']}, obs-flip {f['n_obs_flip']})"
         )
-    lines += ["", "## Pooled metrics (epoch0035, anchored)", ""]
+    lines += ["", f"## Pooled metrics ({primary_name}, anchored)", ""]
     pooled = results.get("pooled", {})
     if pooled:
         keys = [
             "sd_err_mm_k0", "sd_err_mm_full", "tangential_mm_full", "normal_angle_deg_full",
-            "seam_mm", "seam_deg", "chunk_jerk_rms", "chunk_sparc",
+            "tilt_err_deg_full", "seam_mm", "seam_deg", "chunk_jerk_rms", "chunk_sparc",
             "stiffness_mse", "gripper_err", "grasp_force_err",
         ]
         hdr = "| metric | " + " | ".join(pooled) + " |"
-        sep = "|---|---|---|---|" if len(pooled) == 3 else "|" + "---|" * (len(pooled) + 1)
+        sep = "|" + "---|" * (len(pooled) + 1)
         lines += [hdr, sep]
         for k in keys:
             vals = []
@@ -666,6 +735,7 @@ def write_report(out_root: Path, results: dict, train_summary: dict):
     lines += [
         "",
         "## Artifacts",
+        f"- `{out_root}/matched/`",
         f"- `{out_root}/epoch0035/`",
         f"- `{out_root}/epoch0020/`",
         f"- `{out_root}/training_curves.png`",
@@ -680,12 +750,13 @@ def main() -> int:
     ap.add_argument("--dataset_root", type=Path, default=Path("/mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb"))
     ap.add_argument("--ckpt_root", type=Path, default=Path("/mnt/data/umidata/ft/training_outputs/scanner_fixb"))
     ap.add_argument("--out_dir", type=Path, default=Path("/mnt/data/umidata/ft/training_outputs/scanner_fixb/eval"))
-    ap.add_argument("--ckpt", action="append", default=None, help="export label, e.g. epoch0035 (repeatable)")
+    ap.add_argument("--ckpt", action="append", default=None, help="export label, e.g. epoch0035 / matched (repeatable)")
     ap.add_argument("--exec_h", type=int, default=4)
     ap.add_argument("--sd_range_mm", type=float, default=60.0)
     ap.add_argument("--mold_points", type=int, default=5000)
     args = ap.parse_args()
-    labels = args.ckpt or ["epoch0035", "epoch0020"]
+    args.run_ckpts = None
+    labels = args.ckpt or ["matched", "epoch0035", "epoch0020"]
 
     train_out = args.out_dir
     train_out.mkdir(parents=True, exist_ok=True)
@@ -696,7 +767,9 @@ def main() -> int:
         out = args.out_dir / label
         print(f"==== {label} ====")
         payload = evaluate_ckpt(args, label, out)
-        if label == "epoch0035":
+        if label in ("matched", "epoch0035") and primary is None:
+            primary = payload
+        if label == "matched":
             primary = payload
 
     if primary is None and labels:

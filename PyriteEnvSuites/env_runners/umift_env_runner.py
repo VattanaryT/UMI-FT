@@ -865,11 +865,12 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        # Mold-aware scanner Fix B (matched epoch-35). Override for other runs:
+        # Mold-aware scanner Fix B. Override for other runs:
         #   /scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt
         #   /scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt
         #   /scanner_fixb/r3_surface_fixb/epoch=0035-train_loss=0.016.ckpt
-        #   /scanner_fixb/r4_world_fixb_tilt/epoch=0035-....ckpt  (after Hyak train)
+        #   /scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt
+        #     (r4: epoch-35 pruned by top-k; 60 is earliest kept for matched compare)
         "ckpt_path": "/scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",

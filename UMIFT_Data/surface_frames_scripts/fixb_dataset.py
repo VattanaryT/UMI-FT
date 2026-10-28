@@ -69,17 +69,28 @@ class UmiFTDatasetR4(UmiFTDataset):
             )
             self._r4_field_jump = {k: v["field_jump"] for k, v in table.items()}
             self._r4_mask_stats = self._log_delta_R_mask_fraction(train=True)
-            if self._r4_filter_stats_path:
-                path = Path(self._r4_filter_stats_path)
-                path.parent.mkdir(parents=True, exist_ok=True)
-                payload = {}
-                if path.exists():
-                    try:
-                        payload = json.loads(path.read_text())
-                    except json.JSONDecodeError:
-                        payload = {}
-                payload["train"] = self._r4_mask_stats
-                path.write_text(json.dumps(payload, indent=2))
+            self._write_filter_stats(split="train", stats=self._r4_mask_stats)
+
+    def _write_filter_stats(self, split: str, stats: dict) -> None:
+        """Best-effort JSON dump; skip if path unset or filesystem is read-only (Hyak /data)."""
+        if not self._r4_filter_stats_path:
+            return
+        path = Path(self._r4_filter_stats_path)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {}
+            if path.exists():
+                try:
+                    payload = json.loads(path.read_text())
+                except json.JSONDecodeError:
+                    payload = {}
+            payload[split] = stats
+            path.write_text(json.dumps(payload, indent=2))
+        except OSError as e:
+            print(
+                f"[UmiFTDatasetR4] skip writing filter_stats_path={path}: {e} "
+                f"(mask stats already printed above)"
+            )
 
     def _action_indices_for_query(self, epi_id: int, rgb_id: int) -> np.ndarray:
         key = f"episode_{int(epi_id)}"
@@ -202,14 +213,5 @@ class UmiFTDatasetR4(UmiFTDataset):
             val_set._r4_filter_stats_path = self._r4_filter_stats_path
             val_set._r4_mask = True
             stats = val_set._log_delta_R_mask_fraction(train=False)
-            if self._r4_filter_stats_path:
-                path = Path(self._r4_filter_stats_path)
-                payload = {}
-                if path.exists():
-                    try:
-                        payload = json.loads(path.read_text())
-                    except json.JSONDecodeError:
-                        payload = {}
-                payload["val"] = stats
-                path.write_text(json.dumps(payload, indent=2))
+            val_set._write_filter_stats(split="val", stats=stats)
         return val_set
