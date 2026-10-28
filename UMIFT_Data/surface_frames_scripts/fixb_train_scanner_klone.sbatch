@@ -74,6 +74,10 @@ if [[ "${RUN}" == "r4_world_fixb_tilt" ]]; then
   # Writable mask-stats dump (dataset zarr mount is read-only).
   EXTRA_OVERRIDES+=(
     "task.dataset.filter_stats_path=/checkpoints/${RUN_TITLE}/r4_delta_R_mask_stats.json"
+    # Pin action dims 0:21 to the vendored r2 normalizer (same bytes as job 41907426).
+    "task.dataset.r2_action_normalizer_path=/opt/umift/UMIFT_Data/surface_frames_scripts/assets/r2_sparse_normalizer_41907426.pkl"
+    # Log grad norm. Clip stays off (training.sparse_gradient_norm_limit=-1).
+    "training.log_gradient_norm=true"
   )
 fi
 

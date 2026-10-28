@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import json
+import pickle
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -22,6 +23,7 @@ from diffusion_policy.common.sampler_umift import (
     sparse_action_indices_from_rgb_timestamps,
 )
 from diffusion_policy.dataset.umift_dataset import UmiFTDataset
+from diffusion_policy.model.common.normalizer import SingleFieldLinearNormalizer
 from PyriteConfig.tasks.umift.umift_type_conversions import (
     action21_to_action_sample,
     obs_to_obs_sample,
@@ -29,6 +31,76 @@ from PyriteConfig.tasks.umift.umift_type_conversions import (
 from threadpoolctl import threadpool_limits
 
 from fixb_r4_chunk_filter import FIELD_JUMP_DEG, build_episode_mask_table
+
+# Vendored copy of the r2 Hyak fit (job 41907426, 2026-10-16). Dims 0:21 of that
+# file are what r4 training must use. Refitting on today's r4 windows reproduces
+# δn max 0.318 because the 0.989 m peak sits inside a scan pause the current
+# sampler drops (41.5% of queries).
+DEFAULT_R2_ACTION_NORMALIZER = (
+    Path(__file__).resolve().parent
+    / "assets"
+    / "r2_sparse_normalizer_41907426.pkl"
+)
+
+
+def pin_r4_action_normalizer(sparse_normalizer, r2_pkl_path: str):
+    """Overwrite action dims 0:21 with r2's scale, offset, and input stats.
+
+    Dims 21:27 stay an identity normalizer (ΔR rot6d). Raises if the saved
+    scale/offset do not match r2 on every dim 0:20.
+    """
+    path = Path(r2_pkl_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"r2_action_normalizer_path not found: {path}. "
+            "r4 must load r2's action normalizer for dims 0:21, not refit them."
+        )
+    with path.open("rb") as f:
+        r2 = pickle.load(f)
+    r2p = r2.params_dict["action"]
+    r4p = sparse_normalizer.params_dict["action"]
+    s2 = r2p["scale"].detach().float().cpu().reshape(-1)
+    o2 = r2p["offset"].detach().float().cpu().reshape(-1)
+    s4 = r4p["scale"].detach().float().cpu().reshape(-1).clone()
+    o4 = r4p["offset"].detach().float().cpu().reshape(-1).clone()
+    if s2.numel() != 21 or s4.numel() != 27:
+        raise RuntimeError(
+            f"expected r2 action dim 21 and r4 action dim 27, got {s2.numel()} and {s4.numel()}"
+        )
+    s4[:21] = s2
+    o4[:21] = o2
+    s4[21:] = 1.0
+    o4[21:] = 0.0
+    stats = {}
+    for key in ("min", "max", "mean", "std"):
+        a = r4p["input_stats"][key].detach().float().cpu().reshape(-1).clone()
+        b = r2p["input_stats"][key].detach().float().cpu().reshape(-1)
+        if b.numel() != 21 or a.numel() != 27:
+            raise RuntimeError(f"input_stats[{key}] dims r2={b.numel()} r4={a.numel()}")
+        a[:21] = b
+        stats[key] = a.numpy()
+    sparse_normalizer["action"] = SingleFieldLinearNormalizer.create_manual(
+        scale=s4.numpy(),
+        offset=o4.numpy(),
+        input_stats_dict=stats,
+    )
+    got_s = sparse_normalizer.params_dict["action"]["scale"].detach().float().cpu().reshape(-1)
+    got_o = sparse_normalizer.params_dict["action"]["offset"].detach().float().cpu().reshape(-1)
+    scale_err = torch.max(torch.abs(got_s[:21] - s2)).item()
+    offset_err = torch.max(torch.abs(got_o[:21] - o2)).item()
+    if scale_err > 0 or offset_err > 0:
+        raise RuntimeError(
+            f"pinned normalizer mismatch vs r2: max|scale|={scale_err} max|offset|={offset_err}"
+        )
+    if not torch.equal(got_s[21:], torch.ones(6)) or not torch.equal(got_o[21:], torch.zeros(6)):
+        raise RuntimeError("ΔR dims 21:27 are not identity after pin")
+    print(
+        f"[UmiFTDatasetR4] action dims 0:21 pinned to {path} "
+        f"(max|scale diff|=0, max|offset diff|=0); dims 21:27 identity. "
+        f"δn scale={float(got_s[2]):.6g} offset={float(got_o[2]):.6g} "
+        f"r2 δn max={float(stats['max'][2]):.6g}"
+    )
+    return sparse_normalizer
 
 
 class UmiFTDatasetFixB(UmiFTDataset):
@@ -55,11 +127,13 @@ class UmiFTDatasetR4(UmiFTDataset):
         mask_delta_R_after_field_jumps: bool = True,
         field_jump_deg: float = FIELD_JUMP_DEG,
         filter_stats_path: str | None = None,
+        r2_action_normalizer_path: str | None = str(DEFAULT_R2_ACTION_NORMALIZER),
         **kwargs,
     ):
         self._r4_mask = bool(mask_delta_R_after_field_jumps)
         self._r4_jump_deg = float(field_jump_deg)
         self._r4_filter_stats_path = filter_stats_path
+        self._r2_action_normalizer_path = r2_action_normalizer_path
         super().__init__(shape_meta=shape_meta, dataset_path=dataset_path, **kwargs)
         self._r4_field_jump: Dict[str, np.ndarray] = {}
         self._r4_mask_stats: Dict[str, float] = {}
@@ -215,3 +289,10 @@ class UmiFTDatasetR4(UmiFTDataset):
             stats = val_set._log_delta_R_mask_fraction(train=False)
             val_set._write_filter_stats(split="val", stats=stats)
         return val_set
+
+    def get_normalizer(self, **kwargs):
+        sparse, dense = super().get_normalizer(**kwargs)
+        path = self._r2_action_normalizer_path
+        if path:
+            pin_r4_action_normalizer(sparse, path)
+        return sparse, dense

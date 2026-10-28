@@ -6,6 +6,9 @@
 #
 # Chunks: identical to r2 (UmiFTDatasetR4 does not drop queries).
 # Loss: mask ΔR dims (21:27) after a field-frame jump within the chunk.
+# Action normalizer: dims 0:21 are the r2 job-41907426 fit (not refit on r4).
+# Today's sampler drops the δn=0.989 m peak (it sits in a scan pause); refitting
+# would pin δn max at 0.318. Dims 21:27 stay identity.
 defaults:
   - umift_mold_aware
   - _self_
@@ -21,6 +24,8 @@ dataset:
   # Optional; on Hyak override to a writable path (e.g. /checkpoints/...).
   # Default null so a geodude-only path cannot crash train on a RO mount.
   filter_stats_path: null
+  # Oct 16 r2 fit. Hyak sbatch overrides this to the /opt/umift copy of the same file.
+  r2_action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/r2_sparse_normalizer_41907426.pkl
 
 shape_meta:
   action:

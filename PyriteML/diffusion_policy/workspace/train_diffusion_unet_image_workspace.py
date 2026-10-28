@@ -30,6 +30,25 @@ from diffusion_policy.workspace.base_workspace import BaseWorkspace
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
+def _as_float(value) -> float:
+    if torch.is_tensor(value):
+        return float(value.detach().item())
+    return float(value)
+
+
+def _merge_r4_group_log(step_log: dict, logs, prefix: str) -> None:
+    """Write r4 group diffusion MSE as python floats. No-op for r1–r3."""
+    if not logs:
+        return
+    for key, value in logs.items():
+        name = (
+            f"{prefix}_delta_R_masked_frac"
+            if key == "delta_R_masked_frac"
+            else f"{prefix}_mse_{key}"
+        )
+        step_log[name] = float(value)
+
+
 class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
     exclude_keys = tuple()
@@ -400,9 +419,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             if self.flag_has_dense:
                                 step_log["dense_loss"] = dense_loss
                             if cfg.training.log_gradient_norm:
-                                step_log["sparse_gradient_norm"] = sparse_norm
+                                step_log["sparse_gradient_norm"] = _as_float(sparse_norm)
                                 if self.flag_has_dense:
-                                    step_log["dense_gradient_norm"] = dense_norm
+                                    step_log["dense_gradient_norm"] = _as_float(dense_norm)
+                            _merge_r4_group_log(step_log, model_unwrapped.get_r4_group_log(), "train")
                             
                             # log of last step is combined with validation and rollout
                             accelerator.log(step_log, step=self.global_step)
@@ -438,12 +458,17 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0 and accelerator.is_main_process:
                     with torch.no_grad():
                         val_losses = list()
+                        val_r4_acc = {}
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                                 loss = self.model(batch, args)
                                 val_losses.append(loss)
+                                r4_logs = accelerator.unwrap_model(self.model).get_r4_group_log()
+                                if r4_logs:
+                                    for k, v in r4_logs.items():
+                                        val_r4_acc.setdefault(k, []).append(float(v))
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
@@ -451,6 +476,12 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                             val_loss = torch.mean(torch.tensor(val_losses)).item()
                             # log epoch average validation loss
                             step_log['val_loss'] = val_loss
+                            if val_r4_acc:
+                                _merge_r4_group_log(
+                                    step_log,
+                                    {k: float(np.mean(vs)) for k, vs in val_r4_acc.items()},
+                                    "val",
+                                )
 
                 def log_action_mse(step_log, category, pred_action, gt_action):
                     pred_naction = {

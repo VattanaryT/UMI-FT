@@ -15,6 +15,26 @@ from diffusion_policy.model.vision.timm_obs_encoder_with_force import (
 )
 from diffusion_policy.policy.base_image_policy import BaseImagePolicy
 
+# Diffusion-MSE groups for r4 action27. Logged as python floats so JsonLogger keeps them.
+_R4_LOSS_GROUPS = (
+    ("v_t", 0, 2),
+    ("delta_n", 2, 3),
+    ("stiffness", 18, 19),
+    ("grip_grasp", 19, 21),
+    ("delta_R", 21, 27),
+)
+
+
+def _r4_group_mse(per: torch.Tensor, w: torch.Tensor) -> dict:
+    """Masked mean of per-element diffusion MSE. Keys are python floats."""
+    out = {}
+    for name, a, b in _R4_LOSS_GROUPS:
+        ww = w[..., a:b]
+        pp = per[..., a:b]
+        out[name] = float(((pp * ww).sum() / ww.sum().clamp_min(1.0)).detach().item())
+    out["delta_R_masked_frac"] = float((w[..., 21] == 0).detach().float().mean().item())
+    return out
+
 
 class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
     def __init__(
@@ -112,6 +132,8 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
         self.train_diffusion_n_samples = int(train_diffusion_n_samples)
         self.kwargs = kwargs
         self.sparse_loss = 0
+        # r4 only: per-group diffusion MSE (python floats) from the last compute_loss.
+        self.r4_group_log = None
 
         self.flag_has_dense = flag_has_dense
         self.hack_no_obs_encoder_for_dense = hack_no_obs_encoder_for_dense
@@ -477,6 +499,7 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
         # Optional per-dim weights (r4): zero ΔR dims after a field-frame jump.
         # r1/r2/r3 omit action_loss_weight and keep plain mean MSE.
         per = F.mse_loss(pred_sparse, target, reduction="none")
+        self.r4_group_log = None
         if "action_loss_weight" in batch and "sparse" in batch["action_loss_weight"]:
             w = batch["action_loss_weight"]["sparse"].to(
                 device=per.device, dtype=per.dtype
@@ -487,6 +510,8 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
                     f"pred shape {tuple(per.shape)}"
                 )
             sparse_loss = (per * w).sum() / w.sum().clamp_min(1.0)
+            if per.shape[-1] >= 27:
+                self.r4_group_log = _r4_group_mse(per, w)
         else:
             sparse_loss = per.mean()
         self.sparse_loss = sparse_loss
@@ -534,6 +559,10 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
 
     def get_loss_components(self):
         return self.sparse_loss, self.smoothness_loss, self.dense_loss
+
+    def get_r4_group_log(self):
+        """Python floats of the last r4 diffusion MSE by group, or None for r1–r3."""
+        return self.r4_group_log
 
     def has_dense(self):
         return self.flag_has_dense
