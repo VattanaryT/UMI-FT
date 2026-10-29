@@ -57,8 +57,10 @@ Contact later: set `control_para["mold_aware_dry_run"] = False`.
 3. r1: absolute fixture poses via existing `action21_postprocess`.
 4. r2/r3: anchored Fix B decode (`integrate_fixb` + heading) from `MPC.last_raw_action`.
 5. r4: same as r2 plus predicted tilt ΔR from action dims 21:27.
-6. Safety triggers (press depth, speed, step, mesh distance, normal flip) abort if
-   `mold_aware_abort_on_safety` is True.
+6. Speed, step, and δn clamps stay on. Tilt (45°), rotation-rate (20°/step), and
+   r4 mesh-jump hold are off (`SafetyLimits.enable_*`, default False) so contact
+   matches the Oct 22 dry_run=false decode. Hard stops (mesh distance, normal flip)
+   still abort if `mold_aware_abort_on_safety` is True.
 
 ## Open-loop compare (offline)
 

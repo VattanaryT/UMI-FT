@@ -80,6 +80,11 @@ class SafetyLimits:
     stop_on_normal_flip: bool = True
     max_tilt_from_normal_deg: float = 45.0
     max_rot_rate_deg_per_step: float = 20.0
+    # Orientation rewrites added 2026-10-26. Off matches the Oct 22 contact decode
+    # (speed, step, and δn clamps stay on).
+    enable_tilt_clamp: bool = False
+    enable_rot_rate_clamp: bool = False
+    enable_mesh_jump_hold: bool = False
 
 
 # Soft clamps (applied / flagged) vs hard stops (abort-worthy).
@@ -351,7 +356,7 @@ class MoldAwareRuntime:
             dR = rot6d_rows_to_R(raw_action[:, 21:27])
             R_d = np.einsum("hij,hjk->hik", R_field, dR)
             # If mesh R_f jumps mid-chunk, hold previous R_d (then rate-clamp).
-            if H > 1:
+            if self.limits.enable_mesh_jump_hold and H > 1:
                 from scipy.spatial.transform import Rotation as _Rot
 
                 hold = np.zeros(H, dtype=bool)
@@ -374,13 +379,14 @@ class MoldAwareRuntime:
             )
             R_d = np.einsum("hij,jk->hik", R_field, B[0])
 
-        if apply_safety:
+        if apply_safety and self.limits.enable_tilt_clamp:
             R_d, tilt_hit = _clamp_tilt_to_normal(
                 R_d, R_field[:, :, 2], self.limits.max_tilt_from_normal_deg
             )
             self.last_clamp_tilt = tilt_hit
             if np.any(tilt_hit):
                 self.last_triggers.append("max_tilt")
+        if apply_safety and self.limits.enable_rot_rate_clamp:
             R_d, rate_hit = _clamp_rot_rate(R_d, self.limits.max_rot_rate_deg_per_step)
             self.last_clamp_rot_rate = rate_hit
             if np.any(rate_hit):
