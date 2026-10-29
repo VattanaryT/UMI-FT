@@ -1214,11 +1214,13 @@ def main():
         action_type = "pose9g1"
         id_list = [0]
         action_to_trajectory = pose9g1_to_traj
-    elif shape_meta["action"]["shape"][0] == 21:
+    elif shape_meta["action"]["shape"][0] in (21, 27):
+        # 27 is r4: action21 plus ΔR rot6d. Decode uses the raw tail; this
+        # type only builds the SE3/stiffness/gripper schedule.
         action_type = "pose9pose9s1a2"
         id_list = [0]
         action_to_trajectory = pose9pose9s1a2_to_traj
-    elif shape_meta["action"]["shape"][0] == 42:
+    elif shape_meta["action"]["shape"][0] in (42, 54):
         action_type = "pose9pose9s1a2"
         id_list = [0, 1]
         action_to_trajectory = pose9pose9s1a2_to_traj

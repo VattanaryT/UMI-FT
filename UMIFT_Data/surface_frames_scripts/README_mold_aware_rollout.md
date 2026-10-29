@@ -7,8 +7,8 @@ and registration checks come after today’s session.
 ## Preflight (offline, ~1 min)
 
 ```bash
-cd /home/boeing/umi_ft_ws/UMI-FT/UMIFT_Data/surface_frames_scripts
-/usr/bin/python3 sanity_mold_aware_ep5.py
+source /home/boeing/umi_ft_ws/worktrees/activate.sh UMI-FT-surface_frames
+python UMIFT_Data/surface_frames_scripts/sanity_mold_aware_ep5.py
 ```
 
 Must print `SANITY PASS` before any robot motion. Needs the ep5 open-loop
@@ -20,17 +20,19 @@ export already under `training_outputs/scanner_fixb/eval/exports/`.
 Default ckpt is r2 epoch-35. Real depth is used; periodic Keyence scan is off
 for these checkpoints (no `scan_heatmap`).
 
+`~/.bashrc` pins `PYTHONPATH` at the main `UMI-FT/` checkout. `source` the surface-frames worktree first, and run that worktree's runner. `activate.sh` changes directory there. Do not `cd` back to `umi_ft_ws` and do not launch `UMI-FT/PyriteEnvSuites/...`: that file is the other checkout, and the runner loads `mold_aware_runtime` from the directory next to itself.
+
 ```bash
 conda activate pyrite
-# open3d required for FixBMoldField
-python -c "import open3d" || pip install open3d
+source /home/boeing/umi_ft_ws/worktrees/activate.sh UMI-FT-surface_frames
+python -c "import PyriteConfig; print(PyriteConfig.__file__)"
+# must print .../worktrees/UMI-FT-surface_frames/PyriteConfig/...
 
 export PYRITE_CHECKPOINT_FOLDERS=/mnt/data/umidata/ft/training_outputs
 export PYRITE_HARDWARE_CONFIG_FOLDERS=/home/boeing/umi_ft_ws/hardware_interfaces/workcell/table_top_manip/config
 export PYRITE_CONTROL_LOG_FOLDERS=$HOME/data/control_log
-cd /home/boeing/umi_ft_ws
-python UMI-FT/PyriteEnvSuites/scripts/kill_ports.py
-python UMI-FT/PyriteEnvSuites/env_runners/umift_env_runner.py
+python PyriteEnvSuites/scripts/kill_ports.py
+python PyriteEnvSuites/env_runners/umift_env_runner.py
 ```
 
 Jog UR to start pose, remote mode, confirm video (`q`), then menu.

@@ -6,6 +6,8 @@ Commands are from `/home/boeing/umi_ft_ws`. Current data is `stringer_scanner_v2
 
 Most recent: `/mnt/data/umidata/ft/datasets/stringer_scanner_v2/`
 
+October no-scan Fix B (50 episodes, built, not trained): `/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/{r1_world_world,r2_world_fixb,r4_world_fixb_tilt,shared}` from `datasets/stringer_v3.5/`.
+
 - Combined zarr (75 episodes, 2026-09-27): `acp_replay_buffer.zarr`
 - Heatmaps zeroed: `acp_replay_buffer_zero_scan.zarr`
 - Per-episode pieces: `zarr/` and `bags/`
