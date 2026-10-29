@@ -49,6 +49,14 @@ def _merge_r4_group_log(step_log: dict, logs, prefix: str) -> None:
         step_log[name] = float(value)
 
 
+def _merge_per_dim_log(step_log: dict, logs, prefix: str) -> None:
+    """Write per-action-dim diffusion MSE as python floats."""
+    if not logs:
+        return
+    for i, value in enumerate(logs):
+        step_log[f"{prefix}_mse_d{i:02d}"] = float(value)
+
+
 class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     include_keys = ["global_step", "epoch"]
     exclude_keys = tuple()
@@ -423,6 +431,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                 if self.flag_has_dense:
                                     step_log["dense_gradient_norm"] = _as_float(dense_norm)
                             _merge_r4_group_log(step_log, model_unwrapped.get_r4_group_log(), "train")
+                            if cfg.training.log_per_dim_action_loss:
+                                _merge_per_dim_log(
+                                    step_log, model_unwrapped.get_per_dim_log(), "train"
+                                )
                             
                             # log of last step is combined with validation and rollout
                             accelerator.log(step_log, step=self.global_step)
@@ -459,16 +471,22 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     with torch.no_grad():
                         val_losses = list()
                         val_r4_acc = {}
+                        val_dim_acc = []
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}",
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                                 loss = self.model(batch, args)
                                 val_losses.append(loss)
-                                r4_logs = accelerator.unwrap_model(self.model).get_r4_group_log()
+                                unwrapped = accelerator.unwrap_model(self.model)
+                                r4_logs = unwrapped.get_r4_group_log()
                                 if r4_logs:
                                     for k, v in r4_logs.items():
                                         val_r4_acc.setdefault(k, []).append(float(v))
+                                if cfg.training.log_per_dim_action_loss:
+                                    dim_logs = unwrapped.get_per_dim_log()
+                                    if dim_logs:
+                                        val_dim_acc.append(dim_logs)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
@@ -482,6 +500,9 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                     {k: float(np.mean(vs)) for k, vs in val_r4_acc.items()},
                                     "val",
                                 )
+                            if val_dim_acc:
+                                dim_mean = np.mean(np.asarray(val_dim_acc, dtype=np.float64), axis=0)
+                                _merge_per_dim_log(step_log, dim_mean.tolist(), "val")
 
                 def log_action_mse(step_log, category, pred_action, gt_action):
                     pred_naction = {

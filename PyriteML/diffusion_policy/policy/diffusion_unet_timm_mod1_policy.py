@@ -36,6 +36,14 @@ def _r4_group_mse(per: torch.Tensor, w: torch.Tensor) -> dict:
     return out
 
 
+def _per_dim_mse(per: torch.Tensor, w: torch.Tensor) -> list:
+    """Masked mean diffusion MSE per action dim, as python floats."""
+    num = (per * w).sum(dim=(0, 1))
+    den = w.sum(dim=(0, 1)).clamp_min(1.0)
+    vals = (num / den).detach().float().cpu()
+    return [float(v) for v in vals]
+
+
 class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
     def __init__(
         self,
@@ -134,6 +142,8 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
         self.sparse_loss = 0
         # r4 only: per-group diffusion MSE (python floats) from the last compute_loss.
         self.r4_group_log = None
+        # Per-action-dim diffusion MSE from the last compute_loss (python floats).
+        self.per_dim_log = None
 
         self.flag_has_dense = flag_has_dense
         self.hack_no_obs_encoder_for_dense = hack_no_obs_encoder_for_dense
@@ -513,7 +523,9 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
             if per.shape[-1] >= 27:
                 self.r4_group_log = _r4_group_mse(per, w)
         else:
+            w = torch.ones_like(per)
             sparse_loss = per.mean()
+        self.per_dim_log = _per_dim_mse(per, w)
         self.sparse_loss = sparse_loss
         self.smoothness_loss = smoothness_loss
 
@@ -563,6 +575,10 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
     def get_r4_group_log(self):
         """Python floats of the last r4 diffusion MSE by group, or None for r1–r3."""
         return self.r4_group_log
+
+    def get_per_dim_log(self):
+        """Python floats of the last diffusion MSE per action dim, or None."""
+        return self.per_dim_log
 
     def has_dense(self):
         return self.flag_has_dense

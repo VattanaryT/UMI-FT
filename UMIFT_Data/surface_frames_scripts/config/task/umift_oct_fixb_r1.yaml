@@ -1,0 +1,18 @@
+# October stringer_v3.5 (no scan). World obs, world action.
+# One shared action normalizer, fit on the r2/r4 train chunks:
+#   dims 18:21 (stiffness, gripper, grasp force) come from that file.
+#   dims 0:18 stay the online r1 fit. Those are fixture-frame pose, not v/δn.
+#   rot6d 3:9 and 12:18 are identity either way.
+defaults:
+  - umift_mold_aware
+  - _self_
+
+name: OCT-V35-FIXB-R1-WORLD-WORLD
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/r1_world_world/acp_replay_buffer.zarr
+
+dataset:
+  _target_: fixb_dataset.UmiFTDatasetOctNorm
+  action_normalizer_role: r1
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_r2r4_action_normalizer_1ddfa2b4331f.pkl
+  action_normalizer_sha256: 1ddfa2b4331fb581f4951e55163fb915ff7f7fc06c60f8c87fff2bdfe4b3e1ef

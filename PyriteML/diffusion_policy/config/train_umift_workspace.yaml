@@ -191,6 +191,8 @@ training:
   normalization_weight: 0.00 # needs debugging before using it
 
   log_gradient_norm: False
+  # Diffusion MSE of the sparse action, one python float per action dim.
+  log_per_dim_action_loss: False
 
   gradient_accumulate_every: 1
   # EMA destroys performance when used with BatchNorm

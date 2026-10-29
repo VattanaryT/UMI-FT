@@ -8,6 +8,7 @@ weight that zeros only the ΔR dims after a field-frame jump inside the chunk.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import pickle
 from pathlib import Path
@@ -295,4 +296,144 @@ class UmiFTDatasetR4(UmiFTDataset):
         path = self._r2_action_normalizer_path
         if path:
             pin_r4_action_normalizer(sparse, path)
+        return sparse, dense
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def apply_shared_action_normalizer(sparse_normalizer, path: str, sha256: str, role: str):
+    """Pin a versioned r2/r4 action normalizer.
+
+    role r2: replace all 21 action dims.
+    role r4: dims 0:21 from the file, dims 21:27 identity (ΔR).
+    role r1: dims 18:21 only (stiffness, gripper, grasp force). Pose dims 0:18
+    stay the online r1 fit.
+    """
+    path = Path(path)
+    digest = _sha256_file(path)
+    if not sha256 or digest != sha256:
+        raise RuntimeError(
+            f"action normalizer sha256 {digest} != config {sha256} ({path})"
+        )
+    with path.open("rb") as f:
+        saved = pickle.load(f)
+    src = saved.params_dict["action"]
+    s = src["scale"].detach().float().cpu().reshape(-1)
+    o = src["offset"].detach().float().cpu().reshape(-1)
+    if s.numel() != 21 or o.numel() != 21:
+        raise RuntimeError(f"shared normalizer action dim {s.numel()}, expected 21")
+    dst = sparse_normalizer.params_dict["action"]
+    sd = dst["scale"].detach().float().cpu().reshape(-1).clone()
+    od = dst["offset"].detach().float().cpu().reshape(-1).clone()
+    if role == "r1":
+        if sd.numel() != 21:
+            raise RuntimeError(f"r1 action dim {sd.numel()}, expected 21")
+        before = torch.max(torch.abs(sd[18:21] - s[18:21])).item()
+        sd[18:21] = s[18:21]
+        od[18:21] = o[18:21]
+    elif role == "r2":
+        if sd.numel() != 21:
+            raise RuntimeError(f"r2 action dim {sd.numel()}, expected 21")
+        before = torch.max(torch.abs(sd - s)).item()
+        sd = s.clone()
+        od = o.clone()
+    elif role == "r4":
+        if sd.numel() != 27:
+            raise RuntimeError(f"r4 action dim {sd.numel()}, expected 27")
+        before = torch.max(torch.abs(sd[:21] - s)).item()
+        sd[:21] = s
+        od[:21] = o
+        sd[21:] = 1.0
+        od[21:] = 0.0
+    else:
+        raise ValueError(f"unknown action_normalizer_role {role}")
+    stats = {}
+    for key in ("min", "max", "mean", "std"):
+        a = dst["input_stats"][key].detach().float().cpu().reshape(-1).clone()
+        b = src["input_stats"][key].detach().float().cpu().reshape(-1)
+        if b.numel() != 21:
+            raise RuntimeError(f"shared input_stats[{key}] dim {b.numel()}")
+        if role == "r1":
+            a[18:21] = b[18:21]
+        elif role == "r2":
+            a = b.clone()
+        else:
+            a[:21] = b
+        stats[key] = a.numpy()
+    sparse_normalizer["action"] = SingleFieldLinearNormalizer.create_manual(
+        scale=sd.numpy(),
+        offset=od.numpy(),
+        input_stats_dict=stats,
+    )
+    got_s = sparse_normalizer.params_dict["action"]["scale"].detach().float().cpu().reshape(-1)
+    got_o = sparse_normalizer.params_dict["action"]["offset"].detach().float().cpu().reshape(-1)
+    if role == "r4":
+        if not torch.equal(got_s[21:], torch.ones(6)) or not torch.equal(got_o[21:], torch.zeros(6)):
+            raise RuntimeError("ΔR dims 21:27 are not identity after pin")
+        if torch.max(torch.abs(got_s[:21] - s)).item() != 0:
+            raise RuntimeError("r4 dims 0:21 scale mismatch after pin")
+    print(
+        f"[shared-normalizer] role={role} sha256={digest[:12]} "
+        f"online_vs_file_max|scale|_before_pin={before:.3g} "
+        f"δn scale={float(s[2]):.6g} offset={float(o[2]):.6g}"
+    )
+    return sparse_normalizer
+
+
+class UmiFTDatasetOctNorm(UmiFTDataset):
+    """r1 or r2 with the versioned October action normalizer."""
+
+    def __init__(
+        self,
+        shape_meta: dict,
+        dataset_path: str,
+        action_normalizer_path: str,
+        action_normalizer_sha256: str,
+        action_normalizer_role: str,
+        **kwargs,
+    ):
+        if action_normalizer_role not in ("r1", "r2"):
+            raise ValueError(action_normalizer_role)
+        self._an_path = action_normalizer_path
+        self._an_sha = action_normalizer_sha256
+        self._an_role = action_normalizer_role
+        super().__init__(shape_meta=shape_meta, dataset_path=dataset_path, **kwargs)
+
+    def get_normalizer(self, **kwargs):
+        sparse, dense = super().get_normalizer(**kwargs)
+        apply_shared_action_normalizer(
+            sparse, self._an_path, self._an_sha, self._an_role
+        )
+        return sparse, dense
+
+
+class UmiFTDatasetOctR4(UmiFTDatasetR4):
+    """r4 chunks and ΔR loss mask, with the October shared normalizer."""
+
+    def __init__(
+        self,
+        shape_meta: dict,
+        dataset_path: str,
+        action_normalizer_path: str,
+        action_normalizer_sha256: str,
+        **kwargs,
+    ):
+        self._an_path = action_normalizer_path
+        self._an_sha = action_normalizer_sha256
+        super().__init__(
+            shape_meta=shape_meta,
+            dataset_path=dataset_path,
+            r2_action_normalizer_path=None,
+            **kwargs,
+        )
+
+    def get_normalizer(self, **kwargs):
+        sparse, dense = UmiFTDataset.get_normalizer(self, **kwargs)
+        apply_shared_action_normalizer(sparse, self._an_path, self._an_sha, "r4")
         return sparse, dense

@@ -1,0 +1,28 @@
+# October stringer_v3.5 (no scan). World obs, Fix B action + ΔR rot6d.
+# Same chunks as r1 and r2. ΔR loss (dims 21:27) is zeroed after a >30° mesh
+# R_f jump inside the chunk. Those dims use an identity normalizer.
+# Dims 0:21 use the shared r2/r4 train-chunk fit (not a separate r4 refit).
+defaults:
+  - umift_mold_aware
+  - _self_
+
+name: OCT-V35-FIXB-R4-WORLD-FIXB-TILT
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/r4_world_fixb_tilt/acp_replay_buffer.zarr
+
+dataset:
+  _target_: fixb_dataset.UmiFTDatasetOctR4
+  mask_delta_R_after_field_jumps: true
+  field_jump_deg: 30.0
+  filter_stats_path: null
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_r2r4_action_normalizer_1ddfa2b4331f.pkl
+  action_normalizer_sha256: 1ddfa2b4331fb581f4951e55163fb915ff7f7fc06c60f8c87fff2bdfe4b3e1ef
+
+shape_meta:
+  action:
+    shape: [27]
+    rotation_rep: rotation_6d
+  raw:
+    fixb_delta_R_rot6d_0:
+      shape: [6]
+      type: low_dim

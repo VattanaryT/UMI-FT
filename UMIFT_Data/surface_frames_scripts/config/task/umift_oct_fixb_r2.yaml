@@ -1,0 +1,17 @@
+# October stringer_v3.5 (no scan). World obs, Fix B action (v_t1, v_t2, δn).
+# Built so r1/r2/r4 share one chunk index. Train later.
+# Action normalizer: all 21 dims from the shared r2/r4 train-chunk fit.
+# Rot6d 3:9 and 12:18 are identity.
+defaults:
+  - umift_mold_aware
+  - _self_
+
+name: OCT-V35-FIXB-R2-WORLD-FIXB
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/r2_world_fixb/acp_replay_buffer.zarr
+
+dataset:
+  _target_: fixb_dataset.UmiFTDatasetOctNorm
+  action_normalizer_role: r2
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_r2r4_action_normalizer_1ddfa2b4331f.pkl
+  action_normalizer_sha256: 1ddfa2b4331fb581f4951e55163fb915ff7f7fc06c60f8c87fff2bdfe4b3e1ef
