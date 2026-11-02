@@ -2,7 +2,7 @@
 date: 2026-11-02
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: 685f10e
 status: in-progress
 artifacts:
   - UMIFT_Data/surface_frames_scripts/config/task/umift_oct_fixb_r4_h4s.yaml
