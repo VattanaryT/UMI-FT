@@ -2,7 +2,7 @@
 date: 2026-11-02
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: fb4b1d3
 status: done
 artifacts:
   - /mnt/data/umidata/ft/training_outputs/oct_v35_fixb/r1_world_world/epoch=0195-train_loss=0.013.ckpt
