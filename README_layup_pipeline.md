@@ -160,4 +160,4 @@ Frames follow `rgb_time_stamps_0`. Depth and scan heatmaps are stored as viewabl
 
 `combine_umift_dataset.sh` rebuilds the whole zarr every run. It prepends 5 seconds of the first frame (`--start-pad-seconds`, default 5). Virtual-target postprocessing skips episodes it already labeled.
 
-In `umift_env_runner.py`, `set_depth_to_zero` is `True`. `sparse_execution_horizon` must stay at or below the checkpoint's action horizon (the 10 Hz config uses 32; the runner is set to 16). Scan-pause windows are excluded from action targets, but zeroing heatmaps does not remove those gaps.
+In `umift_env_runner.py`, `set_depth_to_zero` is `True`. `sparse_execution_horizon` must stay at or below the checkpoint's action horizon. Horizon-24 checkpoints execute 6 steps; a 64-step checkpoint is raised to 32. Scan-pause windows are excluded from action targets, but zeroing heatmaps does not remove those gaps.

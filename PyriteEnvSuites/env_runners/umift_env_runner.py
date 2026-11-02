@@ -809,9 +809,12 @@ def main():
         # wall-clock time, so motion inside them looks slow_down_factor x slower).
         "scale_obs_windows_by_slow_down": True,
         # Must be <= the loaded checkpoint's sparse_action_horizon.
-        # Horizon-24 checkpoints stay at 16. A 64-step checkpoint is raised
-        # to 32 below (2.07 s of demo time, ~4.1 s of wall clock at half speed).
-        "sparse_execution_horizon": 16, # first step is at t=0, so this should be >1
+        # Horizon-24 checkpoints execute 6 steps. At half speed that is
+        # (6-1)*(1/15)*2 ≈ 0.67 s of wall clock between replans, so more
+        # overlapping chunks vote on each pose. This dilutes a bad absolute
+        # pose; it does not cap the step. A 64-step checkpoint is raised
+        # to 32 below.
+        "sparse_execution_horizon": 6, # first step is at t=0, so this should be >1
         # Zero-added-latency temporal ensembling of overlapping action chunks.
         # Lower sparse_execution_horizon with this on increases overlap/smoothing.
         "enable_ensemble_chunking": True,
@@ -1229,11 +1232,12 @@ def main():
         "down_sample_steps"
     ]
     sparse_action_horizon = int(shape_meta["sample"]["action"]["sparse"]["horizon"])
-    if sparse_action_horizon >= 64 and int(control_para["sparse_execution_horizon"]) <= 16:
+    exec_h_cfg = int(control_para["sparse_execution_horizon"])
+    if sparse_action_horizon >= 64 and exec_h_cfg <= 16:
         control_para["sparse_execution_horizon"] = 32
         print(
             f"[horizon] action chunk {sparse_action_horizon}: "
-            "sparse_execution_horizon 16 -> 32"
+            f"sparse_execution_horizon {exec_h_cfg} -> 32"
         )
     # sparse_action_horizon_s = (
     #     sparse_action_horizon * sparse_action_down_sample_steps * p_timestep_s
