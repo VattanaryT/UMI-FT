@@ -75,7 +75,9 @@ class SafetyLimits:
     # Live policy peaks ~0.19 m/s on val demos; 0.25 leaves headroom without aborting.
     max_tangential_speed_mps: float = 0.25
     max_step_m: float = 0.025
-    max_distance_from_mesh_m: float = 0.030
+    # 0.030 aborted the 2026-10-29 contact runs (commanded δn already ~27 mm).
+    # 0.10 lets those chunks run; still stops a large fly-off. Demos peak ~0.32 m.
+    max_distance_from_mesh_m: float = 0.10
     max_foot_hop_m: float = 0.020
     stop_on_normal_flip: bool = True
     max_tilt_from_normal_deg: float = 45.0

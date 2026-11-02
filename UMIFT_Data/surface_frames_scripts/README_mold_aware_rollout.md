@@ -37,16 +37,19 @@ python PyriteEnvSuites/env_runners/umift_env_runner.py
 
 Jog UR to start pose, remote mode, confirm video (`q`), then menu.
 
+At the "Press Enter to start" prompt, `d` moves the arm to the demonstrated start closest to the median of that checkpoint's dataset (lift, travel, descend), then waits for Enter. The same `d` is on the post-episode menu. `r` still returns to the pose captured when you pressed `q`.
+
 ### Switch policy
 
 Edit `pipeline_para["ckpt_path"]` in `umift_env_runner.py`:
 
 | run | path |
 |-----|------|
-| r1 | `/scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt` |
-| r2 | `/scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt` |
-| r3 | `/scanner_fixb/r3_surface_fixb/epoch=0035-train_loss=0.016.ckpt` |
-| r4 | `/scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt` (epoch-35 pruned by top-k) |
+| r1 October v3.5 | `/oct_v35_fixb/r1_world_world/epoch=0195-train_loss=0.013.ckpt` (loaded now) |
+| r4 October v3.5 | `/oct_v35_fixb/r4_world_fixb_tilt/epoch=0195-train_loss=0.013.ckpt` |
+| r1 September | `/scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt` |
+| r2 September | `/scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt` |
+| r4 September | `/scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt` |
 
 Contact later: set `control_para["mold_aware_dry_run"] = False`.
 
@@ -59,8 +62,8 @@ Contact later: set `control_para["mold_aware_dry_run"] = False`.
 5. r4: same as r2 plus predicted tilt ΔR from action dims 21:27.
 6. Speed, step, and δn clamps stay on. Tilt (45°), rotation-rate (20°/step), and
    r4 mesh-jump hold are off (`SafetyLimits.enable_*`, default False) so contact
-   matches the Oct 22 dry_run=false decode. Hard stops (mesh distance, normal flip)
-   still abort if `mold_aware_abort_on_safety` is True.
+   matches the Oct 22 dry_run=false decode. Hard stops still abort if
+   `mold_aware_abort_on_safety` is True: mesh distance is 0.10 m, normal flip unchanged.
 
 ## Open-loop compare (offline)
 

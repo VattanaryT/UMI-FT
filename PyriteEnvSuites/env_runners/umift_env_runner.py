@@ -35,6 +35,19 @@ from PyriteUtility.planning_control.policy_clock import (
     PolicyElapsedClock,
     scale_obs_windows_by_slow_down,
 )
+from PyriteEnvSuites.env_runners.dataset_start_pose import (
+    central_episode_start,
+    dataset_poses_are_fixture,
+    pose7_change_frame,
+    read_cartesian_safe_zone,
+    resolve_dataset_zarr,
+    tcp_inside_safe_zone,
+)
+from PyriteEnvSuites.env_runners.rollout_experiment_log import (
+    CAMERA_HZ,
+    append_rollout_journal,
+    format_horizon_banner,
+)
 from PyriteUtility.planning_control.scan_encoder_monitor import (
     ScanEncoderMonitor,
     render_scan_panel,
@@ -162,6 +175,66 @@ def home_to_pose7(
     )
     if wait:
         time.sleep(duration_s + 0.5)
+
+
+def move_to_dataset_start_pose(
+    env,
+    id_list: list,
+    *,
+    dataset_zarr: Optional[Path],
+    hardware_config_path: str,
+) -> bool:
+    """Move robot 0 to the demonstrated start closest to the median.
+
+    Uses the same lift-travel-descend path as ``home_to_pose7``. Does not
+    change the startup pose that menu option ``r`` returns to. Returns False
+    without moving when the dataset or the safe zone rejects the goal.
+    """
+    if dataset_zarr is None:
+        print(
+            "[dataset-start] No local dataset zarr for this checkpoint. "
+            "Staying at the current pose."
+        )
+        return False
+    try:
+        episode_name, pose_src, median_xyz = central_episode_start(dataset_zarr)
+    except Exception as exc:
+        print(f"[dataset-start] Could not read start poses ({exc}).")
+        return False
+    if dataset_poses_are_fixture(dataset_zarr):
+        T_fixture_from_base = load_workcell_extrinsics().T_fixture_from_right_base
+        pose_base = pose7_change_frame(pose_src, np.linalg.inv(T_fixture_from_base))
+        frame_note = "fixture -> right_base"
+    else:
+        pose_base = np.asarray(pose_src, dtype=np.float64).reshape(7)
+        frame_note = "dataset frame (not tagged fixture)"
+    goal_xyz = pose_base[:3]
+    dist_mm = float(np.linalg.norm(pose_src[:3] - median_xyz) * 1000.0)
+    print(
+        f"[dataset-start] {episode_name} from {dataset_zarr.name} "
+        f"({frame_note}), {dist_mm:.1f} mm from the median start."
+    )
+    print(
+        "[dataset-start] goal right_base xyz "
+        f"[{goal_xyz[0]:.3f}, {goal_xyz[1]:.3f}, {goal_xyz[2]:.3f}] m"
+    )
+    safe_zone = read_cartesian_safe_zone(hardware_config_path)
+    if safe_zone is not None and not tcp_inside_safe_zone(goal_xyz, safe_zone):
+        print(
+            "[dataset-start] Goal is outside the cartesian safe zone "
+            f"{safe_zone}. Not moving."
+        )
+        return False
+    goals = []
+    obs_raw = env.get_observation_from_buffer()
+    for rid in id_list:
+        if rid == 0:
+            goals.append(pose_base.reshape(7))
+        else:
+            goals.append(np.asarray(obs_raw[f"ts_pose_fb_{rid}"][-1], dtype=np.float64))
+    print("[dataset-start] Lifting, traveling, then descending onto that pose.")
+    home_to_pose7(env, id_list, goals, duration_s=5.0, wait=True)
+    return True
 
 
 def read_robot_joints_via_rtde(
@@ -826,7 +899,7 @@ def main():
         "use_audio": False,
         "gripper_lookahead_steps": 0,  # how many steps to look ahead for gripper action
         "set_wrench_fb_to_zero": False,
-        "set_depth_to_zero": True,  # ablation: feed all-zero depth to policy
+        "set_depth_to_zero": True,  # do not feed depth; October v3.5 tests run RGB only
         "test_nominal_target": False,  # False to follow virtual target
         "test_nominal_target_stiffness": -1,  # -1, for a 'no force case'. 1500, for a quick test without force.
         "fix_orientation": False,
@@ -878,13 +951,16 @@ def main():
             "socket_ip": "192.168.2.18",
             "ports": [5555],
         },
-        # Mold-aware scanner Fix B. Override for other runs:
+        # October stringer_v3.5 Fix B (no scan). On disk each run has one file,
+        # epoch 195, which is both the latest epoch and the only train_loss.
+        # Loaded below: r1. r4 is the previous contact rollout.
+        #   /oct_v35_fixb/r1_world_world/epoch=0195-train_loss=0.013.ckpt
+        #   /oct_v35_fixb/r4_world_fixb_tilt/epoch=0195-train_loss=0.013.ckpt
+        # September scanner Fix B, if you need the old comparison:
         #   /scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt
         #   /scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt
-        #   /scanner_fixb/r3_surface_fixb/epoch=0035-train_loss=0.016.ckpt
         #   /scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt
-        #     (r4: epoch-35 pruned by top-k; 60 is earliest kept for matched compare)
-        "ckpt_path": "/scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt",
+        "ckpt_path": "/oct_v35_fixb/r1_world_world/epoch=0195-train_loss=0.013.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
@@ -946,14 +1022,20 @@ def main():
     # Mold-aware / Fix B: detect run type from checkpoint task name.
     mold_runtime = None
     mold_run_type = "none"
+    _task_name = ""
+    _dataset_path_cfg = ""
     try:
         _payload = torch.load(
             open(ckpt_full_path, "rb"), map_location="cpu", pickle_module=dill
         )
         _task_name = str(getattr(_payload["cfg"].task, "name", ""))
+        _dataset_path_cfg = str(
+            getattr(_payload["cfg"].task, "dataset_path", "") or ""
+        )
     except Exception as exc:
         print(f"[mold] could not read task name from ckpt ({exc}); mold_aware off")
         _task_name = ""
+        _dataset_path_cfg = ""
     # Mold field + FixB labels live in the fixture frame. Live RTDE tip is
     # right_base; keep T_fixture_from_right_base for mold obs/decode.
     mold_T_fixture_from_base: Optional[np.ndarray] = None
@@ -967,9 +1049,8 @@ def main():
             dry_run=bool(control_para["mold_aware_dry_run"]),
         )
         mold_T_fixture_from_base = load_workcell_extrinsics().T_fixture_from_right_base
-        # Mold-aware policies were trained with real depth.
-        control_para["set_depth_to_zero"] = False
-        # No scan heatmap in scanner Fix B checkpoints.
+        # Depth stays at set_depth_to_zero (default True). These policies have a
+        # depth input, but inference feeds zeros and does not open the depth stream.
         control_para["periodic_scan_enabled"] = False
         control_para["show_scan_panel"] = False
         control_para["monitor_scan_encoder"] = False
@@ -978,7 +1059,8 @@ def main():
             f"field={control_para['mold_aware_field_npz']}"
         )
         print(
-            "[mold] set_depth_to_zero=False, periodic_scan_enabled=False; "
+            f"[mold] set_depth_to_zero={control_para['set_depth_to_zero']}, "
+            "periodic_scan_enabled=False; "
             "mold obs/decode use fixture frame via workcell extrinsics"
         )
     else:
@@ -1194,6 +1276,7 @@ def main():
             depth_clip=depth_clip if depth_query_size is not None else 0.5,
             vision_key=vision_key,
             realsense_serial=realsense_serial,
+            capture_depth=not bool(control_para["set_depth_to_zero"]),
         )
     else:
         env = ManipServerUMIFTEnv(
@@ -1250,6 +1333,32 @@ def main():
         * sparse_action_down_sample_steps
         * p_timestep_s
         * control_para["slow_down_factor"]
+    )
+    _sparse = shape_meta["sample"]["obs"]["sparse"]
+    _rgb_meta = _sparse[rgb_key]
+    _wrench_meta = _sparse.get("robot0_eef_wrench_left", {"horizon": 1, "down_sample_steps": 1})
+    _step_wall_s = (
+        sparse_action_down_sample_steps
+        * p_timestep_s
+        * control_para["slow_down_factor"]
+    )
+    horizon_banner = format_horizon_banner(
+        rgb_horizon=int(_rgb_meta["horizon"]),
+        rgb_ds=int(_rgb_meta["down_sample_steps"]),
+        wrench_horizon=int(_wrench_meta["horizon"]),
+        wrench_ds_live=int(_wrench_meta["down_sample_steps"]),
+        wrench_hz=500.0,
+        action_horizon=int(sparse_action_horizon),
+        action_executed=int(control_para["sparse_execution_horizon"]),
+        step_wall_s=float(_step_wall_s),
+        slow_down=float(control_para["slow_down_factor"]),
+        depth_zeroed=bool(control_para["set_depth_to_zero"]),
+        camera_hz=CAMERA_HZ,
+    )
+    print(horizon_banner)
+    print(
+        f"[rollout-log] appending each episode to "
+        f"{control_log_folder_path}/rollout_log.jsonl"
     )
 
     action_type = None
@@ -1396,12 +1505,32 @@ def main():
             f"[layup-eval] WARNING: could not capture right start joints ({exc}). "
             "Menu option 'e' will be unavailable until restart."
         )
+    dataset_start_zarr = resolve_dataset_zarr(_dataset_path_cfg, _task_name)
+    if dataset_start_zarr is None:
+        print(
+            "[dataset-start] option d is unavailable "
+            f"(task={_task_name!r}, cfg path={_dataset_path_cfg!r})."
+        )
+    else:
+        print(f"[dataset-start] option d uses {dataset_start_zarr}")
+
     #########################################
     # main loop starts
     #########################################
     while True:
         printOrNot(vbs_h1, "New episode. Episode ID: ", episode_id)
-        input("Press Enter to start the episode.")
+        start_cmd = input(
+            "Press Enter to start the episode. "
+            "d: move to a dataset start pose first. "
+        )
+        if start_cmd.strip().lower() == "d":
+            move_to_dataset_start_pose(
+                env,
+                id_list,
+                dataset_zarr=dataset_start_zarr,
+                hardware_config_path=pipeline_para["hardware_config_path"],
+            )
+            input("Press Enter to start the episode.")
 
         # env.start_saving_data_for_a_new_episode(pipeline_para["episode_data_save_path"])
         env.start_saving_data_for_a_new_episode()
@@ -2126,6 +2255,7 @@ def main():
 
         env.stop_saving_data()
 
+        cam_info = None
         if cam_rec is not None:
             try:
                 if isinstance(env, ManipServerLayupEnv):
@@ -2139,6 +2269,48 @@ def main():
             except Exception as exc:
                 print(f"[rollout-cam] stop failed: {exc}")
             cam_rec = None
+
+        journal = {
+            "rollout_id": finished_rollout_id,
+            "episode_id": int(finished_episode_id),
+            "ckpt_path": pipeline_para["ckpt_path"],
+            "mold_run_type": mold_run_type,
+            "mold_aware_dry_run": bool(mold_runtime.dry_run) if mold_runtime else None,
+            "set_depth_to_zero": bool(control_para["set_depth_to_zero"]),
+            "slow_down_factor": float(control_para["slow_down_factor"]),
+            "scale_obs_windows_by_slow_down": bool(
+                control_para.get("scale_obs_windows_by_slow_down", False)
+            ),
+            "sparse_execution_horizon": int(control_para["sparse_execution_horizon"]),
+            "enable_ensemble_chunking": bool(
+                control_para.get("enable_ensemble_chunking", False)
+            ),
+            "ensemble_decay_m": float(control_para.get("ensemble_decay_m", 0.0)),
+            "horizons": horizon_banner,
+            "control_log": finished_episode_log_path,
+            "camera_hz_expected": CAMERA_HZ,
+        }
+        if mold_runtime is not None:
+            journal["max_distance_from_mesh_m"] = float(
+                mold_runtime.limits.max_distance_from_mesh_m
+            )
+            journal["enable_tilt_clamp"] = bool(mold_runtime.limits.enable_tilt_clamp)
+            journal["enable_rot_rate_clamp"] = bool(
+                mold_runtime.limits.enable_rot_rate_clamp
+            )
+            journal["enable_mesh_jump_hold"] = bool(
+                mold_runtime.limits.enable_mesh_jump_hold
+            )
+        if cam_info is not None:
+            journal["wrist_rate"] = cam_info.get("wrist_rate")
+            journal["center_rate"] = cam_info.get("center_rate")
+        if mold_runtime is not None and ep_safety_reasons is not None:
+            journal["n_safety_stops"] = int(ep_n_safety_stops)
+            journal["safety_stop_reasons"] = list(ep_safety_reasons)
+        if control_log_folder_path:
+            journal_path = Path(control_log_folder_path) / "rollout_log.jsonl"
+            append_rollout_journal(journal_path, journal)
+            print(f"[rollout-log] {finished_rollout_id} -> {journal_path}")
 
         # Per-rollout summary (print + save next to control log).
         if mold_runtime is not None:
@@ -2182,6 +2354,7 @@ def main():
             "(wait for compare; save results next to ckpt)."
         )
         print("     b: reset to default pose, then quit the program.")
+        print("     d: move to a dataset start pose, then continue.")
         print("     others: quit the program.")
         # Surface any compares that finished during the previous episode.
         layup_eval_results.extend(
@@ -2234,6 +2407,13 @@ def main():
             )
         elif c == "c":
             pass
+        elif c == "d":
+            move_to_dataset_start_pose(
+                env,
+                id_list,
+                dataset_zarr=dataset_start_zarr,
+                hardware_config_path=pipeline_para["hardware_config_path"],
+            )
         else:
             print("Quitting the program.")
             break

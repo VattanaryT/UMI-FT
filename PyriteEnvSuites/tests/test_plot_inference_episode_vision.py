@@ -254,3 +254,12 @@ def test_export_episode_vision_video_writes_mp4(monkeypatch, tmp_path):
     )
     assert out.is_file()
     assert out.stat().st_size > 0
+
+
+def test_query_index_follows_horizon_ends(monkeypatch):
+    plot = _import_plot_module(monkeypatch)
+    ends = np.asarray([4, 8, 12])
+    assert plot.query_index_for_sample(0, ends) == 0
+    assert plot.query_index_for_sample(4, ends) == 1
+    assert plot.query_index_for_sample(11, ends) == 2
+    assert plot.query_index_for_sample(20, ends) == 2

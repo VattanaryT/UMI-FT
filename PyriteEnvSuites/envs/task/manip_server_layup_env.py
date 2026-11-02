@@ -296,11 +296,18 @@ class ManipServerLayupEnv(ManipServerEnv):
         depth_clip: float = 0.5,
         vision_key: Optional[List[str]] = None,
         realsense_serial: Optional[str] = None,
+        capture_depth: Optional[bool] = None,
     ) -> None:
         self._realsense_serial = realsense_serial
         self.vision_key = vision_key or []
         self._use_rgb = "rgb_0" in self.vision_key
         self._use_depth = "depth_0" in self.vision_key
+        # None keeps the old behavior (open depth iff the policy lists depth_0).
+        # False still returns zero depth tensors so the policy shape is unchanged.
+        if capture_depth is None:
+            self._capture_depth = self._use_depth
+        else:
+            self._capture_depth = bool(capture_depth) and self._use_depth
         self._use_pyrealsense_vision = self._use_rgb or self._use_depth
 
         super().__init__(
@@ -340,7 +347,7 @@ class ManipServerLayupEnv(ManipServerEnv):
                 policy_rgb_hw=policy_hw,
                 serial=self._realsense_serial,
                 capture_color=self._use_rgb,
-                capture_depth=self._use_depth,
+                capture_depth=self._capture_depth,
             )
             self._vision_buffer.start()
 

@@ -3,8 +3,10 @@
 Chains executed nominal/virtual targets across horizons, overlays episode JSON
 pose/wrench feedback, and shows policy RGB/depth for the selected time.
 
-The bottom slider scrubs over action timestamps (smooth), holds RGB/depth from
-the latest replan, and truncates the 3D trajectory to the current time.
+The bottom time slider scrubs action timestamps. The query slider, and the
+left/right arrow keys, step one policy query at a time. The blue band on the
+plots is that query. RGB/depth hold the latest replan, and the 3D path grows
+up to the current time (or through the end of the selected query).
 
 Usage:
   export PYRITE_CONTROL_LOG_FOLDERS=$HOME/data/control_log
@@ -18,9 +20,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import hashlib
+import html
 import json
 import os
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -441,6 +446,22 @@ def _blank_rgb(h: int = 64, w: int = 64) -> np.ndarray:
     return np.zeros((h, w, 3), dtype=np.uint8)
 
 
+def _missing_camera_image(text: str) -> np.ndarray:
+    """Gray label on black, used when a camera file was not written."""
+    img = np.zeros((180, 320, 3), dtype=np.uint8)
+    cv2.putText(
+        img,
+        text,
+        (12, 96),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (190, 190, 190),
+        1,
+        cv2.LINE_AA,
+    )
+    return img
+
+
 def _y_span(ys: List[np.ndarray], pad_frac: float = 0.05) -> Tuple[float, float]:
     """Return (ymin, ymax) with padding; falls back to a small default span."""
     vals = [np.asarray(y, dtype=np.float64).reshape(-1) for y in ys if y is not None]
@@ -456,6 +477,48 @@ def _y_span(ys: List[np.ndarray], pad_frac: float = 0.05) -> Tuple[float, float]
         return (lo - pad, hi + pad)
     pad = pad_frac * (hi - lo)
     return (lo - pad, hi + pad)
+
+
+def query_index_for_sample(sample_idx: int, horizon_end_idx: np.ndarray) -> int:
+    """Query whose half-open sample range contains ``sample_idx``."""
+    ends = np.asarray(horizon_end_idx, dtype=np.int64)
+    found = np.where(int(sample_idx) < ends)[0]
+    if found.size == 0:
+        return int(len(ends) - 1)
+    return int(found[0])
+
+
+def query_tick_scatter(times: np.ndarray, y0: float, y1: float) -> go.Scatter:
+    """Faint vertical line at every policy query."""
+    xs: List[Optional[float]] = []
+    ys: List[Optional[float]] = []
+    for t in np.asarray(times, dtype=np.float64):
+        xs.extend([float(t), float(t), None])
+        ys.extend([y0, y1, None])
+    return go.Scatter(
+        x=xs,
+        y=ys,
+        mode="lines",
+        line=dict(color="rgba(80,80,80,0.45)", width=1, dash="dot"),
+        name="query ticks",
+        showlegend=False,
+        hoverinfo="skip",
+    )
+
+
+def query_window_scatter(t0: float, t1: float, y0: float, y1: float) -> go.Scatter:
+    """Shaded band covering the query currently selected."""
+    return go.Scatter(
+        x=[t0, t1, t1, t0, t0],
+        y=[y0, y0, y1, y1, y0],
+        mode="lines",
+        fill="toself",
+        fillcolor="rgba(31,119,180,0.18)",
+        line=dict(color="rgba(31,119,180,0.95)", width=1.5),
+        name="query window",
+        showlegend=False,
+        hoverinfo="skip",
+    )
 
 
 def time_marker_scatter(t: float, y0: float, y1: float) -> go.Scatter:
@@ -504,7 +567,7 @@ def horizon_index_for_time(t: float, horizon_times: np.ndarray) -> int:
     """Latest horizon with start time <= t (hold previous image between replans)."""
     if horizon_times.size == 0:
         return 0
-    valid = np.where(np.isfinite(horizon_times) & (horizon_times <= t))[0]
+    valid = np.where(np.isfinite(horizon_times) & (horizon_times <= float(t) + 1e-6))[0]
     if valid.size == 0:
         return 0
     return int(valid[-1])
@@ -516,6 +579,219 @@ def vision_index_for_time(t: float, vision_times: np.ndarray) -> int:
 
 
 DEFAULT_VISION_VIDEO_FPS = 15.0
+
+
+def _letterbox_note(rgb_image: np.ndarray) -> str:
+    """Black bars on the policy RGB mean the live frame was letterboxed."""
+    img = np.asarray(rgb_image)
+    if img.size == 0:
+        return "unknown"
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255)
+    top = float(img[:6].mean())
+    mid = float(img[img.shape[0] // 2 - 4 : img.shape[0] // 2 + 4].mean())
+    if top < 5.0 and mid > 15.0:
+        return "yes (black bars)"
+    return "no"
+
+
+def load_center_camera(log_path: str, t_cmd: np.ndarray) -> Tuple[List[np.ndarray], np.ndarray, str]:
+    """Orbbec center MP4, timed across the logged action span.
+
+    The file is tagged 15 fps, but capture often wrote fewer frames than the
+    episode lasted, so frames are spread from the first logged action to the last.
+    """
+    mp4 = Path(log_path) / "cameras" / "orbbec_center.mp4"
+    if not mp4.is_file():
+        return [], np.zeros(0, dtype=np.float64), "no cameras/orbbec_center.mp4"
+    cap = cv2.VideoCapture(str(mp4))
+    frames: List[np.ndarray] = []
+    try:
+        while True:
+            ok, bgr = cap.read()
+            if not ok or bgr is None:
+                break
+            frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    finally:
+        cap.release()
+    n = len(frames)
+    if n == 0:
+        return [], np.zeros(0, dtype=np.float64), f"{mp4.name} opened but had no frames"
+    span = float(t_cmd[-1] - t_cmd[0]) if len(t_cmd) else 0.0
+    times = np.linspace(0.0, max(span, 0.0), n)
+    container_s = n / 15.0
+    note = (
+        f"cameras/orbbec_center.mp4  {n} frames, container {container_s:.1f}s at 15 fps, "
+        f"shown across {span:.1f}s of logged motion"
+    )
+    return frames, times, note
+
+
+def _resolve_ckpt(ckpt_attr: str) -> str:
+    if not ckpt_attr:
+        return ""
+    if os.path.isfile(ckpt_attr):
+        return ckpt_attr
+    root = os.environ.get(
+        "PYRITE_CHECKPOINT_FOLDERS", "/mnt/data/umidata/ft/training_outputs"
+    )
+    return os.path.join(root, str(ckpt_attr).lstrip("/"))
+
+
+def training_config_text(ckpt_path: str) -> str:
+    """Short training config stored inside the checkpoint. Cached on disk."""
+    if not ckpt_path or not os.path.isfile(ckpt_path):
+        return f"(checkpoint not found: {ckpt_path or 'unset'})"
+    digest = hashlib.sha256(ckpt_path.encode()).hexdigest()[:16]
+    cache = Path("/tmp/umift_ckpt_cfg") / f"{digest}.txt"
+    if cache.is_file() and cache.stat().st_mtime >= os.path.getmtime(ckpt_path):
+        return cache.read_text()
+    try:
+        import torch
+        import dill
+        from omegaconf import OmegaConf
+    except ImportError as exc:
+        return f"(could not import torch/omegaconf: {exc})"
+    print(f"[plot] reading training config from {ckpt_path}")
+    payload = torch.load(open(ckpt_path, "rb"), map_location="cpu", pickle_module=dill)
+    cfg = payload["cfg"]
+    lines = [
+        f"file: {ckpt_path}",
+        f"task: {OmegaConf.select(cfg, 'task.name', default='')}",
+        f"dataset: {OmegaConf.select(cfg, 'task.dataset_path', default='')}",
+        f"dataset class: {OmegaConf.select(cfg, 'task.dataset._target_', default='')}",
+        f"epochs: {OmegaConf.select(cfg, 'training.num_epochs', default='')}"
+        f"  checkpoint_every: {OmegaConf.select(cfg, 'training.checkpoint_every', default='')}",
+        f"batch_size: {OmegaConf.select(cfg, 'dataloader.batch_size', default='')}",
+        f"action horizon: {OmegaConf.select(cfg, 'task.sparse_action_horizon', default='')}"
+        f"  dim: {list(OmegaConf.select(cfg, 'task.shape_meta.action.shape', default=[]))}",
+        f"rgb horizon/ds: {OmegaConf.select(cfg, 'task.sparse_obs_rgb_horizon', default='')}"
+        f" / {OmegaConf.select(cfg, 'task.sparse_obs_rgb_down_sample_steps', default='')}",
+        f"wrench horizon: {OmegaConf.select(cfg, 'task.sparse_obs_wrench_horizon', default='')}",
+        f"pose_frames: {OmegaConf.select(cfg, 'task.shape_meta.pose_frames', default='')}",
+    ]
+    extra = OmegaConf.select(cfg, "task.dataset.r2_action_normalizer_path", default=None)
+    if extra:
+        lines.append(f"r2 action normalizer: {extra}")
+    text = "\n".join(lines)
+    del payload
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(text)
+    return text
+
+
+def inference_config_text(log, rgb_image: Optional[np.ndarray], center_note: str) -> str:
+    """Knobs recorded on the control-log zarr, plus whether the policy RGB is letterboxed."""
+    want = [
+        "ckpt_path",
+        "mold_run_type",
+        "mold_aware_dry_run",
+        "sparse_execution_horizon",
+        "enable_ensemble_chunking",
+        "ensemble_decay_m",
+        "max_tangential_speed_mps",
+        "mold_aware_field_npz",
+        "hardware_config_path",
+        "episode_data_folder",
+    ]
+    lines = []
+    for key in want:
+        if key in log.attrs:
+            lines.append(f"{key}: {log.attrs[key]}")
+    if rgb_image is not None:
+        lines.append(f"policy RGB letterbox: {_letterbox_note(rgb_image)}")
+    lines.append(f"center camera: {center_note}")
+    lines.append(
+        "not stored in this log: mesh-distance limit, orientation clamps, "
+        "scale_obs_windows_by_slow_down"
+    )
+    return "\n".join(lines)
+
+
+def _inject_config_panel(html_path: str, training: str, inference: str) -> None:
+    block = (
+        "<details style=\"font-family:ui-monospace,monospace;font-size:12px;"
+        "line-height:1.35;background:#f4f4f4;border-bottom:1px solid #ccc\">"
+        "<summary style=\"cursor:pointer;padding:6px 14px\">"
+        "Training and inference config</summary>"
+        "<div style=\"padding:8px 14px 12px;white-space:pre-wrap\">"
+        "<b>Training</b>\n"
+        + html.escape(training)
+        + "\n\n<b>Inference</b>\n"
+        + html.escape(inference)
+        + "</div></details>\n"
+        "<style>body{margin:0}"
+        ".plotly-graph-div{height:calc(100vh - 32px) !important;width:100% !important}"
+        "</style>\n"
+    )
+    path = Path(html_path)
+    text = path.read_text()
+    if "<body>" in text:
+        text = text.replace("<body>", "<body>\n" + block, 1)
+    else:
+        text = block + text
+    path.write_text(text)
+
+
+def _inject_query_keys(html_path: str, horizon_times: np.ndarray) -> None:
+    """Left/right arrows step one policy query. Time-slider moves stay in sync."""
+    times = json.dumps([round(float(t), 4) for t in np.asarray(horizon_times)])
+    n_queries = int(len(horizon_times))
+    script = (
+        "<script>\n"
+        "(function () {\n"
+        f"  var n = {n_queries};\n"
+        f"  var hTimes = {times};\n"
+        "  var q = 0;\n"
+        "  function graph() { return document.querySelector('.plotly-graph-div'); }\n"
+        "  function queryAtTime(t) {\n"
+        "    var i = 0;\n"
+        "    for (var k = 0; k < hTimes.length; k++) {\n"
+        "      if (hTimes[k] <= t + 1e-3) i = k;\n"
+        "    }\n"
+        "    return i;\n"
+        "  }\n"
+        "  function show(i) {\n"
+        "    var el = graph();\n"
+        "    if (!el || !window.Plotly) return;\n"
+        "    q = Math.max(0, Math.min(n - 1, i));\n"
+        "    Plotly.animate(el, ['q' + q], {\n"
+        "      frame: {duration: 0, redraw: true},\n"
+        "      mode: 'immediate',\n"
+        "      transition: {duration: 0}\n"
+        "    });\n"
+        "    try { Plotly.relayout(el, {'sliders[0].active': q}); } catch (err) {}\n"
+        "  }\n"
+        "  document.addEventListener('keydown', function (ev) {\n"
+        "    if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;\n"
+        "    var tag = (ev.target && ev.target.tagName) || '';\n"
+        "    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;\n"
+        "    ev.preventDefault();\n"
+        "    show(q + (ev.key === 'ArrowRight' ? 1 : -1));\n"
+        "  });\n"
+        "  function bind() {\n"
+        "    var el = graph();\n"
+        "    if (!el || !el.on) { setTimeout(bind, 50); return; }\n"
+        "    el.on('plotly_sliderchange', function (ev) {\n"
+        "      if (!ev || !ev.step) return;\n"
+        "      var label = String(ev.step.label || '');\n"
+        "      var qm = /^q(\\d+)/.exec(label);\n"
+        "      if (qm) { q = parseInt(qm[1], 10); return; }\n"
+        "      var tm = /([0-9.]+)s/.exec(label);\n"
+        "      if (tm) q = queryAtTime(parseFloat(tm[1]));\n"
+        "    });\n"
+        "  }\n"
+        "  bind();\n"
+        "})();\n"
+        "</script>\n"
+    )
+    path = Path(html_path)
+    text = path.read_text()
+    if "</body>" in text:
+        text = text.replace("</body>", script + "</body>", 1)
+    else:
+        text = text + script
+    path.write_text(text)
 
 
 def episode_video_duration_s(
@@ -735,7 +1011,9 @@ def plot_episode(
     nom = chained["nominal"]
     virt = chained["virtual"]
     stiff = chained["stiffness"]
-    h_times = chained["horizon_times_s"][: len(vision_keys)]
+    h_times = np.asarray(chained["horizon_times_s"], dtype=np.float64)
+    h_start = np.asarray(chained["horizon_start_idx"], dtype=np.int64)
+    h_end = np.asarray(chained["horizon_end_idx"], dtype=np.int64)
 
     # Fallback blank images if missing
     sample_rgb = next((im for im in rgb_images if im is not None), _blank_rgb())
@@ -748,6 +1026,15 @@ def plot_episode(
         depth_times = np.asarray([0.0], dtype=np.float64)
     rgb_sources = [image_to_data_uri(image) for image in rgb_images]
     depth_sources = [image_to_data_uri(image) for image in depth_images]
+    center_frames, center_times, center_note = load_center_camera(log_path, t_cmd)
+    if not center_frames:
+        center_frames = [_missing_camera_image("center cam not recorded")]
+        center_times = np.asarray([0.0], dtype=np.float64)
+    center_sources = [
+        image_to_data_uri(image, max_dimension=360) for image in center_frames
+    ]
+    config_training = training_config_text(_resolve_ckpt(str(log.attrs.get("ckpt_path", ""))))
+    config_inference = inference_config_text(log, rgb_images[0], center_note)
 
     slider_idx = sample_slider_indices(len(t_cmd), max_slider_steps)
     if slider_idx.size == 0:
@@ -757,6 +1044,7 @@ def plot_episode(
     t0 = float(t_cmd[k0])
     v0_rgb = vision_index_for_time(t0, rgb_times)
     v0_depth = vision_index_for_time(t0, depth_times)
+    v0_center = vision_index_for_time(t0, center_times)
     fb_times = (
         episode_data["time_s"] if episode_data is not None else np.zeros(0, dtype=np.float64)
     )
@@ -770,26 +1058,24 @@ def plot_episode(
         fb_3d_pose = None
     fb0 = feedback_prefix_len(t0, fb_3d_times)
 
+    # One screen: cameras and 3D on the top row, time series beside them on the bottom.
     fig = make_subplots(
-        rows=6,
-        cols=2,
+        rows=2,
+        cols=4,
         shared_xaxes=False,
-        vertical_spacing=0.05,
-        horizontal_spacing=0.06,
-        column_widths=[0.34, 0.66],
-        row_heights=[0.14, 0.14, 0.18, 0.18, 0.18, 0.18],
+        vertical_spacing=0.10,
+        horizontal_spacing=0.035,
+        column_widths=[0.17, 0.17, 0.17, 0.49],
+        row_heights=[0.46, 0.54],
         specs=[
-            [{"type": "xy"}, {"type": "scene", "rowspan": 2}],
-            [{"type": "xy"}, None],
-            [{"type": "xy", "colspan": 2}, None],
-            [{"type": "xy", "colspan": 2}, None],
-            [{"type": "xy", "colspan": 2}, None],
-            [{"type": "xy", "colspan": 2}, None],
+            [{"type": "xy"}, {"type": "xy"}, {"type": "xy"}, {"type": "scene"}],
+            [{"type": "xy"}, {"type": "xy"}, {"type": "xy"}, {"type": "xy"}],
         ],
         subplot_titles=(
             "Policy RGB",
-            "3D trajectory",
             "Policy depth",
+            "Center camera",
+            "3D trajectory",
             "Pose (m)",
             "Force (N)",
             "Stiffness (N/m)",
@@ -797,13 +1083,15 @@ def plot_episode(
         ),
     )
 
-    # --- Images (left column) ---
     fig.add_trace(go.Image(source=rgb_sources[v0_rgb], name="rgb"), row=1, col=1)
     fig.add_trace(
-        go.Image(source=depth_sources[v0_depth], name="depth"), row=2, col=1
+        go.Image(source=depth_sources[v0_depth], name="depth"), row=1, col=2
+    )
+    fig.add_trace(
+        go.Image(source=center_sources[v0_center], name="center"), row=1, col=3
     )
 
-    # --- Pose (row 3, full width): full history always visible in 2D ---
+    # --- Pose (row 4, full width): full history always visible in 2D ---
     pose_colors = {"x": "#1f77b4", "y": "#ff7f0e", "z": "#2ca02c"}
     for i, label in enumerate(("x", "y", "z")):
         name_nom = f"nom {label}"
@@ -819,9 +1107,9 @@ def plot_episode(
                 showlegend=True,
                 visible=True,
             ),
-            row=3,
-            col=1,
-        )
+                row=2,
+                col=1,
+            )
         name_virt = f"virt {label}"
         fig.add_trace(
             go.Scatter(
@@ -835,9 +1123,9 @@ def plot_episode(
                 showlegend=True,
                 visible=True,
             ),
-            row=3,
-            col=1,
-        )
+                row=2,
+                col=1,
+            )
         if episode_data is not None:
             name_fb = f"fb {label}"
             fig.add_trace(
@@ -853,11 +1141,11 @@ def plot_episode(
                     showlegend=True,
                     visible=True,
                 ),
-                row=3,
+                row=2,
                 col=1,
             )
 
-    # --- Force (row 4) ---
+    # --- Force ---
     if episode_data is not None:
         t_fb = episode_data["time_s"]
         wrench = episode_data["wrench"]
@@ -872,20 +1160,20 @@ def plot_episode(
                     legendgrouptitle_text="Force",
                     showlegend=True,
                 ),
-                row=4,
-                col=1,
+                row=2,
+                col=2,
             )
     else:
         fig.add_annotation(
             text="no episode JSON wrench/pose feedback",
-            xref="x3 domain",
-            yref="y3 domain",
+            xref="x5 domain",
+            yref="y5 domain",
             x=0.5,
             y=0.5,
             showarrow=False,
         )
 
-    # --- Stiffness (row 5): compliant-direction min eigenvalue ---
+    # --- Stiffness: compliant-direction min eigenvalue ---
     fig.add_trace(
         go.Scatter(
             x=t_cmd,
@@ -897,11 +1185,11 @@ def plot_episode(
             legendgrouptitle_text="Stiffness",
             showlegend=True,
         ),
-        row=5,
-        col=1,
+        row=2,
+        col=3,
     )
 
-    # --- Torque (row 6) ---
+    # --- Torque ---
     if episode_data is not None:
         t_fb = episode_data["time_s"]
         wrench = episode_data["wrench"]
@@ -916,8 +1204,8 @@ def plot_episode(
                     legendgrouptitle_text="Torque",
                     showlegend=True,
                 ),
-                row=6,
-                col=1,
+                row=2,
+                col=4,
             )
 
     # Y spans for magenta scrubber traces (data coords, updated each frame)
@@ -935,10 +1223,32 @@ def plot_episode(
         torque_y0, torque_y1 = (-1.0, 1.0)
     stiff_y0, stiff_y1 = _y_span([stiff])
 
-    fig.add_trace(time_marker_scatter(t0, pose_y0, pose_y1), row=3, col=1)
-    fig.add_trace(time_marker_scatter(t0, force_y0, force_y1), row=4, col=1)
-    fig.add_trace(time_marker_scatter(t0, stiff_y0, stiff_y1), row=5, col=1)
-    fig.add_trace(time_marker_scatter(t0, torque_y0, torque_y1), row=6, col=1)
+    def query_bounds(q: int) -> Tuple[float, float]:
+        q = int(np.clip(q, 0, len(h_times) - 1))
+        t_a = float(t_cmd[int(h_start[q])])
+        t_b = float(t_cmd[int(h_end[q]) - 1])
+        return t_a, max(t_a, t_b)
+
+    q0_t0, q0_t1 = query_bounds(0)
+    plot_spans = (
+        (pose_y0, pose_y1, 1),
+        (force_y0, force_y1, 2),
+        (stiff_y0, stiff_y1, 3),
+        (torque_y0, torque_y1, 4),
+    )
+    for y0, y1, col in plot_spans:
+        fig.add_trace(query_tick_scatter(h_times, y0, y1), row=2, col=col)
+    for y0, y1, col in plot_spans:
+        fig.add_trace(query_window_scatter(q0_t0, q0_t1, y0, y1), row=2, col=col)
+    idx_win_pose = len(fig.data) - 4
+    idx_win_force = len(fig.data) - 3
+    idx_win_stiff = len(fig.data) - 2
+    idx_win_torque = len(fig.data) - 1
+
+    fig.add_trace(time_marker_scatter(t0, pose_y0, pose_y1), row=2, col=1)
+    fig.add_trace(time_marker_scatter(t0, force_y0, force_y1), row=2, col=2)
+    fig.add_trace(time_marker_scatter(t0, stiff_y0, stiff_y1), row=2, col=3)
+    fig.add_trace(time_marker_scatter(t0, torque_y0, torque_y1), row=2, col=4)
     idx_marker_pose = len(fig.data) - 4
     idx_marker_force = len(fig.data) - 3
     idx_marker_stiff = len(fig.data) - 2
@@ -958,7 +1268,7 @@ def plot_episode(
             showlegend=True,
         ),
         row=1,
-        col=2,
+        col=4,
     )
     fig.add_trace(
         go.Scatter3d(
@@ -972,9 +1282,9 @@ def plot_episode(
             legendgrouptitle_text="3D",
             showlegend=True,
         ),
-        row=1,
-        col=2,
-    )
+            row=1,
+            col=4,
+        )
     has_feedback_3d = fb_3d_pose is not None
     if has_feedback_3d:
         fig.add_trace(
@@ -991,11 +1301,11 @@ def plot_episode(
                 showlegend=True,
             ),
             row=1,
-            col=2,
+            col=4,
         )
 
     # Trace indices for animated updates
-    idx_rgb, idx_depth = 0, 1
+    idx_rgb, idx_depth, idx_center = 0, 1, 2
     n_traces = len(fig.data)
     marker_ids = [
         idx_marker_pose,
@@ -1003,12 +1313,15 @@ def plot_episode(
         idx_marker_stiff,
         idx_marker_torque,
     ]
+    window_ids = [idx_win_pose, idx_win_force, idx_win_stiff, idx_win_torque]
     if has_feedback_3d:
         idx_nom3d, idx_virt3d, idx_fb3d = n_traces - 3, n_traces - 2, n_traces - 1
         frame_trace_ids = [
             idx_rgb,
             idx_depth,
+            idx_center,
             *marker_ids,
+            *window_ids,
             idx_nom3d,
             idx_virt3d,
             idx_fb3d,
@@ -1018,45 +1331,62 @@ def plot_episode(
         frame_trace_ids = [
             idx_rgb,
             idx_depth,
+            idx_center,
             *marker_ids,
+            *window_ids,
             idx_nom3d,
             idx_virt3d,
         ]
 
-    frames = []
-    slider_steps = []
-    for step_i, k in enumerate(slider_idx):
-        k = int(k)
-        t_i = float(t_cmd[k])
+    def frame_payload(t_i: float, path_end: int, query_q: int) -> list:
+        """Images, playhead, query band, and 3D prefix through ``path_end``."""
         v_rgb = vision_index_for_time(t_i, rgb_times)
         v_depth = vision_index_for_time(t_i, depth_times)
-        frame_data = [
+        v_center = vision_index_for_time(t_i, center_times)
+        band0, band1 = query_bounds(query_q)
+        end = max(1, int(path_end))
+        data = [
             go.Image(source=rgb_sources[v_rgb]),
             go.Image(source=depth_sources[v_depth]),
+            go.Image(source=center_sources[v_center]),
             time_marker_scatter(t_i, pose_y0, pose_y1),
             time_marker_scatter(t_i, force_y0, force_y1),
             time_marker_scatter(t_i, stiff_y0, stiff_y1),
             time_marker_scatter(t_i, torque_y0, torque_y1),
+            query_window_scatter(band0, band1, pose_y0, pose_y1),
+            query_window_scatter(band0, band1, force_y0, force_y1),
+            query_window_scatter(band0, band1, stiff_y0, stiff_y1),
+            query_window_scatter(band0, band1, torque_y0, torque_y1),
             go.Scatter3d(
-                x=nom[: k + 1, 0].tolist(),
-                y=nom[: k + 1, 1].tolist(),
-                z=nom[: k + 1, 2].tolist(),
+                x=nom[:end, 0].tolist(),
+                y=nom[:end, 1].tolist(),
+                z=nom[:end, 2].tolist(),
             ),
             go.Scatter3d(
-                x=virt[: k + 1, 0].tolist(),
-                y=virt[: k + 1, 1].tolist(),
-                z=virt[: k + 1, 2].tolist(),
+                x=virt[:end, 0].tolist(),
+                y=virt[:end, 1].tolist(),
+                z=virt[:end, 2].tolist(),
             ),
         ]
         if has_feedback_3d:
             fb_n = feedback_prefix_len(t_i, fb_3d_times)
-            frame_data.append(
+            data.append(
                 go.Scatter3d(
                     x=fb_3d_pose[:fb_n, 0].tolist(),
                     y=fb_3d_pose[:fb_n, 1].tolist(),
                     z=fb_3d_pose[:fb_n, 2].tolist(),
                 )
             )
+        return data
+
+    frames = []
+    slider_steps = []
+    for step_i, k in enumerate(slider_idx):
+        k = int(k)
+        t_i = float(t_cmd[k])
+        frame_data = frame_payload(
+            t_i, k + 1, query_index_for_sample(k, h_end)
+        )
         frames.append(
             go.Frame(
                 name=str(step_i),
@@ -1079,6 +1409,29 @@ def plot_episode(
             }
         )
 
+    animate_args = {
+        "frame": {"duration": 0, "redraw": True},
+        "mode": "immediate",
+        "transition": {"duration": 0},
+    }
+    query_steps = []
+    for q in range(len(h_times)):
+        t_q, _t_end = query_bounds(q)
+        frames.append(
+            go.Frame(
+                name=f"q{q}",
+                data=frame_payload(t_q, int(h_end[q]), q),
+                traces=frame_trace_ids,
+            )
+        )
+        query_steps.append(
+            {
+                "args": [[f"q{q}"], animate_args],
+                "label": f"q{q} {t_q:.1f}s",
+                "method": "animate",
+            }
+        )
+
     fig.frames = frames
 
     # Tight 3D framing from full trajectory; fixed while path prefix grows
@@ -1096,37 +1449,48 @@ def plot_episode(
             y=0.98,
             yanchor="top",
         ),
-        height=1300,
-        width=1500,
-        margin=dict(t=90, r=220, b=130, l=80),
+        height=860,
+        autosize=True,
+        margin=dict(t=72, r=16, b=120, l=48),
         uirevision="episode-viewer",
         legend=dict(
-            orientation="v",
-            x=1.01,
-            y=1.0,
+            orientation="h",
+            x=0.0,
+            y=1.08,
             xanchor="left",
-            yanchor="top",
+            yanchor="bottom",
             bgcolor="rgba(255,255,255,0.85)",
             bordercolor="#cccccc",
             borderwidth=1,
-            font=dict(size=11),
+            font=dict(size=10),
             itemclick="toggle",
             itemdoubleclick="toggleothers",
             groupclick="toggleitem",
-            tracegroupgap=12,
+            tracegroupgap=10,
         ),
         sliders=[
             {
                 "active": 0,
-                "currentvalue": {"prefix": "t = ", "xanchor": "left"},
-                "pad": {"t": 20, "b": 10},
+                "currentvalue": {"prefix": "query ", "xanchor": "left"},
+                "pad": {"t": 8, "b": 0},
                 "x": 0.05,
-                "len": 0.75,
+                "len": 0.7,
                 "xanchor": "left",
                 "y": -0.02,
                 "yanchor": "top",
+                "steps": query_steps,
+            },
+            {
+                "active": 0,
+                "currentvalue": {"prefix": "t = ", "xanchor": "left"},
+                "pad": {"t": 28, "b": 4},
+                "x": 0.05,
+                "len": 0.7,
+                "xanchor": "left",
+                "y": -0.08,
+                "yanchor": "top",
                 "steps": slider_steps,
-            }
+            },
         ],
         updatemenus=[
             {
@@ -1134,7 +1498,7 @@ def plot_episode(
                 "direction": "left",
                 "showactive": False,
                 "x": 0.92,
-                "y": -0.02,
+                "y": -0.08,
                 "xanchor": "right",
                 "yanchor": "top",
                 "pad": {"t": 20, "r": 10},
@@ -1178,26 +1542,27 @@ def plot_episode(
         ),
     )
 
-    # Hide ticks on image panels
-    fig.update_xaxes(showticklabels=False, showgrid=False, zeroline=False, row=1, col=1)
-    fig.update_yaxes(
-        showticklabels=False, showgrid=False, zeroline=False, scaleanchor="x", row=1, col=1
-    )
-    fig.update_xaxes(showticklabels=False, showgrid=False, zeroline=False, row=2, col=1)
-    fig.update_yaxes(
-        showticklabels=False, showgrid=False, zeroline=False, scaleanchor="x2", row=2, col=1
-    )
+    for image_col in (1, 2, 3):
+        fig.update_xaxes(
+            showticklabels=False, showgrid=False, zeroline=False, row=1, col=image_col
+        )
+        fig.update_yaxes(
+            showticklabels=False, showgrid=False, zeroline=False, row=1, col=image_col
+        )
 
-    fig.update_xaxes(title_text="time (s)", row=6, col=1)
-    fig.update_yaxes(title_text="pos (m)", title_standoff=8, row=3, col=1)
-    fig.update_yaxes(title_text="force (N)", title_standoff=8, row=4, col=1)
-    fig.update_yaxes(title_text="stiffness (N/m)", title_standoff=8, row=5, col=1)
-    fig.update_yaxes(title_text="torque (Nm)", title_standoff=8, row=6, col=1)
-
-    # Share time axis across pose/force/stiffness/torque for easier reading
-    fig.update_xaxes(matches="x3", row=4, col=1)
-    fig.update_xaxes(matches="x3", row=5, col=1)
-    fig.update_xaxes(matches="x3", row=6, col=1)
+    fig.update_annotations(font=dict(size=12))
+    for plot_col, y_title in (
+        (1, "m"),
+        (2, "N"),
+        (3, "N/m"),
+        (4, "Nm"),
+    ):
+        fig.update_xaxes(title_text="time (s)", row=2, col=plot_col)
+        fig.update_yaxes(title_text=y_title, title_standoff=4, row=2, col=plot_col)
+    # Pose is the 4th xy subplot (x4); share its time zoom with the other plots.
+    fig.update_xaxes(matches="x4", row=2, col=2)
+    fig.update_xaxes(matches="x4", row=2, col=3)
+    fig.update_xaxes(matches="x4", row=2, col=4)
 
     if html_path is None:
         os.makedirs(save_dir or ".", exist_ok=True)
@@ -1208,7 +1573,14 @@ def plot_episode(
     else:
         os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
 
-    fig.write_html(html_path, include_plotlyjs="cdn", auto_open=False)
+    fig.write_html(
+        html_path,
+        include_plotlyjs="cdn",
+        auto_open=False,
+        config={"responsive": True},
+    )
+    _inject_config_panel(html_path, config_training, config_inference)
+    _inject_query_keys(html_path, h_times)
     print(f"Saved: {html_path}")
 
     if save_video:
