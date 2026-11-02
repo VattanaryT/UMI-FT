@@ -2,7 +2,7 @@
 date: 2026-10-29
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: d7d4d67
 status: in-progress
 artifacts:
   - /mnt/data/umidata/ft/data/control_log/r2_world_fixb_e35_rollout0_1793313455
