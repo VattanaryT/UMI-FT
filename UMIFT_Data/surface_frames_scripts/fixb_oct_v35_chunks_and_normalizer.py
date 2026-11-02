@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import pickle
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -41,11 +42,30 @@ from fixb_r4_chunk_filter import FIELD_JUMP_DEG, build_episode_mask_table
 ROOT = Path("/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb")
 ASSETS = Path(__file__).resolve().parent / "assets"
 RUNS = ("r1_world_world", "r2_world_fixb", "r4_world_fixb_tilt")
+# Default is the original October window. --h4s is the 4.0 s lookback retrain.
+# Wrench horizon is 118 because the measured median wrench rate is 29.3 Hz,
+# not the nominal 28 Hz (113 would cover 3.82 s).
 H = 24
 STRIDE = 1
 QUERY_DS = 2
 VAL_RATIO = 0.1
 SEED = 42
+TAG = "oct_v35"
+RGB_H, RGB_DS = 5, 4
+POSE_H, POSE_DS = 5, 16
+WRENCH_H, WRENCH_DS = 32, 1
+
+
+def apply_profile(name: str) -> None:
+    global H, TAG, RGB_H, POSE_H, WRENCH_H
+    if name == "h4s":
+        TAG = "oct_v35_h4s"
+        H = 64
+        RGB_H = 16
+        POSE_H = 51
+        WRENCH_H = 118
+    elif name != "short":
+        raise SystemExit(f"unknown profile {name}")
 
 
 def shape_meta(action_dim: int, with_delta_r: bool) -> dict:
@@ -82,11 +102,11 @@ def shape_meta(action_dim: int, with_delta_r: bool) -> dict:
         "sample": {
             "obs": {
                 "sparse": {
-                    "rgb_0": {"horizon": 5, "down_sample_steps": 4},
-                    "robot0_eef_pos": {"horizon": 5, "down_sample_steps": 16},
-                    "robot0_eef_rot_axis_angle": {"horizon": 5, "down_sample_steps": 16},
-                    "robot0_eef_wrench_left": {"horizon": 32, "down_sample_steps": 1},
-                    "robot0_eef_wrench_right": {"horizon": 32, "down_sample_steps": 1},
+                    "rgb_0": {"horizon": RGB_H, "down_sample_steps": RGB_DS},
+                    "robot0_eef_pos": {"horizon": POSE_H, "down_sample_steps": POSE_DS},
+                    "robot0_eef_rot_axis_angle": {"horizon": POSE_H, "down_sample_steps": POSE_DS},
+                    "robot0_eef_wrench_left": {"horizon": WRENCH_H, "down_sample_steps": WRENCH_DS},
+                    "robot0_eef_wrench_right": {"horizon": WRENCH_H, "down_sample_steps": WRENCH_DS},
                 }
             },
             "action": {"sparse": {"horizon": H, "down_sample_steps": STRIDE}},
@@ -330,7 +350,7 @@ def main() -> int:
     with tmp.open("wb") as f:
         pickle.dump(shared, f)
     digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
-    final = ASSETS / f"oct_v35_r2r4_action_normalizer_{digest[:12]}.pkl"
+    final = ASSETS / f"{TAG}_r2r4_action_normalizer_{digest[:12]}.pkl"
     tmp.replace(final)
     shared_copy = ROOT / "shared" / final.name
     shared_copy.write_bytes(final.read_bytes())
@@ -369,10 +389,17 @@ def main() -> int:
         "val": mask_fraction(indices["r4_world_fixb_tilt"]["val"], jumps),
     }
 
-    out = ROOT / "shared" / "oct_v35_chunk_normalizer.json"
+    report["profile"] = TAG
+    report["horizons"] = {
+        "rgb": [RGB_H, RGB_DS],
+        "pose": [POSE_H, POSE_DS],
+        "wrench": [WRENCH_H, WRENCH_DS],
+        "action": [H, STRIDE],
+    }
+    out = ROOT / "shared" / f"{TAG}_chunk_normalizer.json"
     out.write_text(json.dumps(report, indent=2))
     np.savez_compressed(
-        ROOT / "shared" / "oct_v35_chunk_index.npz",
+        ROOT / "shared" / f"{TAG}_chunk_index.npz",
         train=np.asarray(indices["r2_world_fixb"]["train"], dtype=np.int32),
         val=np.asarray(indices["r2_world_fixb"]["val"], dtype=np.int32),
         val_episode_ids=np.asarray(val_ids, dtype=np.int32),
@@ -393,4 +420,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        if sys.argv[1:] != ["--h4s"]:
+            raise SystemExit("usage: fixb_oct_v35_chunks_and_normalizer.py [--h4s]")
+        apply_profile("h4s")
     raise SystemExit(main())

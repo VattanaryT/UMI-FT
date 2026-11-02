@@ -1,0 +1,23 @@
+# October stringer_v3.5 Fix B r4, 4.0 s shared lookback, action chunk 64.
+# Inherits umift_oct_fixb_r4 (dataset class, ΔR mask, action dim 27).
+# Horizons only. Strides stay 4 / 16 / 1. Depth matches RGB. Gripper stays 1.
+# Wrench horizon is 118, not 113: measured median wrench rate is 29.3 Hz.
+#   (118-1)/29.311 = 3.99 s. RGB (16-1)*4/14.997 = 4.00 s.
+#   Pose (51-1)*16/200.08 = 4.00 s. Action (64-1)/14.997 = 4.20 s demo future.
+# Do not reuse oct_v35_r2r4_action_normalizer_1ddfa2b4331f.pkl.
+defaults:
+  - umift_oct_fixb_r4
+  - _self_
+
+name: OCT-V35-FIXB-R4-H4S
+
+sparse_obs_rgb_horizon: 16
+sparse_obs_depth_horizon: 16
+sparse_obs_low_dim_horizon: 51
+sparse_obs_mold_horizon: 51
+sparse_obs_wrench_horizon: 118
+sparse_action_horizon: 64
+
+dataset:
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r2r4_action_normalizer_3b0863c14453.pkl
+  action_normalizer_sha256: 3b0863c144530d4b68f3ec1e3e933e291fcbf9601e273c921f00698d4c9dbd5b
