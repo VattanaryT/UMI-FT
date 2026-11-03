@@ -2,7 +2,7 @@
 date: 2026-11-03
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: 120be1e
 status: in-progress
 artifacts: []
 ---
