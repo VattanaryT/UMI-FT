@@ -87,6 +87,7 @@ EXTRA_OVERRIDES=(
   "training.log_gradient_norm=true"
   "training.log_per_dim_action_loss=true"
   "checkpoint.topk.k=1000"
+  "task.drop_depth_inputs=true"
 )
 if [[ "${RUN}" == "r4_world_fixb_tilt" ]]; then
   EXTRA_OVERRIDES+=(
@@ -113,6 +114,6 @@ apptainer exec "${APPTAINER_ARGS[@]}" "${SIF}" \
     training.checkpoint_every=5 \
     logging.name="${RUN_TITLE}" \
     logging.group="oct_v35_fixb_scan20261008" \
-    "logging.tags=[oct_v35_fixb,${RUN},fixb_v4_tracked,stringer_v3.5,scan_20261008,weirdlab,l40s,e200,bs160]" \
+    "logging.tags=[oct_v35_fixb,${RUN},fixb_v4_tracked,stringer_v3.5,scan_20261008,weirdlab,l40s,e200,bs160,no_depth]" \
     hydra.run.dir="/checkpoints/${RUN_TITLE}" \
     "${EXTRA_OVERRIDES[@]}"

@@ -8,6 +8,8 @@ defaults:
 
 name: OCT-V35-FIXB-R1REL-H4S
 
+drop_depth_inputs: true
+
 sparse_obs_rgb_horizon: 16
 sparse_obs_depth_horizon: 16
 sparse_obs_low_dim_horizon: 51

@@ -13,6 +13,7 @@
 #SBATCH --error=/gscratch/weirdlab/vtevy/logs/fixb/%j.err
 
 # October stringer_v3.5 Fix B with a 4.0 s lookback and action horizon 64.
+# Depth is not an input (task.drop_depth_inputs). RGB and mold geom stay.
 # Same zarrs as fixb_train_oct_v35_klone.sbatch. New task yaml and normalizer.
 # Start at batch 32 (one optimizer step, no accumulation). Raise the batch
 # after the first epoch fits. Do not point this at the short-horizon ckpt dirs.
@@ -81,6 +82,7 @@ EXTRA_OVERRIDES=(
   "training.log_gradient_norm=true"
   "training.log_per_dim_action_loss=true"
   "checkpoint.topk.k=1000"
+  "task.drop_depth_inputs=true"
 )
 if [[ "${RUN}" == "r4_world_fixb_tilt" ]]; then
   EXTRA_OVERRIDES+=(
@@ -107,6 +109,6 @@ apptainer exec "${APPTAINER_ARGS[@]}" "${SIF}" \
     training.checkpoint_every=5 \
     logging.name="${RUN_TITLE}" \
     logging.group="oct_v35_h4s_scan20261008" \
-    "logging.tags=[oct_v35_h4s,${RUN},fixb_v4_tracked,stringer_v35,scan_20261008,l40s,e200,bs32]" \
+    "logging.tags=[oct_v35_h4s,${RUN},fixb_v4_tracked,stringer_v35,scan_20261008,l40s,e200,bs32,no_depth]" \
     hydra.run.dir="/checkpoints/${RUN_TITLE}" \
     "${EXTRA_OVERRIDES[@]}"

@@ -10,6 +10,7 @@ import sys
 import hydra
 from omegaconf import OmegaConf
 
+from diffusion_policy.common.drop_depth_inputs import apply_drop_depth_inputs
 from diffusion_policy.common.drop_scan_inputs import apply_drop_scan_inputs
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
 
@@ -31,6 +32,7 @@ def main(cfg: OmegaConf):
     # Before resolve, shape_meta interpolations still point at task.shape_meta,
     # so one deletion removes the scan branch from the policy and the dataset.
     apply_drop_scan_inputs(cfg)
+    apply_drop_depth_inputs(cfg)
     # resolve immediately so all the ${now:} resolvers
     # will use the same time.
     OmegaConf.resolve(cfg)
