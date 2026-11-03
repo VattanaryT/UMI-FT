@@ -16,6 +16,6 @@ shape_meta:
 
 dataset:
   action_normalizer_role: r1rel
-  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_r1rel_action_pose_normalizer_fdec6dfe2027.pkl
-  action_normalizer_sha256: fdec6dfe2027a53f1cd6541a5d1fe536187ce530a9cf6eade01cdabd56e3ddcb
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_r1rel_action_pose_normalizer_64e3aa3c37f5.pkl
+  action_normalizer_sha256: 64e3aa3c37f507449b44bcddd7e3e3d9f3d11f47290cb75310a349d61f603b03
   pose_jump_flag_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_pose_jump_flags.npz

@@ -120,17 +120,19 @@ def _collect_unflagged(ds: UmiFTDataset, flags: dict):
         action_idx = action_indices_for_query(ds, int(epi_id), int(rgb_id))
         keep = keep_weight(flags[f"episode_{int(epi_id)}"], action_idx, action.shape[0])
         actions.append(action[keep > 0])
-        positions.append(pos.reshape(-1, pos.shape[-1]))
+        positions.append(pos)
         rotations.append(rot.reshape(-1, rot.shape[-1]))
         n_kept += int(np.sum(keep > 0))
         n_dropped += int(np.sum(keep == 0))
         if i % 4000 == 0:
             print(f"[collect] {i}/{len(ds.sampler.indices)}", flush=True)
     print(f"[collect] unflagged action steps {n_kept}  dropped {n_dropped}")
+    pos_h = np.stack(positions, axis=0)
     return (
         np.concatenate(actions, axis=0),
-        np.concatenate(positions, axis=0),
+        pos_h.reshape(-1, pos_h.shape[-1]),
         np.concatenate(rotations, axis=0),
+        pos_h,
     )
 
 
@@ -225,13 +227,28 @@ def main() -> int:
     _sanity(rel_ds)
 
     flags = load_flags(FLAG_NPZ)
-    print("[fit] unflagged steps, clipped to the 0.5–99.5 percentiles")
-    action_rows, pos_rows, rot_rows = _collect_unflagged(rel_ds, flags)
+    print("[fit] action: unflagged steps, 0.5–99.5 percentile scale only")
+    print("[fit] eef_pos: unclipped min/max (percentile scale saturates >1%)")
+    action_rows, pos_rows, rot_rows, pos_h = _collect_unflagged(rel_ds, flags)
+    pct = _clip_percentile(pos_rows)
+    # Bounds the percentile fit would have used. Training values are not clipped.
+    pct_min = pct.min(axis=0)
+    pct_max = pct.max(axis=0)
+    outside = (pos_h < pct_min) | (pos_h > pct_max)
+    print(
+        f"[eef_pos] scalar saturate {outside.mean():.4%}  "
+        f"any-dim {outside.any(axis=2).mean():.4%}"
+    )
+    for t in range(pos_h.shape[1]):
+        step = outside[:, t]
+        mag = np.linalg.norm(pos_h[:, t], axis=1)
+        print(
+            f"[eef_pos] horizon[{t}] saturate {step.mean():.4%}  "
+            f"|p| p50/p99/max {np.percentile(mag,[50,99]).round(4)} {mag.max():.4f}"
+        )
     saved = LinearNormalizer()
     saved["action"] = _fit_action(action_rows)
-    saved["robot0_eef_pos"] = get_range_normalizer_from_stat(
-        array_to_stats(_clip_percentile(pos_rows))
-    )
+    saved["robot0_eef_pos"] = get_range_normalizer_from_stat(array_to_stats(pos_rows))
     saved["robot0_eef_rot_axis_angle"] = get_identity_normalizer_from_stat(
         array_to_stats(rot_rows)
     )

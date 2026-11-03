@@ -17,11 +17,17 @@
 # Fix B on stringer_v3.5 (October, no scans). One GPU job per run.
 # Data is not on Hyak until it is copied to DATA_ROOT. Do not submit before that.
 #
+# Hyak checkout is the train tag, not a floating branch tip:
+#   cd /gscratch/weirdlab/vtevy/UMI-FT-fixb
+#   git fetch origin tag r1rel-train-2026-11-02
+#   git checkout r1rel-train-2026-11-02
+#
 #   RUN=r1_world_world      sbatch fixb_train_oct_v35_klone.sbatch
 #   RUN=r2_world_fixb       sbatch fixb_train_oct_v35_klone.sbatch
 #   RUN=r4_world_fixb_tilt  sbatch fixb_train_oct_v35_klone.sbatch
 #   RUN=r1rel_world         sbatch fixb_train_oct_v35_klone.sbatch
 # r1rel uses the r1_world_world zarr and a relative-pose normalizer.
+# r1rel and r4 both load assets/oct_v35_pose_jump_flags.npz.
 
 set -euo pipefail
 
@@ -33,7 +39,7 @@ case "${RUN}" in
   r1rel_world)
     TASK=umift_oct_fixb_r1rel
     DATA_HOST_OVERRIDE="${DATA_ROOT:-/gscratch/scrubbed/vtevy/umidata/mold_aware_datasets/stringer_v3.5_fixb}/r1_world_world"
-    NORM_FILE=oct_v35_r1rel_action_pose_normalizer_fdec6dfe2027.pkl
+    NORM_FILE=oct_v35_r1rel_action_pose_normalizer_64e3aa3c37f5.pkl
     ;;
   *) echo "bad RUN=${RUN}"; exit 1 ;;
 esac
