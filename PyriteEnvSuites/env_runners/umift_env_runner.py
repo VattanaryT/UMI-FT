@@ -375,20 +375,22 @@ def make_rollout_id(ckpt_path: str, episode_id: int, ts: Optional[int] = None) -
     return f"{policy}_e{epoch}_rollout{int(episode_id)}_{ts}"
 
 
-# Relative actions are current_TCP @ delta. A healthy first step is a few mm
-# from the measured TCP. Reject the chunk above this instead of commanding it.
-RELATIVE_FIRST_POSE_GATE_M = 0.025
-RELATIVE_FIRST_POSE_GATE_DEG = 10.0
+# Pose-action chunks (absolute fixture r1 and relative r1rel) should start at
+# the measured TCP. The r1 epoch-195 spike was an absolute pose. Reject the
+# chunk above this instead of commanding it. Fix B r2/r3/r4 are decoded
+# separately and are not passed through this gate.
+FIRST_POSE_GATE_M = 0.025
+FIRST_POSE_GATE_DEG = 10.0
 
 
-def relative_first_pose_ok(target_se3: np.ndarray, current_pose7: np.ndarray) -> Tuple[bool, float, float]:
+def first_pose_ok(target_se3: np.ndarray, current_pose7: np.ndarray) -> Tuple[bool, float, float]:
     """True when the first commanded pose is within 25 mm and 10 deg of the TCP."""
     cur = su.pose7_to_SE3(np.asarray(current_pose7, dtype=np.float64).reshape(7))
     step0 = np.asarray(target_se3, dtype=np.float64).reshape(-1, 4, 4)[0]
     dist_m = float(np.linalg.norm(step0[:3, 3] - cur[:3, 3]))
     rel = cur[:3, :3].T @ step0[:3, :3]
     ang_deg = float(np.degrees(np.linalg.norm(Rotation.from_matrix(rel).as_rotvec())))
-    ok = dist_m <= RELATIVE_FIRST_POSE_GATE_M and ang_deg <= RELATIVE_FIRST_POSE_GATE_DEG
+    ok = dist_m <= FIRST_POSE_GATE_M and ang_deg <= FIRST_POSE_GATE_DEG
     return ok, dist_m, ang_deg
 
 
@@ -1432,12 +1434,21 @@ def main():
         f"[frames] pose_frames obs={pose_frames['obs']} action={pose_frames['action']} "
         f"sparse_execution_horizon={control_para['sparse_execution_horizon']}"
     )
+    pose_action = mold_run_type not in (
+        "r2_world_fixb",
+        "r3_surface_fixb",
+        "r4_world_fixb_tilt",
+    )
     if relative_action:
         print(
             "[frames] relative action: action21_postprocess is current_TCP @ delta "
-            f"(not fixture-absolute). First-pose gate "
-            f"{RELATIVE_FIRST_POSE_GATE_M * 1000:.0f} mm / "
-            f"{RELATIVE_FIRST_POSE_GATE_DEG:.0f} deg is on."
+            "(not fixture-absolute)."
+        )
+    if pose_action:
+        print(
+            f"[frames] first-pose gate {FIRST_POSE_GATE_M * 1000:.0f} mm / "
+            f"{FIRST_POSE_GATE_DEG:.0f} deg is on "
+            f"({pose_frames['action']} pose action)."
         )
 
     # Diagnostics for the scan CNN branch (hooks only read tensors).
@@ -1975,10 +1986,16 @@ def main():
             except Exception as exc:
                 print(f"[scan-enc] display/monitor error (ignored): {exc}")
 
-            if relative_action:
+            # Pose actions only. Fix B decode replaces the target mats and is
+            # not a fixture/relative pose prediction.
+            if mold_run_type not in (
+                "r2_world_fixb",
+                "r3_surface_fixb",
+                "r4_world_fixb_tilt",
+            ):
                 gate_bad = []
                 for id in id_list:
-                    ok, dist_m, ang_deg = relative_first_pose_ok(
+                    ok, dist_m, ang_deg = first_pose_ok(
                         action_sparse_target_mats[id],
                         obs_raw[f"ts_pose_fb_{id}"][-1],
                     )

@@ -16,12 +16,24 @@ import torch
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
+from diffusion_policy.common.normalize_util import (
+    array_to_stats,
+    concatenate_normalizer,
+    get_identity_normalizer_from_stat,
+    get_range_normalizer_from_stat,
+)
 from diffusion_policy.dataset.umift_dataset import UmiFTDataset
 from diffusion_policy.model.common.normalizer import LinearNormalizer
 from PyriteConfig.tasks.umift.umift_type_conversions import action21_postprocess
 from PyriteUtility.spatial_math import spatial_utilities as su
 
 from fixb_dataset import R1REL_NORMALIZER_KEYS
+from fixb_pose_jump import FLAG_NPZ, action_indices_for_query, keep_weight, load_flags
+
+# Range-normalized action dims. Rot6d stays an identity normalizer.
+RANGE_SLICES = ((0, 3), (9, 12), (18, 19), (19, 20), (20, 21))
+P_LO = 0.5
+P_HI = 99.5
 
 ROOT = Path(__file__).resolve().parents[2]
 TRAIN_CFG = ROOT / "PyriteML" / "diffusion_policy" / "config"
@@ -68,10 +80,64 @@ def _minmax(normalizer, key: str):
     return mn, mx
 
 
+def _clip_percentile(values: np.ndarray) -> np.ndarray:
+    lo = np.percentile(values, P_LO, axis=0)
+    hi = np.percentile(values, P_HI, axis=0)
+    return np.clip(values, lo, hi).astype(np.float32)
+
+
+def _fit_action(rows: np.ndarray):
+    pieces = []
+    cursor = 0
+    for start, stop in RANGE_SLICES:
+        if start != cursor:
+            pieces.append(
+                get_identity_normalizer_from_stat(array_to_stats(rows[:, cursor:start]))
+            )
+        clipped = _clip_percentile(rows[:, start:stop])
+        pieces.append(get_range_normalizer_from_stat(array_to_stats(clipped)))
+        cursor = stop
+    if cursor != rows.shape[1]:
+        pieces.append(
+            get_identity_normalizer_from_stat(array_to_stats(rows[:, cursor:]))
+        )
+    return concatenate_normalizer(pieces)
+
+
+def _collect_unflagged(ds: UmiFTDataset, flags: dict):
+    ds.sampler.ignore_rgb(True)
+    actions = []
+    positions = []
+    rotations = []
+    n_kept = 0
+    n_dropped = 0
+    for i, (epi_id, rgb_id) in enumerate(ds.sampler.indices):
+        _obs, action_sample = ds.sampler.sample_sequence(i)
+        action = np.asarray(action_sample["sparse"], dtype=np.float32)
+        sparse = _obs["sparse"]
+        pos = np.asarray(sparse["robot0_eef_pos"], dtype=np.float32)
+        rot = np.asarray(sparse["robot0_eef_rot_axis_angle"], dtype=np.float32)
+        action_idx = action_indices_for_query(ds, int(epi_id), int(rgb_id))
+        keep = keep_weight(flags[f"episode_{int(epi_id)}"], action_idx, action.shape[0])
+        actions.append(action[keep > 0])
+        positions.append(pos.reshape(-1, pos.shape[-1]))
+        rotations.append(rot.reshape(-1, rot.shape[-1]))
+        n_kept += int(np.sum(keep > 0))
+        n_dropped += int(np.sum(keep == 0))
+        if i % 4000 == 0:
+            print(f"[collect] {i}/{len(ds.sampler.indices)}", flush=True)
+    print(f"[collect] unflagged action steps {n_kept}  dropped {n_dropped}")
+    return (
+        np.concatenate(actions, axis=0),
+        np.concatenate(positions, axis=0),
+        np.concatenate(rotations, axis=0),
+    )
+
+
 def _print_action_table(rel_norm, abs_norm):
     rel_mn, rel_mx = _minmax(rel_norm, "action")
     abs_mn, abs_mx = _minmax(abs_norm, "action")
-    print("action dim  r1rel_min  r1rel_max  r1_abs_min  r1_abs_max")
+    print("action dim  new_min  new_max  previous_min  previous_max")
     for i in range(21):
         print(
             f"{i:5d}  {rel_mn[i]:10.4g}  {rel_mx[i]:10.4g}  "
@@ -132,11 +198,10 @@ def _sanity(ds: UmiFTDataset) -> None:
 
 def main() -> int:
     rel_cfg = _compose("umift_oct_fixb_r1rel")
-    abs_cfg = _compose("umift_oct_fixb_r1")
     frames = rel_cfg["shape_meta"]["pose_frames"]
     if frames["obs"] != "relative" or frames["action"] != "relative":
         raise RuntimeError(f"r1rel pose_frames {frames}")
-    if rel_cfg["dataset_path"] != ZARR or abs_cfg["dataset_path"] != ZARR:
+    if rel_cfg["dataset_path"] != ZARR:
         raise RuntimeError("dataset_path is not the October r1 zarr")
     sample = rel_cfg["shape_meta"]["sample"]
     if int(sample["action"]["sparse"]["horizon"]) != 24:
@@ -146,8 +211,6 @@ def main() -> int:
 
     print("[load] relative")
     rel_ds = _dataset(rel_cfg)
-    print("[load] absolute r1")
-    abs_ds = _dataset(abs_cfg)
     keys = list(rel_ds.replay_buffer["data"].keys())
     val_ids = [int(k.split("_")[-1]) for k, m in zip(keys, rel_ds.val_mask) if m]
     n_train = len(rel_ds)
@@ -157,21 +220,27 @@ def main() -> int:
         raise RuntimeError(f"chunk counts {n_train}/{n_val}, expected 20207/2055")
     if sorted(val_ids) != [9, 12, 28, 37, 41]:
         raise RuntimeError(f"val episodes {val_ids}")
-    if len(abs_ds) != n_train:
-        raise RuntimeError("absolute r1 train count differs")
 
     print("[sanity]")
     _sanity(rel_ds)
 
-    print("[fit] relative")
-    rel_norm, _ = rel_ds.get_normalizer()
-    print("[fit] absolute r1")
-    abs_norm, _ = abs_ds.get_normalizer()
-    _print_action_table(rel_norm, abs_norm)
-
+    flags = load_flags(FLAG_NPZ)
+    print("[fit] unflagged steps, clipped to the 0.5–99.5 percentiles")
+    action_rows, pos_rows, rot_rows = _collect_unflagged(rel_ds, flags)
     saved = LinearNormalizer()
-    for key in R1REL_NORMALIZER_KEYS:
-        saved[key] = rel_norm[key]
+    saved["action"] = _fit_action(action_rows)
+    saved["robot0_eef_pos"] = get_range_normalizer_from_stat(
+        array_to_stats(_clip_percentile(pos_rows))
+    )
+    saved["robot0_eef_rot_axis_angle"] = get_identity_normalizer_from_stat(
+        array_to_stats(rot_rows)
+    )
+    previous_path = ASSETS / (
+        "oct_v35_r1rel_action_pose_normalizer_b51ef4dc779f.pkl"
+    )
+    with previous_path.open("rb") as f:
+        previous = pickle.load(f)
+    _print_action_table(saved, previous)
     ASSETS.mkdir(parents=True, exist_ok=True)
     tmp = ASSETS / "oct_v35_r1rel_action_pose_normalizer_tmp.pkl"
     with tmp.open("wb") as f:

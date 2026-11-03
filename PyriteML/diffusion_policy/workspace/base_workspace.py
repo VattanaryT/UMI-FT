@@ -2,6 +2,7 @@ import copy
 import pathlib
 import secrets
 import string
+import subprocess
 import threading
 from typing import Optional
 
@@ -10,6 +11,24 @@ import torch
 import wandb
 from hydra.core.hydra_config import HydraConfig
 from omegaconf import OmegaConf
+
+
+def _git_rev_parse_head() -> str:
+    """`git rev-parse HEAD` of the checkout that contains this file."""
+    here = pathlib.Path(__file__).resolve()
+    for directory in [here.parent, *here.parents]:
+        if not (directory / ".git").exists():
+            continue
+        try:
+            return subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=directory,
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            return f"unavailable:{exc}"
+    return "unavailable:no-git-dir"
 
 
 class BaseWorkspace:
@@ -109,7 +128,12 @@ class BaseWorkspace:
             include_keys = tuple(self.include_keys) + ("_output_dir",)
 
         path.parent.mkdir(parents=False, exist_ok=True)
-        payload = {"cfg": self.cfg, "state_dicts": dict(), "pickles": dict()}
+        payload = {
+            "cfg": self.cfg,
+            "state_dicts": dict(),
+            "pickles": dict(),
+            "git_rev": _git_rev_parse_head(),
+        }
 
         for key, value in self.__dict__.items():
             if hasattr(value, "state_dict") and hasattr(value, "load_state_dict"):

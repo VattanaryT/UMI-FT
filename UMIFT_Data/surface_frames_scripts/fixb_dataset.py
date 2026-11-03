@@ -31,6 +31,7 @@ from PyriteConfig.tasks.umift.umift_type_conversions import (
 )
 from threadpoolctl import threadpool_limits
 
+from fixb_pose_jump import load_flags, log_pose_jump_mask, loss_weight_for_query
 from fixb_r4_chunk_filter import FIELD_JUMP_DEG, build_episode_mask_table
 
 # Vendored copy of the r2 Hyak fit (job 41907426, 2026-10-16). Dims 0:21 of that
@@ -129,12 +130,14 @@ class UmiFTDatasetR4(UmiFTDataset):
         field_jump_deg: float = FIELD_JUMP_DEG,
         filter_stats_path: str | None = None,
         r2_action_normalizer_path: str | None = str(DEFAULT_R2_ACTION_NORMALIZER),
+        pose_jump_flag_path: str | None = None,
         **kwargs,
     ):
         self._r4_mask = bool(mask_delta_R_after_field_jumps)
         self._r4_jump_deg = float(field_jump_deg)
         self._r4_filter_stats_path = filter_stats_path
         self._r2_action_normalizer_path = r2_action_normalizer_path
+        self._pose_jump_flag_path = pose_jump_flag_path
         super().__init__(shape_meta=shape_meta, dataset_path=dataset_path, **kwargs)
         self._r4_field_jump: Dict[str, np.ndarray] = {}
         self._r4_mask_stats: Dict[str, float] = {}
@@ -145,6 +148,14 @@ class UmiFTDatasetR4(UmiFTDataset):
             self._r4_field_jump = {k: v["field_jump"] for k, v in table.items()}
             self._r4_mask_stats = self._log_delta_R_mask_fraction(train=True)
             self._write_filter_stats(split="train", stats=self._r4_mask_stats)
+        self._pose_jump_flags = (
+            load_flags(pose_jump_flag_path) if pose_jump_flag_path else None
+        )
+        self._pose_jump_stats = {}
+        if self._pose_jump_flags is not None:
+            self._pose_jump_stats = log_pose_jump_mask(
+                self, self._pose_jump_flags, "train"
+            )
 
     def _write_filter_stats(self, split: str, stats: dict) -> None:
         """Best-effort JSON dump; skip if path unset or filesystem is read-only (Hyak /data)."""
@@ -256,14 +267,20 @@ class UmiFTDatasetR4(UmiFTDataset):
             "obs": dict_apply(obs_dict, torch.from_numpy),
             "action": dict_apply(action_array, torch.from_numpy),
         }
+        epi_id, rgb_id = self.sampler.indices[idx]
+        act = torch_data["action"]["sparse"]
+        H, D = int(act.shape[0]), int(act.shape[1])
         if self._r4_mask:
-            epi_id, rgb_id = self.sampler.indices[idx]
-            act = torch_data["action"]["sparse"]
-            H, D = int(act.shape[0]), int(act.shape[1])
             w = self._delta_R_weight_for_query(epi_id, rgb_id, H, D)
-            torch_data["action_loss_weight"] = {
-                "sparse": torch.from_numpy(w),
-            }
+        else:
+            w = np.ones((H, D), dtype=np.float32)
+        if self._pose_jump_flags is not None:
+            jump = loss_weight_for_query(
+                self, self._pose_jump_flags, int(epi_id), int(rgb_id), H, D
+            )
+            w = w * jump
+        if self._r4_mask or self._pose_jump_flags is not None:
+            torch_data["action_loss_weight"] = {"sparse": torch.from_numpy(w)}
         return torch_data
 
     def get_validation_dataset(self):
@@ -289,6 +306,8 @@ class UmiFTDatasetR4(UmiFTDataset):
             val_set._r4_mask = True
             stats = val_set._log_delta_R_mask_fraction(train=False)
             val_set._write_filter_stats(split="val", stats=stats)
+        if self._pose_jump_flags is not None:
+            log_pose_jump_mask(val_set, self._pose_jump_flags, "val")
         return val_set
 
     def get_normalizer(self, **kwargs):
@@ -434,6 +453,7 @@ class UmiFTDatasetOctNorm(UmiFTDataset):
         action_normalizer_path: str,
         action_normalizer_sha256: str,
         action_normalizer_role: str,
+        pose_jump_flag_path: str | None = None,
         **kwargs,
     ):
         if action_normalizer_role not in ("r1", "r2", "r1rel"):
@@ -441,7 +461,35 @@ class UmiFTDatasetOctNorm(UmiFTDataset):
         self._an_path = action_normalizer_path
         self._an_sha = action_normalizer_sha256
         self._an_role = action_normalizer_role
+        self._pose_jump_flag_path = pose_jump_flag_path
         super().__init__(shape_meta=shape_meta, dataset_path=dataset_path, **kwargs)
+        self._pose_jump_flags = (
+            load_flags(pose_jump_flag_path) if pose_jump_flag_path else None
+        )
+        self._pose_jump_stats = {}
+        if self._pose_jump_flags is not None:
+            self._pose_jump_stats = log_pose_jump_mask(
+                self, self._pose_jump_flags, "train"
+            )
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        torch_data = super().__getitem__(idx)
+        if self._pose_jump_flags is None:
+            return torch_data
+        epi_id, rgb_id = self.sampler.indices[idx]
+        act = torch_data["action"]["sparse"]
+        H, D = int(act.shape[0]), int(act.shape[1])
+        w = loss_weight_for_query(
+            self, self._pose_jump_flags, int(epi_id), int(rgb_id), H, D
+        )
+        torch_data["action_loss_weight"] = {"sparse": torch.from_numpy(w)}
+        return torch_data
+
+    def get_validation_dataset(self):
+        val_set = super().get_validation_dataset()
+        if self._pose_jump_flags is not None:
+            log_pose_jump_mask(val_set, self._pose_jump_flags, "val")
+        return val_set
 
     def get_normalizer(self, **kwargs):
         sparse, dense = super().get_normalizer(**kwargs)

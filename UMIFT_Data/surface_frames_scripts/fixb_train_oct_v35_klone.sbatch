@@ -33,7 +33,7 @@ case "${RUN}" in
   r1rel_world)
     TASK=umift_oct_fixb_r1rel
     DATA_HOST_OVERRIDE="${DATA_ROOT:-/gscratch/scrubbed/vtevy/umidata/mold_aware_datasets/stringer_v3.5_fixb}/r1_world_world"
-    NORM_FILE=oct_v35_r1rel_action_pose_normalizer_b51ef4dc779f.pkl
+    NORM_FILE=oct_v35_r1rel_action_pose_normalizer_fdec6dfe2027.pkl
     ;;
   *) echo "bad RUN=${RUN}"; exit 1 ;;
 esac
@@ -85,6 +85,11 @@ EXTRA_OVERRIDES=(
 if [[ "${RUN}" == "r4_world_fixb_tilt" ]]; then
   EXTRA_OVERRIDES+=(
     "task.dataset.filter_stats_path=/checkpoints/${RUN_TITLE}/r4_delta_R_mask_stats.json"
+  )
+fi
+if [[ "${RUN}" == "r1rel_world" || "${RUN}" == "r4_world_fixb_tilt" ]]; then
+  EXTRA_OVERRIDES+=(
+    "task.dataset.pose_jump_flag_path=/opt/umift/UMIFT_Data/surface_frames_scripts/assets/oct_v35_pose_jump_flags.npz"
   )
 fi
 
