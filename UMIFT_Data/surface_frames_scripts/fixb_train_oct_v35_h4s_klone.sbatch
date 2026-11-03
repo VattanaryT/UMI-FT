@@ -17,26 +17,32 @@
 # Start at batch 32 (one optimizer step, no accumulation). Raise the batch
 # after the first epoch fits. Do not point this at the short-horizon ckpt dirs.
 #
+#   RUN=r1rel_world        sbatch fixb_train_oct_v35_h4s_klone.sbatch
+#   RUN=r2_world_fixb      sbatch fixb_train_oct_v35_h4s_klone.sbatch
 #   RUN=r4_world_fixb_tilt sbatch fixb_train_oct_v35_h4s_klone.sbatch
-#   RUN=r1_world_world     sbatch fixb_train_oct_v35_h4s_klone.sbatch
-#   RUN=r2_world_fixb      sbatch --account=cse --mem=256G fixb_train_oct_v35_h4s_klone.sbatch
+# r1rel uses the r1_world_world zarr. Skip r1_world_world (absolute fixture pose).
 #
 # CSE has 256G nodes. The file default is weirdlab 320G.
 
 set -euo pipefail
 
-RUN="${RUN:?set RUN=r1_world_world|r2_world_fixb|r4_world_fixb_tilt}"
+RUN="${RUN:?set RUN=r1rel_world|r2_world_fixb|r4_world_fixb_tilt|r1_world_world}"
 case "${RUN}" in
   r1_world_world) TASK=umift_oct_fixb_r1_h4s ;;
   r2_world_fixb) TASK=umift_oct_fixb_r2_h4s ;;
   r4_world_fixb_tilt) TASK=umift_oct_fixb_r4_h4s ;;
+  r1rel_world)
+    TASK=umift_oct_fixb_r1rel_h4s
+    DATA_HOST_OVERRIDE="${DATA_ROOT:-/gscratch/scrubbed/vtevy/umidata/mold_aware_datasets/stringer_v3.5_fixb}/r1_world_world"
+    NORM_FILE=oct_v35_h4s_r1rel_action_pose_normalizer_5505c6604004.pkl
+    ;;
   *) echo "bad RUN=${RUN}"; exit 1 ;;
 esac
 
 SIF="${SIF:-/gscratch/weirdlab/vtevy/images/umift-train_v3.sif}"
 UMIFT_HOST="${UMIFT_HOST:-/gscratch/weirdlab/vtevy/UMI-FT-fixb}"
 DATA_ROOT="${DATA_ROOT:-/gscratch/scrubbed/vtevy/umidata/mold_aware_datasets/stringer_v3.5_fixb}"
-DATA_HOST="${DATA_ROOT}/${RUN}"
+DATA_HOST="${DATA_HOST_OVERRIDE:-${DATA_ROOT}/${RUN}}"
 CKPT_HOST="${CKPT_HOST:-/gscratch/weirdlab/vtevy/training_outputs/oct_v35_h4s_fixb_${RUN}}"
 WANDB_ENV="${WANDB_ENV:-/gscratch/weirdlab/vtevy/wandb.env}"
 SCRIPTS="/opt/umift/UMIFT_Data/surface_frames_scripts"
@@ -79,6 +85,11 @@ EXTRA_OVERRIDES=(
 if [[ "${RUN}" == "r4_world_fixb_tilt" ]]; then
   EXTRA_OVERRIDES+=(
     "task.dataset.filter_stats_path=/checkpoints/${RUN_TITLE}/r4_delta_R_mask_stats.json"
+  )
+fi
+if [[ "${RUN}" == "r1rel_world" || "${RUN}" == "r4_world_fixb_tilt" ]]; then
+  EXTRA_OVERRIDES+=(
+    "task.dataset.pose_jump_flag_path=/opt/umift/UMIFT_Data/surface_frames_scripts/assets/oct_v35_pose_jump_flags.npz"
   )
 fi
 

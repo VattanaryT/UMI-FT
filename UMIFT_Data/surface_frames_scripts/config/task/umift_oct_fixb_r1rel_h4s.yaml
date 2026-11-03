@@ -1,0 +1,20 @@
+# October stringer_v3.5 r1rel, 4.0 s shared lookback, action chunk 64.
+# Inherits umift_oct_fixb_r1rel: relative obs, relative action, mold geom,
+# pose-jump mask. Same windows as umift_oct_fixb_r2_h4s. Not the fixture-frame
+# r1 task. Do not reuse the horizon-24 r1rel normalizer.
+defaults:
+  - umift_oct_fixb_r1rel
+  - _self_
+
+name: OCT-V35-FIXB-R1REL-H4S
+
+sparse_obs_rgb_horizon: 16
+sparse_obs_depth_horizon: 16
+sparse_obs_low_dim_horizon: 51
+sparse_obs_mold_horizon: 51
+sparse_obs_wrench_horizon: 118
+sparse_action_horizon: 64
+
+dataset:
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r1rel_action_pose_normalizer_5505c6604004.pkl
+  action_normalizer_sha256: 5505c660400430f05dd4202e9fb55b30c67be97e6b657fd851c9ea2ad05d5e33

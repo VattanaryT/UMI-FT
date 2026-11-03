@@ -3,10 +3,14 @@
 
 Uses the same train chunks as umift_oct_fixb_r1 (pose_frames relative). Saves
 action + robot0_eef_pos + robot0_eef_rot_axis_angle. Does not submit a job.
+
+  python fixb_oct_v35_r1rel_normalizer.py          # horizon 24
+  python fixb_oct_v35_r1rel_normalizer.py --h4s    # 4.0 s windows, action 64
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import pickle
 from pathlib import Path
@@ -199,17 +203,33 @@ def _sanity(ds: UmiFTDataset) -> None:
 
 
 def main() -> int:
-    rel_cfg = _compose("umift_oct_fixb_r1rel")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--h4s", action="store_true")
+    args = parser.parse_args()
+    task = "umift_oct_fixb_r1rel_h4s" if args.h4s else "umift_oct_fixb_r1rel"
+    expect_action_h = 64 if args.h4s else 24
+    expect_mold_h = 51 if args.h4s else 5
+    expect_chunks = (19125, 1945) if args.h4s else (20207, 2055)
+    stem = (
+        "oct_v35_h4s_r1rel_action_pose_normalizer"
+        if args.h4s
+        else "oct_v35_r1rel_action_pose_normalizer"
+    )
+
+    rel_cfg = _compose(task)
     frames = rel_cfg["shape_meta"]["pose_frames"]
     if frames["obs"] != "relative" or frames["action"] != "relative":
         raise RuntimeError(f"r1rel pose_frames {frames}")
     if rel_cfg["dataset_path"] != ZARR:
         raise RuntimeError("dataset_path is not the October r1 zarr")
     sample = rel_cfg["shape_meta"]["sample"]
-    if int(sample["action"]["sparse"]["horizon"]) != 24:
-        raise RuntimeError("action horizon is not 24")
-    if int(sample["obs"]["sparse"]["robot0_mold_geom"]["horizon"]) != 5:
-        raise RuntimeError("mold horizon is not 5")
+    action_h = int(sample["action"]["sparse"]["horizon"])
+    mold_h = int(sample["obs"]["sparse"]["robot0_mold_geom"]["horizon"])
+    if action_h != expect_action_h or mold_h != expect_mold_h:
+        raise RuntimeError(
+            f"{task} horizons action={action_h} mold={mold_h}, "
+            f"expected {expect_action_h}/{expect_mold_h}"
+        )
 
     print("[load] relative")
     rel_ds = _dataset(rel_cfg)
@@ -218,8 +238,10 @@ def main() -> int:
     n_train = len(rel_ds)
     n_val = len(rel_ds.get_validation_dataset())
     print(f"[chunks] train={n_train} val={n_val} val_episodes={val_ids}")
-    if n_train != 20207 or n_val != 2055:
-        raise RuntimeError(f"chunk counts {n_train}/{n_val}, expected 20207/2055")
+    if (n_train, n_val) != expect_chunks:
+        raise RuntimeError(
+            f"chunk counts {n_train}/{n_val}, expected {expect_chunks[0]}/{expect_chunks[1]}"
+        )
     if sorted(val_ids) != [9, 12, 28, 37, 41]:
         raise RuntimeError(f"val episodes {val_ids}")
 
@@ -253,17 +275,19 @@ def main() -> int:
         array_to_stats(rot_rows)
     )
     previous_path = ASSETS / (
-        "oct_v35_r1rel_action_pose_normalizer_b51ef4dc779f.pkl"
+        "oct_v35_r1rel_action_pose_normalizer_64e3aa3c37f5.pkl"
+        if args.h4s
+        else "oct_v35_r1rel_action_pose_normalizer_b51ef4dc779f.pkl"
     )
     with previous_path.open("rb") as f:
         previous = pickle.load(f)
     _print_action_table(saved, previous)
     ASSETS.mkdir(parents=True, exist_ok=True)
-    tmp = ASSETS / "oct_v35_r1rel_action_pose_normalizer_tmp.pkl"
+    tmp = ASSETS / f"{stem}_tmp.pkl"
     with tmp.open("wb") as f:
         pickle.dump(saved, f)
     digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
-    final = ASSETS / f"oct_v35_r1rel_action_pose_normalizer_{digest[:12]}.pkl"
+    final = ASSETS / f"{stem}_{digest[:12]}.pkl"
     tmp.replace(final)
     print(f"[wrote] {final}")
     print(f"[sha256] {digest}")
