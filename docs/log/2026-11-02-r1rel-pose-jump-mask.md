@@ -2,7 +2,7 @@
 date: 2026-11-02
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: bc57c8e
 status: done
 artifacts:
   - UMIFT_Data/surface_frames_scripts/assets/oct_v35_pose_jump_flags.npz
