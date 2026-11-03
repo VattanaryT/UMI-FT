@@ -386,6 +386,44 @@ def apply_shared_action_normalizer(sparse_normalizer, path: str, sha256: str, ro
     return sparse_normalizer
 
 
+R1REL_NORMALIZER_KEYS = (
+    "action",
+    "robot0_eef_pos",
+    "robot0_eef_rot_axis_angle",
+)
+
+
+def apply_r1rel_normalizer(sparse_normalizer, path: str, sha256: str):
+    """Pin the relative-action r1 normalizer (action + relative pose obs).
+
+    Relative xyz/rot6d stats are not the absolute fixture-frame fit. Wrench and
+    mold_geom stay the online fit: the wrench adjoint is unchanged, and mold
+    geom is not a TCP-relative pose.
+    """
+    path = Path(path)
+    digest = _sha256_file(path)
+    if not sha256 or digest != sha256:
+        raise RuntimeError(
+            f"action normalizer sha256 {digest} != config {sha256} ({path})"
+        )
+    with path.open("rb") as f:
+        saved = pickle.load(f)
+    for key in R1REL_NORMALIZER_KEYS:
+        if key not in saved.params_dict:
+            raise RuntimeError(f"r1rel normalizer missing key {key}")
+        before = 0.0
+        if key in sparse_normalizer.params_dict:
+            a = sparse_normalizer.params_dict[key]["scale"].detach().float().cpu().reshape(-1)
+            b = saved.params_dict[key]["scale"].detach().float().cpu().reshape(-1)
+            before = torch.max(torch.abs(a - b)).item()
+        sparse_normalizer[key] = saved[key]
+        print(
+            f"[r1rel-normalizer] key={key} sha256={digest[:12]} "
+            f"online_vs_file_max|scale|={before:.3g}"
+        )
+    return sparse_normalizer
+
+
 class UmiFTDatasetOctNorm(UmiFTDataset):
     """r1 or r2 with the versioned October action normalizer."""
 
@@ -398,7 +436,7 @@ class UmiFTDatasetOctNorm(UmiFTDataset):
         action_normalizer_role: str,
         **kwargs,
     ):
-        if action_normalizer_role not in ("r1", "r2"):
+        if action_normalizer_role not in ("r1", "r2", "r1rel"):
             raise ValueError(action_normalizer_role)
         self._an_path = action_normalizer_path
         self._an_sha = action_normalizer_sha256
@@ -407,9 +445,12 @@ class UmiFTDatasetOctNorm(UmiFTDataset):
 
     def get_normalizer(self, **kwargs):
         sparse, dense = super().get_normalizer(**kwargs)
-        apply_shared_action_normalizer(
-            sparse, self._an_path, self._an_sha, self._an_role
-        )
+        if self._an_role == "r1rel":
+            apply_r1rel_normalizer(sparse, self._an_path, self._an_sha)
+        else:
+            apply_shared_action_normalizer(
+                sparse, self._an_path, self._an_sha, self._an_role
+            )
         return sparse, dense
 
 

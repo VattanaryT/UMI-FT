@@ -26,6 +26,7 @@ if str(_SURFACE_SCRIPTS) not in sys.path:
 from PyriteConfig.tasks.umift.umift_type_conversions import raw_to_obs_inference
 from PyriteConfig.tasks.umift.workcell_frames import (
     load_workcell_extrinsics,
+    pose_frames_cfg,
     scan_crop_cfg,
     shape_meta_needs_fixture_frame,
 )
@@ -372,6 +373,23 @@ def make_rollout_id(ckpt_path: str, episode_id: int, ts: Optional[int] = None) -
     epoch = int(m.group(1)) if m else -1
     ts = int(time.time()) if ts is None else int(ts)
     return f"{policy}_e{epoch}_rollout{int(episode_id)}_{ts}"
+
+
+# Relative actions are current_TCP @ delta. A healthy first step is a few mm
+# from the measured TCP. Reject the chunk above this instead of commanding it.
+RELATIVE_FIRST_POSE_GATE_M = 0.025
+RELATIVE_FIRST_POSE_GATE_DEG = 10.0
+
+
+def relative_first_pose_ok(target_se3: np.ndarray, current_pose7: np.ndarray) -> Tuple[bool, float, float]:
+    """True when the first commanded pose is within 25 mm and 10 deg of the TCP."""
+    cur = su.pose7_to_SE3(np.asarray(current_pose7, dtype=np.float64).reshape(7))
+    step0 = np.asarray(target_se3, dtype=np.float64).reshape(-1, 4, 4)[0]
+    dist_m = float(np.linalg.norm(step0[:3, 3] - cur[:3, 3]))
+    rel = cur[:3, :3].T @ step0[:3, :3]
+    ang_deg = float(np.degrees(np.linalg.norm(Rotation.from_matrix(rel).as_rotvec())))
+    ok = dist_m <= RELATIVE_FIRST_POSE_GATE_M and ang_deg <= RELATIVE_FIRST_POSE_GATE_DEG
+    return ok, dist_m, ang_deg
 
 
 def tool_tilt_deg(R_tool: np.ndarray, R_field: np.ndarray, R_off: np.ndarray) -> float:
@@ -1399,6 +1417,8 @@ def main():
     # fixture frame (origin at tag0). Live RTDE poses are in the right-arm base frame,
     # so hand the controller the base->fixture transform from the workcell extrinsics
     # (override the file with $UMIFT_WORKCELL_EXTRINSICS after moving the part).
+    pose_frames = pose_frames_cfg(shape_meta)
+    relative_action = pose_frames["action"] == "relative"
     if shape_meta_needs_fixture_frame(shape_meta):
         extrinsics = load_workcell_extrinsics()
         controller.SE3_fixture_from_world = extrinsics.T_fixture_from_right_base
@@ -1407,6 +1427,17 @@ def main():
             extrinsics.path,
             "\nT_fixture_from_right_base =\n",
             controller.SE3_fixture_from_world,
+        )
+    print(
+        f"[frames] pose_frames obs={pose_frames['obs']} action={pose_frames['action']} "
+        f"sparse_execution_horizon={control_para['sparse_execution_horizon']}"
+    )
+    if relative_action:
+        print(
+            "[frames] relative action: action21_postprocess is current_TCP @ delta "
+            f"(not fixture-absolute). First-pose gate "
+            f"{RELATIVE_FIRST_POSE_GATE_M * 1000:.0f} mm / "
+            f"{RELATIVE_FIRST_POSE_GATE_DEG:.0f} deg is on."
         )
 
     # Diagnostics for the scan CNN branch (hooks only read tensors).
@@ -1810,7 +1841,9 @@ def main():
 
             # Fix B r2/r3/r4: replace SE3 targets with anchored decode from raw action.
             # Decode in fixture (same as training field); map commands back to base.
-            # r1 keeps action21_postprocess (absolute fixture poses → base via SE3_WF).
+            # Absolute r1 keeps action21_postprocess (fixture poses → base via SE3_WF).
+            # Relative r1 (r1rel) also keeps it: pose_frames.action=relative makes
+            # SE3_WBase the current TCP, so the multiply is current_TCP @ delta.
             if (
                 mold_runtime is not None
                 and mold_run_type
@@ -1941,6 +1974,26 @@ def main():
                     cv2.waitKey(10)
             except Exception as exc:
                 print(f"[scan-enc] display/monitor error (ignored): {exc}")
+
+            if relative_action:
+                gate_bad = []
+                for id in id_list:
+                    ok, dist_m, ang_deg = relative_first_pose_ok(
+                        action_sparse_target_mats[id],
+                        obs_raw[f"ts_pose_fb_{id}"][-1],
+                    )
+                    if not ok:
+                        gate_bad.append(
+                            f"robot {id}: {dist_m * 1000:.1f} mm, {ang_deg:.1f} deg"
+                        )
+                if gate_bad:
+                    print(
+                        f"[first-pose gate] reject h={horizon_count} "
+                        + "; ".join(gate_bad)
+                        + ". Holding the previous command."
+                    )
+                    time.sleep(max(0.0, execution_duration_s))
+                    continue
 
             outputs_ts_nominal_targets = [np.array] * len(id_list)
             outputs_ts_targets = [np.array] * len(id_list)

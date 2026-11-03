@@ -1,0 +1,20 @@
+# October stringer_v3.5 r1, relative obs and relative action.
+# Same zarr, windows, and chunks as umift_oct_fixb_r1. pose_frames match the
+# standard_bc hist/time configs (umift_ss_v2): both relative to the newest TCP.
+# robot0_mold_geom stays. Action and pose normalizer is a fresh relative fit,
+# not oct_v35_r2r4_action_normalizer_1ddfa2b4331f.pkl.
+defaults:
+  - umift_oct_fixb_r1
+  - _self_
+
+name: OCT-V35-FIXB-R1REL
+
+shape_meta:
+  pose_frames:
+    obs: relative
+    action: relative
+
+dataset:
+  action_normalizer_role: r1rel
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_r1rel_action_pose_normalizer_b51ef4dc779f.pkl
+  action_normalizer_sha256: b51ef4dc779f1a1ce5e1fb85ad3265330e3de7386d75fb9db1fb7ba1ce79e95b

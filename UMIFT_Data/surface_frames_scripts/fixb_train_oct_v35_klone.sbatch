@@ -20,21 +20,28 @@
 #   RUN=r1_world_world      sbatch fixb_train_oct_v35_klone.sbatch
 #   RUN=r2_world_fixb       sbatch fixb_train_oct_v35_klone.sbatch
 #   RUN=r4_world_fixb_tilt  sbatch fixb_train_oct_v35_klone.sbatch
+#   RUN=r1rel_world         sbatch fixb_train_oct_v35_klone.sbatch
+# r1rel uses the r1_world_world zarr and a relative-pose normalizer.
 
 set -euo pipefail
 
-RUN="${RUN:?set RUN=r1_world_world|r2_world_fixb|r4_world_fixb_tilt}"
+RUN="${RUN:?set RUN=r1_world_world|r2_world_fixb|r4_world_fixb_tilt|r1rel_world}"
 case "${RUN}" in
   r1_world_world) TASK=umift_oct_fixb_r1 ;;
   r2_world_fixb) TASK=umift_oct_fixb_r2 ;;
   r4_world_fixb_tilt) TASK=umift_oct_fixb_r4 ;;
+  r1rel_world)
+    TASK=umift_oct_fixb_r1rel
+    DATA_HOST_OVERRIDE="${DATA_ROOT:-/gscratch/scrubbed/vtevy/umidata/mold_aware_datasets/stringer_v3.5_fixb}/r1_world_world"
+    NORM_FILE=oct_v35_r1rel_action_pose_normalizer_b51ef4dc779f.pkl
+    ;;
   *) echo "bad RUN=${RUN}"; exit 1 ;;
 esac
 
 SIF="${SIF:-/gscratch/weirdlab/vtevy/images/umift-train_v3.sif}"
 UMIFT_HOST="${UMIFT_HOST:-/gscratch/weirdlab/vtevy/UMI-FT-fixb}"
 DATA_ROOT="${DATA_ROOT:-/gscratch/scrubbed/vtevy/umidata/mold_aware_datasets/stringer_v3.5_fixb}"
-DATA_HOST="${DATA_ROOT}/${RUN}"
+DATA_HOST="${DATA_HOST_OVERRIDE:-${DATA_ROOT}/${RUN}}"
 CKPT_HOST="${CKPT_HOST:-/gscratch/weirdlab/vtevy/training_outputs/oct_v35_fixb_${RUN}}"
 WANDB_ENV="${WANDB_ENV:-/gscratch/weirdlab/vtevy/wandb.env}"
 SCRIPTS="/opt/umift/UMIFT_Data/surface_frames_scripts"
