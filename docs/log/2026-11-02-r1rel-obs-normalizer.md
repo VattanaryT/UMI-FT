@@ -2,7 +2,7 @@
 date: 2026-11-02
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: d632797
 status: done
 artifacts:
   - UMIFT_Data/surface_frames_scripts/assets/oct_v35_r1rel_action_pose_normalizer_64e3aa3c37f5.pkl
