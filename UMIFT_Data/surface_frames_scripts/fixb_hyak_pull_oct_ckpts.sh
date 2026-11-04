@@ -1,11 +1,14 @@
 #!/bin/bash
-# Pull October Fix B r1 and r4 checkpoints from Hyak.
+# Pull October Fix B checkpoints from Hyak.
 # Best = lowest train_loss in the epoch=*.ckpt name. Final = highest epoch.
-# Lands next to the September tree:
+# Only the newest run directory under each remote tree is searched, so an
+# older r4 job is not mixed with the retrain.
+# Lands next to the existing tree:
 #   /mnt/data/umidata/ft/training_outputs/oct_v35_fixb/<run>/
+# A local file with the same name is kept as <name>.pre_jumpmask.
 #
 #   bash fixb_hyak_pull_oct_ckpts.sh
-#   DRY_RUN=1 bash fixb_hyak_pull_oct_ckpts.sh
+#   ONLY_RUNS="r1_world_world" DRY_RUN=1 bash fixb_hyak_pull_oct_ckpts.sh
 
 set -euo pipefail
 
@@ -18,7 +21,11 @@ HYAK="${HYAK:-vtevy@klone.hyak.uw.edu}"
 REMOTE_ROOT="${REMOTE_ROOT:-/gscratch/weirdlab/vtevy/training_outputs}"
 LOCAL_ROOT="${LOCAL_ROOT:-/mnt/data/umidata/ft/training_outputs/oct_v35_fixb}"
 DRY_RUN="${DRY_RUN:-0}"
-RUNS=(r1_world_world r4_world_fixb_tilt)
+if [[ -n "${ONLY_RUNS:-}" ]]; then
+  read -r -a RUNS <<< "${ONLY_RUNS}"
+else
+  RUNS=(r2_world_fixb r4_world_fixb_tilt r1rel_world)
+fi
 
 mkdir -p "${HOME}/.ssh" "${LOCAL_ROOT}"
 CTRL="${HOME}/.ssh/cm-%r@%h:%p"
@@ -32,10 +39,20 @@ pick_py='
 import os, re, sys
 root = sys.argv[1]
 pat = re.compile(r"epoch=(\d+)-train_loss=([0-9.]+)\.ckpt$")
+newest = None
+if os.path.isdir(root):
+    for name in os.listdir(root):
+        path = os.path.join(root, name)
+        if not os.path.isdir(path):
+            continue
+        stamp = os.path.getmtime(path)
+        if newest is None or stamp > newest[0]:
+            newest = (stamp, path)
+search = newest[1] if newest else root
 best = None
 final = None
 n = 0
-for dirpath, _dirs, files in os.walk(root):
+for dirpath, _dirs, files in os.walk(search):
     for name in files:
         m = pat.search(name)
         if not m:
@@ -76,6 +93,14 @@ for run in "${RUNS[@]}"; do
   if [[ "${DRY_RUN}" == "1" ]]; then
     continue
   fi
+  for src in "${best}" "${final}"; do
+    dest="${local_run}/$(basename "${src}")"
+    kept="${dest}.pre_jumpmask"
+    if [[ -e "${dest}" && ! -e "${kept}" ]]; then
+      echo "  keep existing $(basename "${dest}") as $(basename "${kept}")"
+      mv "${dest}" "${kept}"
+    fi
+  done
   rsync -avh --progress -e "${RSYNC_SSH}" \
     "${HYAK}:${best}" "${HYAK}:${final}" "${local_run}/"
   # sidecars from the best rundir (same job as the kept ckpts)

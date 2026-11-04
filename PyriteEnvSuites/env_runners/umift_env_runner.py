@@ -980,7 +980,7 @@ def main():
         #   /scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt
         #   /scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt
         #   /scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt
-        "ckpt_path": "/oct_v35_fixb/r1_world_world/epoch=0195-train_loss=0.013.ckpt",
+        "ckpt_path": "/oct_v35_h4s/r1rel_world/epoch=0025-train_loss=0.029.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
