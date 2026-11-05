@@ -1,0 +1,49 @@
+# Touch points for mold_calib_check.py. Fixture frame of the training mesh
+# stringer_scan_20261008_170729 (fixb_field.npz sha256 f841837b…).
+#
+# Axes, confirmed from that mesh and layup_workcell_extrinsics.yaml:
+#   +X  stringer length. The right-arm base is at fixture x ≈ -0.089 m.
+#       The mesh runs from x ≈ -0.401 m (far) to x ≈ -0.011 m (near).
+#       near = +X end, the end closer to the robot base.
+#       far  = -X end.
+#   +Z  across the stringer, toward the operator (table near edge).
+#       Looking along +X, +Z is to the left.
+#       left  = +Z flange / wall.
+#       right = -Z flange / wall.
+#   +Y  down. The crown outward normal is -Y (up). Flange plane y ≈ -0.004 m.
+#       Crown vertices sit near y ≈ -0.07 m.
+#
+# xyz are on the mesh (meters). heldout matches train because no separate
+# held-out field is on disk yet; replace heldout_xyz_m when that mesh exists.
+
+spot_warn_mm: 20
+
+stringer_axis: [1.0, 0.0, 0.0]
+across_axis: [0.0, 0.0, 1.0]
+crown_normal: [0.0, -1.0, 0.0]
+
+points:
+  - label: flange_l_near
+    description: "Left flange (+Z) outer corner, near end (+X, closer to the robot)."
+    train_xyz_m: [-0.0115, -0.0039, 0.4342]
+    heldout_xyz_m: [-0.0115, -0.0039, 0.4342]
+  - label: flange_l_far
+    description: "Left flange (+Z) outer corner, far end (-X)."
+    train_xyz_m: [-0.4015, -0.0039, 0.4342]
+    heldout_xyz_m: [-0.4015, -0.0039, 0.4342]
+  - label: flange_r_near
+    description: "Right flange (-Z) outer corner, near end (+X)."
+    train_xyz_m: [-0.0115, -0.0039, -0.2858]
+    heldout_xyz_m: [-0.0115, -0.0039, -0.2858]
+  - label: flange_r_far
+    description: "Right flange (-Z) outer corner, far end (-X)."
+    train_xyz_m: [-0.4015, -0.0039, -0.2858]
+    heldout_xyz_m: [-0.4015, -0.0039, -0.2858]
+  - label: wall_l_near
+    description: "Left stringer wall (+Z face), near the +X end, mid-height."
+    train_xyz_m: [-0.0124, -0.0257, 0.1081]
+    heldout_xyz_m: [-0.0124, -0.0257, 0.1081]
+  - label: wall_r_far
+    description: "Right stringer wall (-Z face), near the -X end, mid-height."
+    train_xyz_m: [-0.4007, -0.0341, 0.0421]
+    heldout_xyz_m: [-0.4007, -0.0341, 0.0421]

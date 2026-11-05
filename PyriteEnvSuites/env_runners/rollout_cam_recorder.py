@@ -11,10 +11,94 @@ import cv2
 import numpy as np
 
 from PyriteEnvSuites.env_runners.frame_rate_watch import FrameRateWatch
+from PyriteEnvSuites.env_runners.term_color import print_red
 
 DEFAULT_ORBBEC_V4L = (
     "/dev/v4l/by-id/usb-Orbbec_Orbbec_Femto_Bolt_3D_Camera_CL8K14100WH-video-index0"
 )
+# The by-id video-index0 link is the Y16 depth node (1024x512). Color is
+# another /dev/videoN on the same USB serial, with no by-id symlink.
+_DEPTH_FRAME_HW = (512, 1024)
+
+
+def _serial_from_by_id(path: str) -> Optional[str]:
+    """``..._CL8K14100WH-video-index0`` -> ``CL8K14100WH``."""
+    name = Path(path).name
+    head = name.split("-video-index")[0]
+    serial = head.split("_")[-1]
+    return serial or None
+
+
+def _nodes_for_serial(serial: str) -> list:
+    """Every /dev/videoN whose USB device serial matches. Stable across replugs."""
+    found = []
+    root = Path("/sys/class/video4linux")
+    if not root.is_dir():
+        return found
+    for sysdir in sorted(root.glob("video*")):
+        cur = (sysdir / "device").resolve()
+        device_serial = ""
+        for _ in range(6):
+            serial_path = cur / "serial"
+            if serial_path.is_file():
+                device_serial = serial_path.read_text().strip()
+                break
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+        if device_serial == serial:
+            found.append("/dev/" + sysdir.name)
+    return found
+
+
+def _video_index(path: str) -> Optional[int]:
+    """``/dev/video8`` -> 8. OpenCV's V4L2 backend rejects by-id paths by name."""
+    name = Path(path).name
+    if name.startswith("video") and name[5:].isdigit():
+        return int(name[5:])
+    return None
+
+
+def _color_device_candidates(path: str) -> list:
+    """Color is a different USB interface than the by-id depth symlink."""
+    serial = _serial_from_by_id(path)
+    nodes = _nodes_for_serial(serial) if serial else []
+    if not nodes:
+        nodes = [str(path)]
+    return nodes
+
+
+def _open_one(device: str):
+    resolved = str(Path(device).resolve())
+    index = _video_index(resolved)
+    attempts = []
+    if index is not None:
+        attempts.append(lambda: cv2.VideoCapture(index))
+    attempts.append(lambda: cv2.VideoCapture(resolved))
+    for make in attempts:
+        cap = make()
+        if not cap.isOpened():
+            cap.release()
+            continue
+        ok, frame = cap.read()
+        if not ok or frame is None or tuple(frame.shape[:2]) == _DEPTH_FRAME_HW:
+            cap.release()
+            continue
+        return cap, resolved, tuple(frame.shape[:2])
+    return None, resolved, None
+
+
+def _open_orbbec_color(path: str):
+    """Open the color node for this Bolt. The by-id link is the Y16 depth node."""
+    tried = []
+    for device in _color_device_candidates(path):
+        cap, resolved, shape = _open_one(device)
+        tried.append(
+            f"{resolved}" + (f" {shape[1]}x{shape[0]}" if shape else " failed")
+        )
+        if cap is not None:
+            return cap, resolved, shape, tried
+    return None, None, None, tried
 
 
 class _Mp4Writer:
@@ -111,18 +195,37 @@ class RolloutCamRecorder:
         }
 
     def _orbbec_loop(self) -> None:
-        cap = cv2.VideoCapture(self.orbbec_v4l)
-        if not cap.isOpened():
-            print(f"[rollout-cam] Orbbec open failed: {self.orbbec_v4l}")
+        cap, device, shape, tried = _open_orbbec_color(self.orbbec_v4l)
+        if cap is None:
+            print_red(
+                "[rollout-cam] Orbbec color open failed. Tried: "
+                + "; ".join(tried)
+            )
             return
+        print(
+            f"[rollout-cam] Orbbec color: {device} "
+            f"{shape[1]}x{shape[0]}"
+        )
         period = 1.0 / max(self.orbbec_fps, 1e-3)
+        read_fail_announced = False
+        last_ok = time.time()
         try:
             while not self._stop.is_set():
                 t0 = time.time()
                 ok, frame = cap.read()
                 if not ok or frame is None:
+                    if (
+                        not read_fail_announced
+                        and time.time() - last_ok > 1.0
+                    ):
+                        print_red(
+                            f"[rollout-cam] Orbbec read failed: {self.orbbec_v4l}"
+                        )
+                        read_fail_announced = True
                     time.sleep(0.05)
                     continue
+                read_fail_announced = False
+                last_ok = time.time()
                 h, w = frame.shape[:2]
                 with self._lock:
                     if self._orbbec is None:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+from PyriteEnvSuites.env_runners.term_color import red, yellow
+
 
 class FrameRateWatch:
     """Track frame arrival times and warn when a gap or the average rate is low.
@@ -39,7 +41,7 @@ class FrameRateWatch:
                 missed = max(1, int(round(dt * self.expected_hz)) - 1)
                 self.n_gap_warns += 1
                 self._last_warn_t = now
-                msg = (
+                msg = yellow(
                     f"[cam] {self.name} frame gap {dt * 1000:.0f} ms "
                     f"(expected {period * 1000:.0f} ms at {self.expected_hz:.0f} Hz, "
                     f"~{missed} frame(s) dropped)"
@@ -73,9 +75,19 @@ class FrameRateWatch:
 
     def summary_line(self) -> str:
         s = self.summary()
-        flag = "ok" if s["ok"] else "LOW"
-        return (
+        if s["frames"] == 0:
+            flag = "FAIL"
+        elif s["ok"]:
+            flag = "ok"
+        else:
+            flag = "LOW"
+        line = (
             f"[cam] {s['name']} {flag}: {s['hz']:.1f} Hz over {s['duration_s']:.1f}s "
             f"({s['frames']} frames, expected {s['expected_hz']:.0f} Hz, "
             f"~{s['frames_short']} short, gap_warns={s['gap_warns']})"
         )
+        if flag == "FAIL":
+            return red(line)
+        if flag == "LOW":
+            return yellow(line)
+        return line

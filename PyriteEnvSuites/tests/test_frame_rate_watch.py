@@ -29,6 +29,20 @@ def test_gap_warns_with_dropped_frame_count():
     assert watch.summary()["gap_warns"] == 1
 
 
+def test_zero_frames_summary_is_a_failure():
+    watch = FrameRateWatch("center Orbbec", expected_hz=15.0)
+    line = watch.summary_line()
+    assert "FAIL" in line
+    assert "\033[31m" in line
+
+
+def test_gap_warning_is_yellow():
+    watch = FrameRateWatch("center Orbbec", expected_hz=15.0)
+    watch.tick(0.0)
+    msg = watch.tick(0.0 + 4.0 / 15.0)
+    assert "\033[33m" in msg
+
+
 def test_slow_average_is_not_ok():
     watch = FrameRateWatch("wrist D405", expected_hz=15.0, warn_ratio=0.8)
     t = 0.0

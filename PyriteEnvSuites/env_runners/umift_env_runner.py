@@ -37,6 +37,7 @@ from PyriteUtility.planning_control.policy_clock import (
     scale_obs_windows_by_slow_down,
 )
 from PyriteEnvSuites.env_runners.dataset_start_pose import (
+    DATASET_START_EPISODE,
     central_episode_start,
     dataset_poses_are_fixture,
     pose7_change_frame,
@@ -66,6 +67,7 @@ from PyriteEnvSuites.env_runners.rollout_cam_recorder import (
     DEFAULT_ORBBEC_V4L,
     RolloutCamRecorder,
 )
+from PyriteEnvSuites.env_runners.term_color import print_red, print_yellow
 
 from PyriteEnvSuites.utils.env_utils import (
     pose9g1_to_traj,
@@ -192,15 +194,17 @@ def move_to_dataset_start_pose(
     without moving when the dataset or the safe zone rejects the goal.
     """
     if dataset_zarr is None:
-        print(
+        print_red(
             "[dataset-start] No local dataset zarr for this checkpoint. "
             "Staying at the current pose."
         )
         return False
     try:
-        episode_name, pose_src, median_xyz = central_episode_start(dataset_zarr)
+        episode_name, pose_src, median_xyz = central_episode_start(
+            dataset_zarr, episode_name=DATASET_START_EPISODE
+        )
     except Exception as exc:
-        print(f"[dataset-start] Could not read start poses ({exc}).")
+        print_red(f"[dataset-start] Could not read start poses ({exc}).")
         return False
     if dataset_poses_are_fixture(dataset_zarr):
         T_fixture_from_base = load_workcell_extrinsics().T_fixture_from_right_base
@@ -221,7 +225,7 @@ def move_to_dataset_start_pose(
     )
     safe_zone = read_cartesian_safe_zone(hardware_config_path)
     if safe_zone is not None and not tcp_inside_safe_zone(goal_xyz, safe_zone):
-        print(
+        print_red(
             "[dataset-start] Goal is outside the cartesian safe zone "
             f"{safe_zone}. Not moving."
         )
@@ -980,7 +984,7 @@ def main():
         #   /scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt
         #   /scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt
         #   /scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt
-        "ckpt_path": "/oct_v35_h4s/r1rel_world/epoch=0025-train_loss=0.029.ckpt",
+        "ckpt_path": "/oct_v35_h4s/r4_world_fixb_tilt/epoch=0195-train_loss=0.011.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
@@ -1053,7 +1057,7 @@ def main():
             getattr(_payload["cfg"].task, "dataset_path", "") or ""
         )
     except Exception as exc:
-        print(f"[mold] could not read task name from ckpt ({exc}); mold_aware off")
+        print_red(f"[mold] could not read task name from ckpt ({exc}); mold_aware off")
         _task_name = ""
         _dataset_path_cfg = ""
     # Mold field + FixB labels live in the fixture frame. Live RTDE tip is
@@ -1611,7 +1615,7 @@ def main():
                 env.set_wrist_raw_rgb_sink(cam_rec.push_wrist_rgb)
                 printOrNot(vbs_h1, "Rollout cameras →", cam_rec.out_dir)
             except Exception as exc:
-                print(f"[rollout-cam] start failed (continuing without): {exc}")
+                print_red(f"[rollout-cam] start failed (continuing without): {exc}")
                 cam_rec = None
         if scan_monitor is not None:
             scan_monitor.reset()
@@ -1695,7 +1699,7 @@ def main():
                         f"(duration={outcome.duration_s:.1f}s)",
                     )
                 else:
-                    printOrNot(vbs_h1, f"Scan {scan_id} FAILED: {outcome.error}")
+                    print_red(f"[Episode {episode_id}] Scan {scan_id} FAILED: {outcome.error}")
                 # Real wall-clock time passed during the scan; refresh both
                 # the horizon clock (used below for execution-duration sleep
                 # math) and the periodic-scan clock (measured from when this
@@ -1762,11 +1766,11 @@ def main():
                 obs_raw["ts_pose_fb_0"] = pose_base
                 hard_obs = mold_runtime.last_hard_triggers
                 if hard_obs:
-                    print(f"[mold][safety] obs hard_triggers={hard_obs}")
+                    print_red(f"[mold][safety] obs hard_triggers={hard_obs}")
                     ep_n_safety_stops += 1
                     ep_safety_reasons.extend(hard_obs)
                     if control_para["mold_aware_abort_on_safety"]:
-                        print("[mold] aborting episode due to safety trigger")
+                        print_red("[mold] aborting episode due to safety trigger")
                         break
                 # Live contact / tilt / force samples (one per policy query).
                 if mold_fill:
@@ -1914,19 +1918,19 @@ def main():
                     ep_n_action_steps += 1
                     if flags:
                         ep_n_clamp_steps += 1
-                        print(
+                        print_yellow(
                             f"[mold][clamp] h={horizon_count} step={i} flags={flags}"
                         )
                 soft = mold_runtime.last_soft_triggers
                 hard = mold_runtime.last_hard_triggers
                 if soft:
-                    print(f"[mold][clamp] chunk soft_triggers={soft}")
+                    print_yellow(f"[mold][clamp] chunk soft_triggers={soft}")
                 if hard:
-                    print(f"[mold][safety] hard_triggers={hard}")
+                    print_red(f"[mold][safety] hard_triggers={hard}")
                     ep_n_safety_stops += 1
                     ep_safety_reasons.extend(hard)
                     if control_para["mold_aware_abort_on_safety"]:
-                        print("[mold] aborting episode due to safety trigger")
+                        print_red("[mold] aborting episode due to safety trigger")
                         break
                 # Chunk-seam jump vs previous executed endpoint.
                 if prev_seam_x is not None:
@@ -2004,7 +2008,7 @@ def main():
                             f"robot {id}: {dist_m * 1000:.1f} mm, {ang_deg:.1f} deg"
                         )
                 if gate_bad:
-                    print(
+                    print_yellow(
                         f"[first-pose gate] reject h={horizon_count} "
                         + "; ".join(gate_bad)
                         + ". Holding the previous command."
@@ -2331,13 +2335,20 @@ def main():
                 if isinstance(env, ManipServerLayupEnv):
                     env.set_wrist_raw_rgb_sink(None)
                 cam_info = cam_rec.stop()
-                print(
+                saved = (
                     f"[rollout-cam] saved wrist_frames={cam_info['wrist_frames']} "
                     f"orbbec_frames={cam_info['orbbec_frames']} "
                     f"dir={cam_rec.out_dir}"
                 )
+                if (
+                    cam_info["wrist_frames"] == 0
+                    or cam_info["orbbec_frames"] == 0
+                ):
+                    print_red(saved)
+                else:
+                    print(saved)
             except Exception as exc:
-                print(f"[rollout-cam] stop failed: {exc}")
+                print_red(f"[rollout-cam] stop failed: {exc}")
             cam_rec = None
 
         journal = {
@@ -2456,14 +2467,14 @@ def main():
                         f"{control_log_folder_path}/{finished_rollout_id}_layup/"
                     )
                 except Exception as exc:
-                    print(f"[layup-eval] FAILED: {exc}")
-                    print(
+                    print_red(f"[layup-eval] FAILED: {exc}")
+                    print_yellow(
                         "RTDE may still be paused; attempting resume before continuing."
                     )
                     try:
                         env.resume_rtde_control()
                     except Exception as resume_exc:
-                        print(f"[layup-eval] resume also failed: {resume_exc}")
+                        print_red(f"[layup-eval] resume also failed: {resume_exc}")
             if c == "s":
                 print(
                     "[layup-eval] Scan queued; waiting for compare, then quitting."

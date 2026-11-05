@@ -4,6 +4,7 @@ import numpy as np
 import zarr
 
 from PyriteEnvSuites.env_runners.dataset_start_pose import (
+    _LOCAL_DATASET_BY_TASK,
     central_episode_start,
     pose7_change_frame,
     resolve_dataset_zarr,
@@ -33,6 +34,19 @@ def test_central_episode_is_closest_to_median(tmp_path):
     assert np.allclose(median, [0.02, 0.0, 0.0])
 
 
+def test_named_episode_overrides_the_median(tmp_path):
+    path = tmp_path / "acp_replay_buffer.zarr"
+    root = zarr.open(str(path), mode="w")
+    data = root.create_group("data")
+    _write_episode(data, "episode_0", [0.0, 0.0, 0.0])
+    _write_episode(data, "episode_1", [0.10, 0.0, 0.0])
+    _write_episode(data, "episode_2", [0.02, 0.0, 0.0])
+
+    name, pose, _median = central_episode_start(path, episode_name="episode_1")
+    assert name == "episode_1"
+    assert np.allclose(pose[:3], [0.10, 0.0, 0.0])
+
+
 def test_frame_change_applies_translation():
     pose = np.array([1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0])
     transform = np.eye(4)
@@ -46,6 +60,16 @@ def test_safe_zone_is_inclusive():
     zone = [-0.5, 0.7, -0.9, 0.9, 0.235, 0.8]
     assert tcp_inside_safe_zone([-0.2, 0.78, 0.46], zone)
     assert not tcp_inside_safe_zone([0.8, 0.78, 0.46], zone)
+
+
+def test_r1rel_uses_the_october_r1_zarr():
+    r1 = (
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/"
+        "r1_world_world/acp_replay_buffer.zarr"
+    )
+    assert _LOCAL_DATASET_BY_TASK["OCT-V35-FIXB-R1-WORLD-WORLD"] == r1
+    assert _LOCAL_DATASET_BY_TASK["OCT-V35-FIXB-R1REL"] == r1
+    assert _LOCAL_DATASET_BY_TASK["OCT-V35-FIXB-R1REL-H4S"] == r1
 
 
 def test_missing_cfg_path_uses_task_name(tmp_path, monkeypatch):

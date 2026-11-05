@@ -14,6 +14,24 @@ python UMIFT_Data/surface_frames_scripts/sanity_mold_aware_ep5.py
 Must print `SANITY PASS` before any robot motion. Needs the ep5 open-loop
 export already under `training_outputs/scanner_fixb/eval/exports/`.
 
+Touch-check the mesh against the live TCP before a contact eval. Read-only:
+no policy, no motion. The script prompts the six points in
+`mold_calib_points.yaml` (left = +Z, near = +X). Square the tool to the
+surface at each one.
+
+```bash
+python UMIFT_Data/surface_frames_scripts/mold_calib_check.py --mold train
+python UMIFT_Data/surface_frames_scripts/mold_calib_check.py --mold heldout --field /path/to/fixb_field.npz
+```
+
+Viewer (geodude venv, which has viser). Open http://127.0.0.1:8081 .
+
+```bash
+source /home/boeing/ros2_ws/src/geodude-teleoperation/.venv/bin/activate
+export PYTHONPATH="$PWD:$PWD/UMIFT_Data/surface_frames_scripts:$PYTHONPATH"
+python UMIFT_Data/surface_frames_scripts/mold_calib_viser.py --mold train --csv mold_calib_train_YYYYMMDD_HHMMSS.csv
+```
+
 ## Hardware dry run (no contact)
 
 `mold_aware_dry_run` defaults to `True` (forces δn = +15 mm hover).

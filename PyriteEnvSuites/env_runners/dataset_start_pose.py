@@ -28,6 +28,15 @@ _LOCAL_DATASET_BY_TASK = {
         "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/"
         "r1_world_world/acp_replay_buffer.zarr"
     ),
+    # r1rel is the same October zarr as r1, with relative obs and actions.
+    "OCT-V35-FIXB-R1REL": (
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/"
+        "r1_world_world/acp_replay_buffer.zarr"
+    ),
+    "OCT-V35-FIXB-R1REL-H4S": (
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/"
+        "r1_world_world/acp_replay_buffer.zarr"
+    ),
     "OCT-V35-FIXB-R2-WORLD-FIXB": (
         "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/"
         "r2_world_fixb/acp_replay_buffer.zarr"
@@ -77,9 +86,18 @@ def _episode_names(root) -> list:
     return sorted(names, key=lambda s: int(str(s).split("_")[-1]))
 
 
-def central_episode_start(zarr_path: Path) -> Tuple[str, np.ndarray, np.ndarray]:
+# episode_30 is the median start. On the robot its tool +z was 22 deg from
+# straight down and the TCP sat ~48 mm off the mesh. episode_39 is 27 mm from
+# that median, 30 mm lower (+Y), and 7 deg from straight down.
+DATASET_START_EPISODE = "episode_39"
+
+
+def central_episode_start(
+    zarr_path: Path, episode_name: Optional[str] = None
+) -> Tuple[str, np.ndarray, np.ndarray]:
     """Episode whose first TCP position is closest to the median start.
 
+    ``episode_name`` picks one demonstrated start instead of the median.
     Returns ``(episode_name, pose7, median_xyz)``. ``pose7`` is in the dataset
     frame (fixture for tag-tracked layup sets).
     """
@@ -94,8 +112,13 @@ def central_episode_start(zarr_path: Path) -> Tuple[str, np.ndarray, np.ndarray]
         ]
     )
     median_xyz = np.median(starts[:, :3], axis=0)
-    distances = np.linalg.norm(starts[:, :3] - median_xyz, axis=1)
-    index = int(np.argmin(distances))
+    if episode_name:
+        if episode_name not in names:
+            raise ValueError(f"{episode_name} not in {zarr_path}")
+        index = names.index(episode_name)
+    else:
+        distances = np.linalg.norm(starts[:, :3] - median_xyz, axis=1)
+        index = int(np.argmin(distances))
     return names[index], starts[index].copy(), median_xyz
 
 
