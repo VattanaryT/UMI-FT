@@ -2,7 +2,7 @@
 date: 2026-11-04
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: fd58008
 status: superseded-by 2026-11-04-mold-calib-six-points.md
 artifacts:
   - /mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/shared/fixb_field.npz

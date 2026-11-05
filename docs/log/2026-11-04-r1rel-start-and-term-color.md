@@ -2,7 +2,7 @@
 date: 2026-11-04
 stream: frame
 branch: surface_frame
-commit: uncommitted
+commit: fd58008
 status: done
 artifacts:
   - /home/boeing/data/control_log/r1rel_world_e25_rollout0_1793826797
