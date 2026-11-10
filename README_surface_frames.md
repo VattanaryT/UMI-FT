@@ -160,7 +160,7 @@ Packed into `ts_pose_command_0` as `[v_t1, v_t2, delta_n, qw=1, 0, 0, 0]`. After
 | 9:18 | virtual target at 0, identity rot6d | wrench-derived virtual target | same as r2 |
 | 18 | stiffness scalar, about 200–3000 N/m from the VT labeller | same | same |
 | 19:21 | gripper 0, grasp force `(−Fx_left + Fx_right)/2` | same | same |
-| 21:27 | absent | absent | `ΔR = R(x_s)ᵀ R_tool`, rot6d. Decode `R_d = R(x_s) @ ΔR` |
+| 21:27 | absent | absent | `ΔR = R(x_s)ᵀ R_tool` as rot6d: first two rows of that matrix, dimensionless, not degrees. Decode `R_d = R(x_s) @ ΔR` |
 
 Observations (`shape_meta`, batch axis added by the loader; inference adds a leading 1):
 
@@ -184,17 +184,49 @@ Dataset defaults:
 |---|---|
 | `umift_fixb_r*` | `.../stringer_data_v2_full_fixb/{r1_world_world,r2_world_fixb,r3_surface_fixb}/` |
 | `umift_scanner_fixb_r*` | `.../stringer_scanner_v2_fixb/{r1_world_world,r2_world_fixb,r3_surface_fixb,r4_world_fixb_tilt}/` |
-| `umift_oct_fixb_*` and `*_h4s` | `.../stringer_v3.5_fixb/{r1_world_world,r2_world_fixb,r4_world_fixb_tilt}/` (r1rel reads the r1 zarr) |
+| `umift_oct_fixb_*` and `*_h4s` | `/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/{r1_world_world,r2_world_fixb,r4_world_fixb_tilt}/acp_replay_buffer.zarr` (r1rel reads the r1 zarr) |
 
-Field the runner loads: `.../stringer_scanner_v2_fixb/shared/fixb_field.npz`. Valid only while the mold is in the pose that yaml was calibrated for (`layup_workcell_extrinsics.yaml`, 2026-10-08).
+October source, before the mold copy: `/mnt/data/umidata/ft/datasets/stringer_v3.5/acp_replay_buffer.zarr`. The Fix B copy used for training has 50 episodes (about 60 s median, fixture frame, 5 s start pad, no scan). The source zarr on disk now has 68. RGB and depth gaps longer than 0.5 s are on episodes 13, 25, 29, and 42 (5 gaps, max 0.62 s) in `stringer_v3.5_fixb/audit/audit.json`. Robot gaps stay under 47 ms. About 93% of tag samples see zero tags, so most of the pose is T265 fill.
+
+Field the runner loads: `.../stringer_scanner_v2_fixb/shared/fixb_field.npz` (same bytes as `stringer_v3.5_fixb/shared/fixb_field.npz`). Valid only while the mold is in the pose that yaml was calibrated for (`layup_workcell_extrinsics.yaml`, 2026-10-08).
 
 ## What has been run
 
 | Stage | Status |
 |---|---|
-| Episode inspection plots | `fixb_data_check.py` writes PNGs. Not run this session. |
+| Episode inspection | `python UMIFT_Data/surface_frames_scripts/view_oct.py` then http://127.0.0.1:8765. Original and mold on one page. |
 | Train until the objective drops | Not run here. Hyak checkpoints already exist, including the h4s r4 epoch-195 file named in the dirty runner. Diffusion loss is not expected to hit zero. |
 | Reload in a fresh process with fixed noise | Not run. |
 | Offline decode | This session: `sanity_mold_aware_ep5.py` on scanner r2 episode 5, `SANITY PASS`, decode error 0 against the stored export. That is recorded-action agreement, not closed-loop success. 2026-10-21 log (epoch-35 scanner open loop, not re-run): r1 first-step surface error 6.65 mm, r2 9.03, r3 10.3. |
 | Command-disabled dry run | No such mode. `mold_aware_dry_run` still publishes waypoints. |
 | Hardware | Not run. Launching the runner connects to 192.168.1.2, calibrates the wrist wrench, and will servo as soon as the episode starts. With the file as it is, that is contact-capable r4 (`dry_run` false), executing 32 of 64 steps, depth zeroed, scan off. |
+
+## October viewer
+
+```bash
+source /home/boeing/umi_ft_ws/worktrees/activate.sh UMI-FT-surface_frames
+python UMIFT_Data/surface_frames_scripts/view_oct.py
+```
+
+http://127.0.0.1:8765. Drag the 3D view to rotate. Left and right arrows step the wrist frame and the marker on the path. Up and down arrows change episode.
+
+**r1rel** reads `/mnt/data/umidata/ft/datasets/stringer_v3.5/acp_replay_buffer.zarr` (68 episodes). The time plot is the one-step motion standard BC and r1rel learn: where the tool is at the next RGB frame, written in the current tool frame (`dx, dy, dz` in meters, and the rotation of that step in degrees). The 3D path is still the fixture trajectory, so it can be rotated.
+
+**r4** reads `stringer_v3.5_fixb/r4_world_fixb_tilt` (50 episodes). The time plot is `v1`, `v2` (m/s along the mold) and `n` (`delta_n`, meters). The path is colored by tilt, the angle between tool +z and the inward normal. A red tick at the playhead is tool +z. `F·n` stays on the force plot.
+
+Episodes 13, 25, 29, and 42 are marked when the 50-episode audit recorded an RGB/depth gap over 0.5 s. The page does not write an HTML file.
+
+## Training configs
+
+October Fix B yamls under `UMIFT_Data/surface_frames_scripts/config/task/`. Short runs inherit `umift_mold_aware` (rgb/depth horizon 5 stride 4, pose and mold 5 stride 16, wrench 32 stride 1, action 24 stride 1). `*_h4s` keeps those strides and uses rgb/depth 16, pose and mold 51, wrench 118, action 64 (about 4.0 s of history, 4.2 s of action). h4s r2, r4, and r1rel set `drop_depth_inputs: true`.
+
+| Yaml | Zarr | Action |
+|---|---|---|
+| `umift_oct_fixb_r1` / `_h4s` | `r1_world_world` | 21, fixture pose and wrench-derived virtual target. `UmiFTDatasetOctNorm` role `r1` |
+| `umift_oct_fixb_r1rel` / `_h4s` | same r1 zarr | 21, those poses relative to the newest TCP. Role `r1rel` |
+| `umift_oct_fixb_r2` / `_h4s` | `r2_world_fixb` | 21, `v_t1`, `v_t2`, `delta_n`. Role `r2` |
+| `umift_oct_fixb_r4` / `_h4s` | `r4_world_fixb_tilt` | 27, r2 plus `ΔR` rot6d. `UmiFTDatasetOctR4` |
+
+`standard_bc` task `umift_ss_v2` is not this table. It trains a source zarr with relative command and virtual-target poses, 21 dims, and no mold channels.
+
+Normalizer pickles: short runs `assets/oct_v35_r2r4_action_normalizer_1ddfa2b4331f.pkl`; h4s `assets/oct_v35_h4s_r2r4_action_normalizer_3b0863c14453.pkl`. r1rel has its own pickle, named in `umift_oct_fixb_r1rel.yaml`.
