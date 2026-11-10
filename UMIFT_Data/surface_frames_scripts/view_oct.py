@@ -22,7 +22,7 @@ import numpy as np
 import open3d as o3d
 import zarr
 from PIL import Image
-from scipy.spatial.transform import Rotation
+from scipy.spatial.transform import Rotation, Slerp
 
 ORIG = "/mnt/data/umidata/ft/datasets/stringer_v3.5/acp_replay_buffer.zarr"
 R4 = (
@@ -34,6 +34,10 @@ FIELD = (
 )
 BAG_DIR = Path("/mnt/data/umidata/ft/datasets/stringer_v3.5/bags")
 TAG_DIR = Path("/mnt/data/umidata/ft/datasets/stringer_v3.5/tag_traj")
+UNIFIED_DIR = Path("/mnt/data/umidata/ft/datasets/stringer_v3.5/zarr")
+CORR_DIR = Path("/mnt/data/umidata/ft/datasets/stringer_v3.5/tag_traj_odom_corr")
+# One-sample odom teleport. At 200 Hz this is 30 m/s, not a hand motion.
+ODOM_STEP_M = 0.15
 # Zarr RGB clock starts at the 5 s hold. Bag frame 0 is the first live frame.
 PAD_S = 5.0
 MESH_TRI_CAP = 8000
@@ -107,7 +111,32 @@ def tool_rotation(pose7: np.ndarray) -> np.ndarray:
     return Rotation.from_quat(q_xyzw).as_matrix()
 
 
-def episode_payload(root, episode: int, r4: bool, frame_t: np.ndarray) -> dict:
+def virtual_target_xyz(ep) -> np.ndarray:
+    """Fixture-frame xyz of ts_pose_virtual_target_0.
+
+    That array is SE3_WC from the wrench labeller. Relative training does
+    inv(TCP) @ SE3_WC, and inference multiplies the TCP back on, so this xyz
+    is the point the relative label decodes to.
+    """
+    return np.asarray(ep["ts_pose_virtual_target_0"], dtype=np.float64)[:, :3]
+
+
+def attach_virtual_target(out, xyz, vt_xyz, ip, R_field=None, iser=None) -> None:
+    m = min(len(xyz), len(vt_xyz))
+    ip = ip[ip < m]
+    out["vt"] = rounded(vt_xyz[:m][ip], 4)
+    if R_field is None or iser is None:
+        return
+    offset = vt_xyz[:m] - xyz[:m]
+    # mold_R_field columns are t1, t2, n, so R^T @ offset is the surface-frame split.
+    comp = np.einsum("nji,nj->ni", R_field[:m], offset)
+    sl = iser[iser < m]
+    out["vt_t1"] = rounded(comp[sl, 0], 4)
+    out["vt_t2"] = rounded(comp[sl, 1], 4)
+    out["vt_n"] = rounded(comp[sl, 2], 4)
+
+
+def episode_payload(root, episode: int, r4: bool, frame_t: np.ndarray, vt_xyz=None) -> dict:
     ep = root["data"][f"episode_{episode}"]
     robot_t = np.asarray(ep["robot_time_stamps_0"], dtype=np.float64).reshape(-1)
     rgb_t = np.asarray(ep["rgb_time_stamps_0"], dtype=np.float64).reshape(-1)
@@ -146,6 +175,9 @@ def episode_payload(root, episode: int, r4: bool, frame_t: np.ndarray) -> dict:
         out["dy"] = rounded(rel[sl, 1], 4)
         out["dz"] = rounded(rel[sl, 2], 4)
         out["dang"] = rounded(ang[sl], 2)
+        if vt_xyz is None:
+            vt_xyz = virtual_target_xyz(ep)
+        attach_virtual_target(out, xyz, vt_xyz, ip)
         return out
 
     count = min(n, len(pose), len(ep["mold_normal_0"]), len(ep["fixb_v_par_0"]))
@@ -171,7 +203,84 @@ def episode_payload(root, episode: int, r4: bool, frame_t: np.ndarray) -> dict:
     out["n"] = rounded(dn[iser], 4)
     out["fn_t"] = out["sig_t"]
     out["fn"] = rounded(fn[iser], 2)
+    if vt_xyz is None:
+        vt_xyz = virtual_target_xyz(ep)
+    R_field = np.asarray(ep["mold_R_field_0"], dtype=np.float64)[:count].reshape(-1, 3, 3)
+    attach_virtual_target(out, xyz[:count], vt_xyz, ip, R_field, iser)
     return out
+
+
+def attach_raw_odom(payload: dict, name: str) -> None:
+    """Raw t265_odom positions in the fixture frame.
+
+    The pipeline's T265-only curve (dead_reckon_from_first_anchor) is the
+    solved TCP at the first tag fix, times inv(T_odom) at that instant, times
+    each later odom pose. T_d405_odom equals T_d405_tcp in the stringer config,
+    so the camera conjugation cancels and this is that same rigid map applied
+    to the raw samples. Jumps in the odom stream stay jumps.
+    """
+    zpath = UNIFIED_DIR / f"{name}_unified.zarr"
+    side_path = TAG_DIR / f"{name}_ee_master.npz"
+    if not zpath.exists() or not side_path.exists():
+        return
+    side = np.load(side_path, allow_pickle=True)
+    root = zarr.open(str(zpath), "r")
+    odom = root["sensors"]["t265_odom"]
+
+    def col(key: str) -> np.ndarray:
+        return np.asarray(odom[key], dtype=np.float64).reshape(-1)
+
+    ot = col("timestamp_sec_unified")
+    pos = np.column_stack([col("pos_x"), col("pos_y"), col("pos_z")])
+    quat = np.column_stack(
+        [col("orient_x"), col("orient_y"), col("orient_z"), col("orient_w")]
+    )
+    st = np.asarray(side["timestamp_sec_unified"], dtype=np.float64).reshape(-1)
+    n_vis = np.asarray(side["n_tags_visible"], dtype=np.int32)
+    pose = np.asarray(side["pose7"], dtype=np.float64)
+    hits = np.flatnonzero(n_vis > 0)
+    anchor = int(hits[0]) if len(hits) else 0
+    ta = float(st[anchor])
+    i = int(np.clip(np.searchsorted(ot, ta), 1, len(ot) - 1))
+    t0o, t1o = float(ot[i - 1]), float(ot[i])
+    span = t1o - t0o
+    alpha = 0.0 if span <= 1e-9 else float(np.clip((ta - t0o) / span, 0.0, 1.0))
+    po = (1.0 - alpha) * pos[i - 1] + alpha * pos[i]
+    rots = Rotation.from_quat(quat[[i - 1, i]])
+    if span <= 1e-9:
+        Ro = rots[0].as_matrix()
+    else:
+        Ro = Slerp([0.0, 1.0], rots)([alpha]).as_matrix()[0]
+    solved = pose[anchor]
+    Rs = Rotation.from_quat(solved[[4, 5, 6, 3]]).as_matrix()
+    ps = solved[:3]
+    R_fix_odom = Rs @ Ro.T
+    mapped = pos @ R_fix_odom.T + (ps - R_fix_odom @ po)
+    t_view = (ot - float(st[0])) + PAD_S
+    step = np.linalg.norm(np.diff(mapped, axis=0), axis=1)
+    dt = np.diff(ot)
+    land = np.flatnonzero((step > ODOM_STEP_M) & (dt < 0.05)) + 1
+    ip = stride_idx(len(mapped), PATH_CAP)
+    payload["odom_t"] = rounded(t_view[ip], 3)
+    payload["odom"] = rounded(mapped[ip], 4)
+    payload["odom_jump_t"] = rounded(t_view[land], 3)
+    payload["odom_jump"] = rounded(mapped[land], 4)
+
+
+def attach_corrected_pose(payload: dict, name: str) -> None:
+    """Optional trace from the odom-teleport sidecar. Off until the button is on."""
+    path = CORR_DIR / f"{name}_odom_corr.npz"
+    if not path.exists():
+        return
+    side = np.load(path, allow_pickle=True)
+    st = np.asarray(side["timestamp_sec_unified"], dtype=np.float64).reshape(-1)
+    pose = np.asarray(side["pose7"], dtype=np.float64)
+    ip = stride_idx(len(pose), PATH_CAP)
+    payload["corr_t"] = rounded((st[ip] - float(st[0])) + PAD_S, 3)
+    payload["corr"] = rounded(pose[ip, :3], 4)
+    span = np.asarray(side["bad_span_s"], dtype=np.float64).reshape(-1, 2)
+    if len(span):
+        payload["bad_span"] = [round(float(span[0, 0]) + PAD_S, 1), round(float(span[0, 1]) + PAD_S, 1)]
 
 
 def mesh_payload(vertices: np.ndarray, faces: np.ndarray) -> dict:
@@ -215,6 +324,9 @@ input[type=range] { width:180px; }
   <button id="viewSide" class="on">side</button>
   <button id="viewTop">top</button>
   <button id="viewEnd">end</button>
+  <button id="vt">virtual target</button>
+  <button id="odom">t265</button>
+  <button id="corr">t265 fixed</button>
   <span id="hint">drag to orbit · ← → frame · ↑ ↓ episode</span>
 </div>
 <div class="top">
@@ -232,6 +344,9 @@ const note = document.getElementById("note");
 const readout = document.getElementById("readout");
 const wrist = document.getElementById("wrist");
 let mode = "r4";
+let showVt = false;
+let showOdom = false;
+let showCorr = false;
 let counts = {r1rel: 50, r4: 50};
 let mesh = null;
 let data = null;
@@ -281,7 +396,21 @@ function sceneTraces(d) {
     mode: "lines", name: "tool z", showlegend: false,
     line: {color: "#e74c3c", width: 6}
   };
-  if (!d.r4) return [path, cursor];
+  const v0 = (d.vt && d.vt.length) ? d.vt[0] : c0.p;
+  const vt = {
+    type: "scatter3d",
+    x: (d.vt || []).map(p => p[0]), y: (d.vt || []).map(p => p[1]), z: (d.vt || []).map(p => p[2]),
+    mode: "lines", name: "virtual target", visible: showVt,
+    line: {color: "#f5b7ff", width: 3}
+  };
+  const link = {
+    type: "scatter3d",
+    x: [c0.p[0], v0[0]], y: [c0.p[1], v0[1]], z: [c0.p[2], v0[2]],
+    mode: "lines", name: "tcp to vt", visible: showVt, showlegend: false,
+    line: {color: "#f5b7ff", width: 5}
+  };
+  const odom = odomTraces(d).concat(corrTrace(d));
+  if (!d.r4) return [path, cursor, vt, link].concat(odom);
   const mold = {
     type: "mesh3d", x: mesh.x, y: mesh.y, z: mesh.z, i: mesh.i, j: mesh.j, k: mesh.k,
     color: "#9aabb6", opacity: 0.45, name: "mold", hoverinfo: "skip", showlegend: false
@@ -291,7 +420,36 @@ function sceneTraces(d) {
     x: d.foot.map(p => p[0]), y: d.foot.map(p => p[1]), z: d.foot.map(p => p[2]),
     mode: "lines", name: "foot", showlegend: false, line: {color: "#f4d03f", width: 3}
   };
-  return [mold, path, foot, cursor, axis];
+  return [mold, path, foot, cursor, axis, vt, link].concat(odom);
+}
+
+function odomTraces(d) {
+  const pts = d.odom || [];
+  const jumps = d.odom_jump || [];
+  return [
+    {
+      type: "scatter3d",
+      x: pts.map(p => p[0]), y: pts.map(p => p[1]), z: pts.map(p => p[2]),
+      mode: "lines", name: "t265", visible: showOdom,
+      line: {color: "#ff9f1a", width: 3}
+    },
+    {
+      type: "scatter3d",
+      x: jumps.map(p => p[0]), y: jumps.map(p => p[1]), z: jumps.map(p => p[2]),
+      mode: "markers", name: "odom step", visible: showOdom,
+      marker: {size: 6, color: "#e74c3c", symbol: "diamond"}
+    }
+  ];
+}
+
+function corrTrace(d) {
+  const pts = d.corr || [];
+  return {
+    type: "scatter3d",
+    x: pts.map(p => p[0]), y: pts.map(p => p[1]), z: pts.map(p => p[2]),
+    mode: "lines", name: "t265 fixed", visible: showCorr,
+    line: {color: "#2ecc71", width: 3}
+  };
 }
 
 const VIEWS = {
@@ -318,6 +476,10 @@ function sceneBoxFrom(d) {
   const zs = mesh.z.slice();
   d.path.forEach(p => { xs.push(p[0]); ys.push(p[1]); zs.push(p[2]); });
   if (d.foot) d.foot.forEach(p => { xs.push(p[0]); ys.push(p[1]); zs.push(p[2]); });
+  if (showVt && d.vt) d.vt.forEach(p => { xs.push(p[0]); ys.push(p[1]); zs.push(p[2]); });
+  if (showOdom && d.odom) d.odom.forEach(p => { xs.push(p[0]); ys.push(p[1]); zs.push(p[2]); });
+  if (showOdom && d.odom_jump) d.odom_jump.forEach(p => { xs.push(p[0]); ys.push(p[1]); zs.push(p[2]); });
+  if (showCorr && d.corr) d.corr.forEach(p => { xs.push(p[0]); ys.push(p[1]); zs.push(p[2]); });
   const pad = 0.05;
   function rng(a) {
     const s = span(a);
@@ -381,6 +543,11 @@ function line(x, y, name, color, axis) {
   return {x, y, name, xaxis: axis, yaxis: axis.replace("x", "y"), line: {color, width: 1.4}};
 }
 
+function hideUnlessVt(trace) {
+  trace.visible = showVt;
+  return trace;
+}
+
 function plotTraces(d) {
   const force = line(d.force_t, d.force, "||F||", "#e67e22", "x2");
   if (!d.r4) {
@@ -397,7 +564,10 @@ function plotTraces(d) {
     line(d.sig_t, d.v2, "v2", "#2ecc71", "x"),
     force,
     d.fn ? line(d.fn_t, d.fn, "F·n", "#af7ac5", "x2") : force,
-    line(d.sig_t, d.n, "n", "#9b59b6", "x3")
+    line(d.sig_t, d.n, "n", "#9b59b6", "x3"),
+    hideUnlessVt(line(d.sig_t, d.vt_t1 || [], "vt·t1", "#f5b7ff", "x3")),
+    hideUnlessVt(line(d.sig_t, d.vt_t2 || [], "vt·t2", "#d7bde2", "x3")),
+    hideUnlessVt(line(d.sig_t, d.vt_n || [], "vt·n", "#f5b041", "x3"))
   ];
 }
 
@@ -406,6 +576,27 @@ function vline(n) {
     type: "line", xref: "x" + n, yref: "y" + n + " domain",
     x0: 0, x1: 0, y0: 0, y1: 1, line: {color: "#ffffff", width: 1}
   };
+}
+
+function jumpLine(n, t) {
+  return {
+    type: "line", xref: "x" + n, yref: "y" + n + " domain",
+    x0: t, x1: t, y0: 0, y1: 1, line: {color: "#e74c3c", width: 1}
+  };
+}
+
+function plotShapes(d) {
+  const shapes = [vline(""), vline("2"), vline("3")];
+  const t = d.frame_t && d.frame_t.length ? d.frame_t[Math.max(0, Math.min(fi, d.frame_t.length - 1))] : 0;
+  shapes.forEach(s => { s.x0 = t; s.x1 = t; });
+  if (showOdom && d.odom_jump_t) {
+    d.odom_jump_t.forEach(jt => {
+      shapes.push(jumpLine("", jt));
+      shapes.push(jumpLine("2", jt));
+      shapes.push(jumpLine("3", jt));
+    });
+  }
+  return shapes;
 }
 
 function timeEnd(d) {
@@ -426,7 +617,7 @@ function plotLayout(d) {
     paper_bgcolor: "#111", plot_bgcolor: "#1c1c1c", font: {color: "#ddd"},
     margin: {l: 72, r: 16, t: 28, b: 32},
     legend: {orientation: "h", y: 1.12},
-    shapes: [vline(""), vline("2"), vline("3")],
+    shapes: plotShapes(d),
     xaxis: Object.assign({anchor: "y", range: [0, timeEnd(d)]}, x),
     yaxis: {title: top, domain: [0.70, 1], anchor: "x", automargin: false},
     xaxis2: Object.assign({anchor: "y2", matches: "x"}, x),
@@ -451,6 +642,13 @@ function paintCursor() {
       x: [[c.p[0], c.tip[0]]], y: [[c.p[1], c.tip[1]]], z: [[c.p[2], c.tip[2]]]
     }, [axisIdx]));
   }
+  if (data.vt && data.vt.length) {
+    const q = data.vt[Math.min(j, data.vt.length - 1)];
+    const linkIdx = data.r4 ? 6 : 3;
+    jobs.push(Plotly.restyle("view3d", {
+      x: [[c.p[0], q[0]]], y: [[c.p[1], q[1]]], z: [[c.p[2], q[2]]]
+    }, [linkIdx]));
+  }
   Promise.all(jobs).then(() => {
     applyCamera(cam);
     requestAnimationFrame(() => applyCamera(cam));
@@ -471,7 +669,7 @@ async function show(keepFrame) {
   const d = await (await fetch("/api/episode?ep=" + i + "&mode=" + mode)).json();
   data = d;
   label.textContent = "episode " + d.episode + " / " + (counts[mode] - 1);
-  note.textContent = d.gap ? "RGB/depth gap > 0.5 s" : "";
+  note.textContent = noteText(d);
   time.max = Math.max(0, d.frame_t.length - 1);
   if (!keepFrame) fi = 0;
   fi = Math.max(0, Math.min(fi, d.frame_t.length - 1));
@@ -504,6 +702,72 @@ r4Btn.onclick = () => setMode("r4");
 document.getElementById("viewSide").onclick = () => setView("side");
 document.getElementById("viewTop").onclick = () => setView("top");
 document.getElementById("viewEnd").onclick = () => setView("end");
+document.getElementById("vt").onclick = () => {
+  showVt = !showVt;
+  document.getElementById("vt").classList.toggle("on", showVt);
+  if (!data) return;
+  sceneBox = sceneBoxFrom(data);
+  const layout = sceneLayout();
+  const cam = liveCamera();
+  const vtIdx = data.r4 ? 5 : 2;
+  const jobs = [
+    Plotly.restyle("view3d", {visible: showVt}, [vtIdx, vtIdx + 1]),
+    Plotly.relayout("view3d", {
+      "scene.xaxis.range": layout.scene.xaxis.range,
+      "scene.yaxis.range": layout.scene.yaxis.range,
+      "scene.zaxis.range": layout.scene.zaxis.range
+    })
+  ];
+  if (data.vt_n) {
+    const n = document.getElementById("plots").data.length;
+    jobs.push(Plotly.restyle("plots", {visible: showVt}, [n - 3, n - 2, n - 1]));
+  }
+  Promise.all(jobs).then(() => applyCamera(cam));
+};
+document.getElementById("odom").onclick = () => {
+  showOdom = !showOdom;
+  document.getElementById("odom").classList.toggle("on", showOdom);
+  if (!data) return;
+  sceneBox = sceneBoxFrom(data);
+  const layout = sceneLayout();
+  const cam = liveCamera();
+  const odomIdx = data.r4 ? 7 : 4;
+  const jobs = [
+    Plotly.restyle("view3d", {visible: showOdom}, [odomIdx, odomIdx + 1]),
+    Plotly.relayout("view3d", {
+      "scene.xaxis.range": layout.scene.xaxis.range,
+      "scene.yaxis.range": layout.scene.yaxis.range,
+      "scene.zaxis.range": layout.scene.zaxis.range
+    }),
+    Plotly.relayout("plots", {shapes: plotShapes(data)})
+  ];
+  Promise.all(jobs).then(() => applyCamera(cam));
+};
+document.getElementById("corr").onclick = () => {
+  showCorr = !showCorr;
+  document.getElementById("corr").classList.toggle("on", showCorr);
+  if (!data) return;
+  note.textContent = noteText(data);
+  sceneBox = sceneBoxFrom(data);
+  const layout = sceneLayout();
+  const cam = liveCamera();
+  const corrIdx = data.r4 ? 9 : 6;
+  const jobs = [
+    Plotly.restyle("view3d", {visible: showCorr}, [corrIdx]),
+    Plotly.relayout("view3d", {
+      "scene.xaxis.range": layout.scene.xaxis.range,
+      "scene.yaxis.range": layout.scene.yaxis.range,
+      "scene.zaxis.range": layout.scene.zaxis.range
+    })
+  ];
+  Promise.all(jobs).then(() => applyCamera(cam));
+};
+function noteText(d) {
+  const parts = [];
+  if (d.gap) parts.push("RGB/depth gap > 0.5 s");
+  if (showCorr && d.bad_span) parts.push("flagged " + d.bad_span[0] + "–" + d.bad_span[1] + " s");
+  return parts.join(" · ");
+}
 ep.oninput = () => show(false);
 time.oninput = () => { fi = +time.value; paintCursor(); };
 
@@ -621,7 +885,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, buf.getvalue(), "image/jpeg")
             return
         root = self.root_r4 if r4 else self.root_orig
-        payload = episode_payload(root, episode, r4, self._frame_times(episode))
+        # r4's own ts_pose_virtual_target_0 is the identity placeholder.
+        # The wrench label r1rel trains on still lives on the source zarr.
+        vt_xyz = None
+        if r4:
+            vt_xyz = virtual_target_xyz(self.root_orig["data"][f"episode_{episode}"])
+        payload = episode_payload(root, episode, r4, self._frame_times(episode), vt_xyz)
+        attach_raw_odom(payload, self.names[episode])
+        attach_corrected_pose(payload, self.names[episode])
         self._send(200, json.dumps(payload).encode(), "application/json")
 
 
