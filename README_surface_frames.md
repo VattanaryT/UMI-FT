@@ -137,7 +137,7 @@ First-pose gate (25 mm / 10°) is skipped for r2/r3/r4.
 
 ## Horizons, noise, eval mode
 
-Checkpoint `shape_meta` sets the predicted length (`sparse_action_horizon`, 24 or 64). The runner executes `sparse_execution_horizon` steps of that chunk, then replans. Config value is 6. If the loaded horizon is ≥ 64 and the config value is ≤ 16, the runner raises execution to 32. The h4s r4 checkpoint takes that branch: predict 64, execute 32, ensemble the overlap. Wall time between loop starts is `(exec − 1) * (1/15) * slow_down_factor`. Step 0 is retimed to `current_hardware_time_s` immediately before it is scheduled.
+Checkpoint `shape_meta` sets the predicted length (`sparse_action_horizon`, 24 or 64). The runner executes `sparse_execution_horizon` steps of that chunk, then replans. Config value is 6. `raise_exec_horizon_64_to_32` defaults off, so a 64-step checkpoint also executes 6. Turn it on to raise a ≥64-step chunk from a configured horizon ≤16 up to 32. Wall time between loop starts is `(exec − 1) * (1/15) * slow_down_factor`. Step 0 is retimed to `current_hardware_time_s` immediately before it is scheduled.
 
 Train diffusion steps: 50. Inference steps: 16, from `cfg.policy.num_inference_steps` applied in `load_policy`. Prediction target epsilon. The whole action is denoised (`cond_mask` all false).
 

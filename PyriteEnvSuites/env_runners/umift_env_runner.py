@@ -55,7 +55,13 @@ from PyriteUtility.planning_control.scan_encoder_monitor import (
     render_scan_panel,
     stack_for_display,
 )
-from PyriteUtility.planning_control.temporal_ensemble import PoseChunkEnsembler
+from PyriteUtility.planning_control.temporal_ensemble import (
+    DEFAULT_EXECUTION_HORIZON,
+    DEFAULT_RAISE_EXEC_64_TO_32,
+    blend_pose_chunk,
+    make_pose_ensembler,
+    resolve_execution_horizon,
+)
 from PyriteUtility.plotting.matplotlib_helpers import set_axes_equal
 from PyriteUtility.pytorch_utils.model_io import load_policy
 from PyriteUtility.spatial_math import spatial_utilities as su
@@ -745,16 +751,8 @@ def make_action_chunk_ensemblers(
     id_list: list,
     decay_m: float = 0.0,
 ) -> dict:
-    """One PoseChunkEnsembler per robot for live MPC temporal ensembling."""
-    return {
-        rid: PoseChunkEnsembler(
-            pose_keys=("pose7", "nominal_pose7"),
-            linear_keys=("stiffness", "eoat"),
-            weight_mode="exp",
-            decay_m=decay_m,
-        )
-        for rid in id_list
-    }
+    """One pose ensembler per robot. Same constructor the r1rel replay uses."""
+    return {rid: make_pose_ensembler(decay_m) for rid in id_list}
 
 
 if "PYRITE_CHECKPOINT_FOLDERS" not in os.environ:
@@ -909,9 +907,10 @@ def main():
         # Horizon-24 checkpoints execute 6 steps. At half speed that is
         # (6-1)*(1/15)*2 ≈ 0.67 s of wall clock between replans, so more
         # overlapping chunks vote on each pose. This dilutes a bad absolute
-        # pose; it does not cap the step. A 64-step checkpoint is raised
-        # to 32 below.
-        "sparse_execution_horizon": 6, # first step is at t=0, so this should be >1
+        # pose; it does not cap the step. A >=64-step checkpoint stays at
+        # this value unless raise_exec_horizon_64_to_32 is on.
+        "sparse_execution_horizon": DEFAULT_EXECUTION_HORIZON, # first step is at t=0, so this should be >1
+        "raise_exec_horizon_64_to_32": DEFAULT_RAISE_EXEC_64_TO_32,
         # Zero-added-latency temporal ensembling of overlapping action chunks.
         # Lower sparse_execution_horizon with this on increases overlap/smoothing.
         "enable_ensemble_chunking": True,
@@ -964,6 +963,11 @@ def main():
             "shared/fixb_field.npz"
         ),
         "mold_aware_abort_on_safety": True,
+        # Read only when the checkpoint action is r4vt. Ignored for r1rel.
+        # Measured TCP (p_meas - x_s)·n. 20 mm is past the demo contact tail.
+        "max_tcp_penetration_m": 0.020,
+        # Hold this replan at the cap; abort if the next replan is still there.
+        "wrench_hold_n": 90.0,
         # Per-rollout MP4s next to the control log: wrist D405 + center Orbbec.
         "record_rollout_cameras": True,
         "orbbec_v4l_device": DEFAULT_ORBBEC_V4L,
@@ -1046,6 +1050,7 @@ def main():
     # Mold-aware / Fix B: detect run type from checkpoint task name.
     mold_runtime = None
     mold_run_type = "none"
+    r4vt = False
     _task_name = ""
     _dataset_path_cfg = ""
     try:
@@ -1064,13 +1069,29 @@ def main():
     # right_base; keep T_fixture_from_right_base for mold obs/decode.
     mold_T_fixture_from_base: Optional[np.ndarray] = None
     if "robot0_mold_geom" in shape_meta["obs"]:
-        from mold_aware_runtime import MoldAwareRuntime, infer_run_type
+        from mold_aware_runtime import (
+            FixBActionEnsembler,
+            MoldAwareRuntime,
+            fixb_decode_dt,
+            infer_run_type,
+            r4_safety_limits,
+        )
 
         mold_run_type = infer_run_type(_task_name, shape_meta)
+        r4vt = mold_run_type == "r4_world_fixb_tilt"
+        r4_limits = (
+            r4_safety_limits(
+                max_tcp_penetration_m=float(control_para["max_tcp_penetration_m"]),
+                wrench_hold_n=float(control_para["wrench_hold_n"]),
+            )
+            if r4vt
+            else None
+        )
         mold_runtime = MoldAwareRuntime.from_assets(
             run_type=mold_run_type,
             field_path=Path(control_para["mold_aware_field_npz"]),
             dry_run=bool(control_para["mold_aware_dry_run"]),
+            limits=r4_limits,
         )
         mold_T_fixture_from_base = load_workcell_extrinsics().T_fixture_from_right_base
         # Depth stays at set_depth_to_zero (default True). These policies have a
@@ -1082,6 +1103,13 @@ def main():
             f"[mold] enabled run_type={mold_run_type} dry_run={mold_runtime.dry_run} "
             f"field={control_para['mold_aware_field_npz']}"
         )
+        if r4vt:
+            print(
+                f"[mold] r4vt action blend, "
+                f"dn_floor={mold_runtime.limits.enable_delta_n_floor} "
+                f"tcp_penetration_m={mold_runtime.limits.max_tcp_penetration_m} "
+                f"wrench_hold_n={mold_runtime.limits.wrench_hold_n}"
+            )
         print(
             f"[mold] set_depth_to_zero={control_para['set_depth_to_zero']}, "
             "periodic_scan_enabled=False; "
@@ -1340,11 +1368,16 @@ def main():
     ]
     sparse_action_horizon = int(shape_meta["sample"]["action"]["sparse"]["horizon"])
     exec_h_cfg = int(control_para["sparse_execution_horizon"])
-    if sparse_action_horizon >= 64 and exec_h_cfg <= 16:
-        control_para["sparse_execution_horizon"] = 32
+    exec_h_resolved = resolve_execution_horizon(
+        exec_h_cfg,
+        sparse_action_horizon,
+        bool(control_para["raise_exec_horizon_64_to_32"]),
+    )
+    if exec_h_resolved != exec_h_cfg:
+        control_para["sparse_execution_horizon"] = exec_h_resolved
         print(
             f"[horizon] action chunk {sparse_action_horizon}: "
-            f"sparse_execution_horizon {exec_h_cfg} -> 32"
+            f"sparse_execution_horizon {exec_h_cfg} -> {exec_h_resolved}"
         )
     # sparse_action_horizon_s = (
     #     sparse_action_horizon * sparse_action_down_sample_steps * p_timestep_s
@@ -1476,6 +1509,13 @@ def main():
         * control_para["slow_down_factor"]
     )
     printOrNot(vbs_h2, "Starting main loop.")
+    r4_action_ensembler = (
+        FixBActionEnsembler(
+            decay_m=float(control_para.get("ensemble_decay_m", 0.01))
+        )
+        if r4vt
+        else None
+    )
 
     printOrNot(vbs_h2, "Calibrating robot wrench.")
     env.calibrate_robot_wrench(NSamples=100)
@@ -1621,6 +1661,8 @@ def main():
             scan_monitor.reset()
         if mold_runtime is not None:
             mold_runtime.reset()
+        if r4vt:
+            r4_action_ensembler.reset()
         if control_para["enable_control_log"]:
             log_store = zarr.DirectoryStore(path=episode_log_path)
             log = zarr.open(store=log_store, mode="w")
@@ -1632,6 +1674,12 @@ def main():
             )
             log.attrs["ensemble_decay_m"] = float(
                 control_para.get("ensemble_decay_m", 0.0)
+            )
+            log.attrs["ensemble_mode"] = "action_blend" if r4vt else "pose"
+            log.attrs["decode_dt_s"] = float(
+                sparse_action_down_sample_steps
+                * p_timestep_s
+                * (1.0 if r4vt else control_para["slow_down_factor"])
             )
             log.attrs["episode_id"] = int(episode_id)
             log.attrs["rollout_id"] = rollout_id
@@ -1647,6 +1695,12 @@ def main():
                 log.attrs["max_tangential_speed_mps"] = float(
                     mold_runtime.limits.max_tangential_speed_mps
                 )
+                if r4vt:
+                    log.attrs["enable_delta_n_floor"] = False
+                    log.attrs["max_tcp_penetration_m"] = float(
+                        control_para["max_tcp_penetration_m"]
+                    )
+                    log.attrs["wrench_hold_n"] = float(control_para["wrench_hold_n"])
             log.attrs["log_policy_vision"] = bool(control_para["log_policy_vision"])
             printOrNot(vbs_h1, "Control log:", episode_log_path)
             printOrNot(vbs_h1, "Rollout ID:", rollout_id)
@@ -1795,6 +1849,24 @@ def main():
                 if wkey is not None:
                     w = np.asarray(obs_raw[wkey][-1], dtype=np.float64).reshape(-1)
                     ep_force.append(float(np.linalg.norm(w[:3])))
+                    if r4vt:
+                        decision = mold_runtime.wrench_hold_update(ep_force[-1])
+                        if decision == "abort":
+                            print_red(
+                                f"[mold][safety] wrench {ep_force[-1]:.1f} N "
+                                "still over the hold cap; aborting"
+                            )
+                            ep_n_safety_stops += 1
+                            ep_safety_reasons.append("wrench_abort")
+                            break
+                        if decision == "hold":
+                            print_yellow(
+                                f"[mold][hold] wrench {ep_force[-1]:.1f} N "
+                                f">= {mold_runtime.limits.wrench_hold_n:.0f} N; "
+                                "holding this replan"
+                            )
+                            time.sleep(max(0.0, execution_duration_s))
+                            continue
 
             raw_to_obs_inference(obs_raw, obs_task, shape_meta)
 
@@ -1874,14 +1946,21 @@ def main():
                 )
                 R0, p0 = _pose7_to_Rp(pose7_fix.reshape(1, 7))
                 raw_a = np.asarray(controller.last_raw_action, dtype=np.float64)
-                H = raw_a.shape[0]
-                dt = np.full(
-                    H,
-                    sparse_action_down_sample_steps
-                    * p_timestep_s
-                    * control_para["slow_down_factor"],
-                    dtype=np.float64,
-                )
+                if r4vt:
+                    exec_now = int(control_para["sparse_execution_horizon"])
+                    r4_action_ensembler.push(horizon_count * exec_now, raw_a)
+                    raw_a = r4_action_ensembler.pop(exec_now)
+                    dt = fixb_decode_dt(
+                        raw_a.shape[0], sparse_action_down_sample_steps, p_timestep_s
+                    )
+                else:
+                    dt = np.full(
+                        raw_a.shape[0],
+                        sparse_action_down_sample_steps
+                        * p_timestep_s
+                        * control_para["slow_down_factor"],
+                        dtype=np.float64,
+                    )
                 decoded = mold_runtime.decode_chunk(raw_a, p0[0], R0[0], dt)
                 # Robot schedule_controls expects right_base SE3.
                 R_base, p_base = se3_batch_fixture_to_base(
@@ -2199,7 +2278,7 @@ def main():
 
             # Blend overlapping chunk predictions (or hard-cut) down to execution horizon.
             exec_h = int(control_para["sparse_execution_horizon"])
-            if action_ensemblers is not None:
+            if action_ensemblers is not None and not r4vt:
                 start_step = horizon_count * exec_h
                 for id in id_list:
                     chunk_len = int(np.asarray(outputs_ts_targets[id]).shape[0])
@@ -2221,8 +2300,9 @@ def main():
                             outputs_eoat[id] if outputs_eoat is not None else None
                         ),
                     }
-                    action_ensemblers[id].push(start_step=start_step, fields=fields)
-                    blended = action_ensemblers[id].pop(exec_h)
+                    blended = blend_pose_chunk(
+                        action_ensemblers[id], start_step, fields, exec_h
+                    )
                     outputs_ts_targets[id] = blended["pose7"]
                     outputs_ts_nominal_targets[id] = blended["nominal_pose7"]
                     outputs_ts_stiffnesses[id] = _stiffness_per_step_to_6x6n(
@@ -2367,6 +2447,12 @@ def main():
                 control_para.get("enable_ensemble_chunking", False)
             ),
             "ensemble_decay_m": float(control_para.get("ensemble_decay_m", 0.0)),
+            "ensemble_mode": "action_blend" if r4vt else "pose",
+            "decode_dt_s": float(
+                sparse_action_down_sample_steps
+                * p_timestep_s
+                * (1.0 if r4vt else control_para["slow_down_factor"])
+            ),
             "horizons": horizon_banner,
             "control_log": finished_episode_log_path,
             "camera_hz_expected": CAMERA_HZ,
@@ -2382,6 +2468,12 @@ def main():
             journal["enable_mesh_jump_hold"] = bool(
                 mold_runtime.limits.enable_mesh_jump_hold
             )
+            if r4vt:
+                journal["enable_delta_n_floor"] = False
+                journal["max_tcp_penetration_m"] = float(
+                    control_para["max_tcp_penetration_m"]
+                )
+                journal["wrench_hold_n"] = float(control_para["wrench_hold_n"])
         if cam_info is not None:
             journal["wrist_rate"] = cam_info.get("wrist_rate")
             journal["center_rate"] = cam_info.get("center_rate")

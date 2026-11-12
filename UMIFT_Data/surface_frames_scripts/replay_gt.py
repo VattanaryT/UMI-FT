@@ -24,8 +24,17 @@ from PyriteConfig.tasks.umift.umift_type_conversions import (
     action21_to_action_sample,
     raw_to_action21,
 )
-from PyriteUtility.planning_control.temporal_ensemble import ensemble_chunks_offline
+from PyriteUtility.planning_control.temporal_ensemble import (
+    ensemble_chunks_offline,
+    resolve_execution_horizon,
+)
 import PyriteUtility.spatial_math.spatial_utilities as su
+from mold_aware_runtime import (
+    FixBActionEnsembler,
+    blend_action_rows,
+    fixb_decode_dt,
+    mean_rotation,
+)
 
 DATA = Path("/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr")
 R4VT_ZARR = DATA / "r4vt_world_fixb_tilt" / "acp_replay_buffer.zarr"
@@ -41,7 +50,7 @@ EXPORT_ROOT = Path("/mnt/data/umidata/ft/replay_exports")
 
 ACTION_HORIZON = 64
 EXEC_HORIZONS = (6, 32)
-RUNNER_DT_S = (1.0 / 15.0) * 2.0
+RUNNER_DT_S = 1.0 / 15.0  # fixb_decode_dt; slow-down stays on the waypoint clock
 DECAY_M = 0.01
 PRESS_FLOOR_M = -0.005
 CONTACT_N = 8.0
@@ -49,23 +58,8 @@ EXCLUDED_R4VT = (35, 44)
 VAL_SEED = 42
 VAL_RATIO = 0.1
 
-# The configured execution horizon is 6. This block raises it to 32 when the
-# checkpoint action horizon is at least 64. This replay scores both and does
-# not edit the runner.
-RUNNER_OVERRIDE = {
-    "file": "PyriteEnvSuites/env_runners/umift_env_runner.py",
-    "lines": "1341-1348",
-    "text": (
-        "sparse_action_horizon = int(shape_meta[\"sample\"][\"action\"][\"sparse\"][\"horizon\"])\n"
-        "exec_h_cfg = int(control_para[\"sparse_execution_horizon\"])\n"
-        "if sparse_action_horizon >= 64 and exec_h_cfg <= 16:\n"
-        "    control_para[\"sparse_execution_horizon\"] = 32\n"
-        "    print(\n"
-        "        f\"[horizon] action chunk {sparse_action_horizon}: \"\n"
-        "        f\"sparse_execution_horizon {exec_h_cfg} -> 32\"\n"
-        "    )"
-    ),
-}
+# Configured execution horizon is 6. raise_exec_horizon_64_to_32 defaults off,
+# so a 64-step checkpoint stays at 6. Turn the key on to restore the raise to 32.
 
 _FIELD = None
 _SCALE = {}
@@ -414,7 +408,7 @@ def replay_horizon(group, arm: str, episode: int, exec_h: int, scale, offset, ru
                 action,
                 demo[head, :3],
                 tool_r,
-                np.full(ACTION_HORIZON, RUNNER_DT_S),
+                fixb_decode_dt(ACTION_HORIZON, 1, RUNNER_DT_S),
                 apply_safety=False,
             )
             pose, stiff = _nominal_pose(None, base, "r4vt", decoded)
@@ -444,7 +438,14 @@ def replay_horizon(group, arm: str, episode: int, exec_h: int, scale, offset, ru
 
     if not chunks:
         raise RuntimeError(f"{arm} episode {episode} produced no {exec_h}-step windows")
-    blended = blend_executed(chunks, exec_h)
+    if arm == "r1rel":
+        from PyriteUtility.planning_control.temporal_ensemble import (
+            ensemble_pose_chunks,
+        )
+
+        blended = ensemble_pose_chunks(chunks, exec_h, DECAY_M)
+    else:
+        blended = blend_executed(chunks, exec_h)
     idx = np.concatenate(exec_idx)
     clean = ~(bad[idx] | long_dt[idx])
     ens_pose = blended["nominal_pose7"]
@@ -489,7 +490,7 @@ def replay_horizon(group, arm: str, episode: int, exec_h: int, scale, offset, ru
     }
 
 
-def replay_episode(arm: str, episode: int) -> dict:
+def replay_episode(arm: str, episode: int, exec_horizons=EXEC_HORIZONS) -> dict:
     if arm == "r4vt" and int(episode) in EXCLUDED_R4VT:
         raise RuntimeError(f"r4vt does not replay episode {episode}")
     if arm == "r4vt":
@@ -524,7 +525,7 @@ def replay_episode(arm: str, episode: int) -> dict:
             "ts_pose_fb_0": sha256_array(np.asarray(group["ts_pose_fb_0"])),
             "stiffness_0": sha256_array(np.asarray(group["stiffness_0"])),
         }
-    for exec_h in EXEC_HORIZONS:
+    for exec_h in exec_horizons:
         report["horizons"][str(exec_h)] = replay_horizon(
             group, arm, episode, exec_h, scale, offset, runtime
         )
@@ -553,7 +554,8 @@ def _settings(arm: str, episodes) -> dict:
         "contact_n": CONTACT_N,
         "anchor": "demo TCP at the chunk start",
         "r4vt_label_test_anchor": "stored mold_x_s_0 and fixb_dt_next_0",
-        "runner_override": RUNNER_OVERRIDE,
+        "raise_exec_horizon_64_to_32": False,
+        "resolved_execution_horizon": resolve_execution_horizon(action_horizon=ACTION_HORIZON),
         "sha256": {
             "normalizer": sha256_file(norm),
             "normalizer_expected": expected,
@@ -640,56 +642,10 @@ def write_exports(episodes=(0, 9)) -> list[Path]:
     return written
 
 
-def mean_rotation(rotations: np.ndarray, weights: np.ndarray) -> np.ndarray:
-    """Weighted rotation mean. Quaternion signs are aligned to the heaviest sample."""
-    from scipy.spatial.transform import Rotation
-
-    mats = np.asarray(rotations, dtype=np.float64).reshape(-1, 3, 3)
-    w = np.asarray(weights, dtype=np.float64).reshape(-1)
-    quats = Rotation.from_matrix(mats).as_quat()
-    reference = quats[int(np.argmax(w))]
-    flip = np.sum(quats * reference, axis=1) < 0.0
-    quats = np.where(flip[:, None], -quats, quats)
-    total = np.sum(quats * w[:, None], axis=0)
-    norm = float(np.linalg.norm(total))
-    if norm == 0.0:
-        total = reference
-    else:
-        total = total / norm
-    return Rotation.from_quat(total).as_matrix()
-
-
-def blend_action_rows(actions, starts, steps, decay_m: float = DECAY_M) -> np.ndarray:
-    """Average v, δn, and ΔR from every chunk that predicts each absolute step.
-
-    ``actions[k][i]`` is the prediction of absolute step ``starts[k] + i``.
-    The other action columns are copied from the heaviest contributor.
-    """
-    from fixb_labels import so3_to_rot6d_rows
-    from mold_aware_runtime import rot6d_rows_to_R
-
-    actions = [np.asarray(a, dtype=np.float64) for a in actions]
-    starts = [int(s) for s in starts]
-    horizon = actions[0].shape[0]
-    out = np.zeros((len(steps), actions[0].shape[1]), dtype=np.float64)
-    for row, step in enumerate(steps):
-        chosen = []
-        for action, start in zip(actions, starts):
-            index = int(step) - start
-            if 0 <= index < horizon:
-                weight = float(np.exp(-float(decay_m) * index))
-                chosen.append((weight, action[index]))
-        weights = np.array([item[0] for item in chosen], dtype=np.float64)
-        rows = np.stack([item[1] for item in chosen], axis=0)
-        total = float(np.sum(weights))
-        base = rows[int(np.argmax(weights))].copy()
-        base[0:2] = np.sum(rows[:, 0:2] * weights[:, None], axis=0) / total
-        base[2] = float(np.sum(rows[:, 2] * weights) / total)
-        base[21:27] = so3_to_rot6d_rows(
-            mean_rotation(rot6d_rows_to_R(rows[:, 21:27]), weights)
-        ).reshape(6)
-        out[row] = base
-    return out
+def _frame_flags(r_dec: np.ndarray, r_stored: np.ndarray) -> tuple[bool, bool]:
+    n_dot = float(np.dot(r_dec[:, 2], r_stored[:, 2]))
+    t_dot = float(np.dot(r_dec[:, 0], r_stored[:, 0]))
+    return n_dot > 0.5 and t_dot < 0.0, n_dot < 0.0
 
 
 def _rgb_aligned_dt(group) -> dict:
@@ -734,26 +690,30 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
     stored_foot = np.asarray(group["mold_x_s_0"], dtype=np.float64)
     stored_n = np.asarray(group["mold_normal_0"], dtype=np.float64)
     stored_dn = np.asarray(group["fixb_delta_n_0"], dtype=np.float64).reshape(-1)
+    stored_r = np.asarray(group["mold_R_field_0"], dtype=np.float64).reshape(-1, 3, 3)
     windows = _windows(robot_t, rgb_t, exec_h)
     actions = []
     for indices in windows:
         actions.append(
             roundtrip_action(_action_rows(group, indices, with_delta_r=True), scale, offset)
         )
-    starts = [k * int(exec_h) for k in range(len(windows))]
     chunks = []
     foot = {"off": [], "pose": [], "action": []}
     depth = {"off": [], "pose": [], "action": []}
     rot = {"off": [], "pose": [], "action": []}
     used_idx = []
+    outliers = []
     field = _mold_field()
+    ensembler = FixBActionEnsembler(decay_m=DECAY_M)
+    dt_chunk = fixb_decode_dt(ACTION_HORIZON, 1, RUNNER_DT_S)
+    dt_exec = fixb_decode_dt(exec_h, 1, RUNNER_DT_S)
     for k, indices in enumerate(windows):
         head = int(indices[0])
         decoded = runtime.decode_chunk(
             actions[k],
             demo[head, :3],
             _pose_R(demo[head])[0],
-            np.full(ACTION_HORIZON, dt_s),
+            dt_chunk,
             apply_safety=False,
         )
         pose, stiff = _nominal_pose(None, None, "r4vt", decoded)
@@ -761,17 +721,29 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
         sl = slice(0, exec_h)
         used = indices[sl]
         tool_r = _pose_R(demo[used])
-        foot["off"].append(_inplane(decoded["x_s"][sl], stored_foot[used], stored_n[used]))
+        foot_off = _inplane(decoded["x_s"][sl], stored_foot[used], stored_n[used])
+        rot_off = geodesic_deg(decoded["R_d"][sl], tool_r)
+        foot["off"].append(foot_off)
         depth["off"].append(np.abs(np.asarray(decoded["sd"][sl]) - stored_dn[used]))
-        rot["off"].append(geodesic_deg(decoded["R_d"][sl], tool_r))
-        blended_action = blend_action_rows(
-            actions, starts, [starts[k] + j for j in range(exec_h)]
-        )
+        rot["off"].append(rot_off)
+        for j in np.flatnonzero(rot_off > 90.0):
+            t1_flip, n_flip = _frame_flags(decoded["R_field"][j], stored_r[int(used[j])])
+            outliers.append(
+                {
+                    "robot_index": int(used[j]),
+                    "step_in_window": int(j),
+                    "rot_deg": float(rot_off[j]),
+                    "foot_m": float(foot_off[j]),
+                    "t1_flip": t1_flip,
+                    "n_flip": n_flip,
+                }
+            )
+        ensembler.push(k * int(exec_h), actions[k])
         action_decoded = runtime.decode_chunk(
-            blended_action,
+            ensembler.pop(exec_h),
             demo[head, :3],
             _pose_R(demo[head])[0],
-            np.full(exec_h, dt_s),
+            dt_exec,
             apply_safety=False,
         )
         foot["action"].append(
@@ -793,6 +765,8 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
         "dt_s": float(dt_s),
         "execution_horizon": int(exec_h),
         "label_dt": _rgb_aligned_dt(group),
+        "decode_dt_s": float(dt_chunk[0]),
+        "rotation_gt_90_ensemble_off": outliers,
     }
     for name in ("off", "pose", "action"):
         report[name] = {
@@ -801,6 +775,42 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
             "rotation_deg": _column(np.concatenate(rot[name]), clean),
         }
     return report
+
+
+def write_runtime_replay(episodes=(0, 9)) -> None:
+    """Episodes 0 and 9 through the runner's dt and FixBActionEnsembler."""
+    out = EXPORT_ROOT / "gt_r4_runtime_fix"
+    settings = out / "settings.json"
+    if settings.exists():
+        raise SystemExit(f"refusing to overwrite {settings}")
+    out.mkdir(parents=True, exist_ok=True)
+    for episode in episodes:
+        for exec_h in EXEC_HORIZONS:
+            report = action_blend_episode(int(episode), int(exec_h))
+            path = out / f"episode_{int(episode)}_h{int(exec_h)}.json"
+            path.write_text(json.dumps(report, indent=2) + "\n")
+            print(_format_action_blend(report), flush=True)
+            big = report["rotation_gt_90_ensemble_off"]
+            print(f"  rot>90 ensemble off: {len(big)}", flush=True)
+            for row in big:
+                print(
+                    f"    idx {row['robot_index']} step {row['step_in_window']} "
+                    f"rot {row['rot_deg']:.1f} foot {row['foot_m'] * 1e3:.1f} mm "
+                    f"t1_flip {row['t1_flip']} n_flip {row['n_flip']}",
+                    flush=True,
+                )
+    settings.write_text(
+        json.dumps(
+            {
+                "episodes": [int(ep) for ep in episodes],
+                "decode": "fixb_decode_dt(down_sample_steps=1, raw_time_step_s=1/15)",
+                "ensemble": "FixBActionEnsembler",
+                "execution_horizons": list(EXEC_HORIZONS),
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 def write_action_blend(episodes=(0, 9)) -> None:

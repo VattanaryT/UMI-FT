@@ -223,6 +223,62 @@ class PoseChunkEnsembler:
         return self._next_pop_step
 
 
+DEFAULT_EXECUTION_HORIZON = 6
+DEFAULT_RAISE_EXEC_64_TO_32 = False
+
+
+def resolve_execution_horizon(
+    configured: int = DEFAULT_EXECUTION_HORIZON,
+    action_horizon: int = 64,
+    raise_64_to_32: bool = DEFAULT_RAISE_EXEC_64_TO_32,
+) -> int:
+    """Keep the configured horizon unless the 64-step raise is turned on."""
+    configured = int(configured)
+    if bool(raise_64_to_32) and int(action_horizon) >= 64 and configured <= 16:
+        return 32
+    return configured
+
+
+R1_POSE_KEYS = ("pose7", "nominal_pose7")
+R1_LINEAR_KEYS = ("stiffness", "eoat")
+
+
+def make_pose_ensembler(decay_m: float = 0.0) -> PoseChunkEnsembler:
+    """The ensembler the r1rel runner loop constructs."""
+    return PoseChunkEnsembler(
+        pose_keys=R1_POSE_KEYS,
+        linear_keys=R1_LINEAR_KEYS,
+        weight_mode="exp",
+        decay_m=float(decay_m),
+    )
+
+
+def blend_pose_chunk(ensembler: PoseChunkEnsembler, start_step: int, fields, n: int):
+    """One live replan: push this chunk, pop the steps that will be sent."""
+    ensembler.push(start_step=int(start_step), fields=fields)
+    return ensembler.pop(int(n))
+
+
+def ensemble_pose_chunks(chunks, execution_horizon: int, decay_m: float = 0.01):
+    """Offline r1rel replay of the live push/pop, same ensembler."""
+    ensembler = make_pose_ensembler(decay_m)
+    executed = {"pose7": [], "nominal_pose7": [], "stiffness": []}
+    start = 0
+    for chunk in chunks:
+        fields = {
+            "pose7": np.asarray(chunk["pose7"], dtype=np.float64),
+            "nominal_pose7": np.asarray(chunk["nominal_pose7"], dtype=np.float64),
+            "stiffness": np.asarray(chunk["stiffness"], dtype=np.float64).reshape(-1),
+            "eoat": None,
+        }
+        blended = blend_pose_chunk(ensembler, start, fields, execution_horizon)
+        executed["pose7"].append(blended["pose7"])
+        executed["nominal_pose7"].append(blended["nominal_pose7"])
+        executed["stiffness"].append(np.asarray(blended["stiffness"]).reshape(-1))
+        start += int(execution_horizon)
+    return {key: np.concatenate(parts, axis=0) for key, parts in executed.items()}
+
+
 def ensemble_chunks_offline(
     chunks: Sequence[Mapping[str, Optional[np.ndarray]]],
     execution_horizon: int,
