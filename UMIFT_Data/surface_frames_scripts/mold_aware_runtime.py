@@ -70,6 +70,13 @@ def infer_run_type(task_name: str, shape_meta) -> str:
 @dataclass
 class SafetyLimits:
     max_press_depth_m: float = 0.005
+    enable_delta_n_floor: bool = True
+    # Measured TCP only: (p_meas - x_s) · n. Negative is into the mold.
+    max_tcp_penetration_m: float = 0.020
+    enable_tcp_penetration_abort: bool = False
+    # First replan at or above this holds; the next one still there aborts.
+    wrench_hold_n: float = 90.0
+    enable_wrench_hold: bool = False
     dry_run_hover_m: float = 0.015
     max_force_n: float = 80.0
     # Live policy peaks ~0.19 m/s on val demos; 0.25 leaves headroom without aborting.
@@ -98,7 +105,121 @@ SOFT_CLAMP_KEYS = (
     "max_rot_rate",
     "mesh_jump_hold",
 )
-HARD_STOP_KEYS = ("normal_flip", "max_distance_from_mesh")
+HARD_STOP_KEYS = (
+    "normal_flip",
+    "max_distance_from_mesh",
+    "tcp_penetration",
+    "wrench_abort",
+)
+
+
+def fixb_decode_dt(
+    n_steps: int, down_sample_steps: int, raw_time_step_s: float
+) -> np.ndarray:
+    """Demo-time step for Fix B integration. Slow-down stays on the waypoint clock."""
+    step_s = float(down_sample_steps) * float(raw_time_step_s)
+    return np.full(int(n_steps), step_s, dtype=np.float64)
+
+
+def r4_safety_limits(
+    max_tcp_penetration_m: float = 0.020, wrench_hold_n: float = 90.0
+) -> SafetyLimits:
+    """r4vt: no δn floor. Abort on measured TCP depth. Hold, then abort, on force."""
+    return SafetyLimits(
+        enable_delta_n_floor=False,
+        enable_tcp_penetration_abort=True,
+        max_tcp_penetration_m=float(max_tcp_penetration_m),
+        enable_wrench_hold=True,
+        wrench_hold_n=float(wrench_hold_n),
+    )
+
+
+def mean_rotation(rotations: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """Weighted rotation mean. Quaternion signs follow the heaviest sample."""
+    mats = np.asarray(rotations, dtype=np.float64).reshape(-1, 3, 3)
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    quats = Rotation.from_matrix(mats).as_quat()
+    reference = quats[int(np.argmax(w))]
+    flip = np.sum(quats * reference, axis=1) < 0.0
+    quats = np.where(flip[:, None], -quats, quats)
+    total = np.sum(quats * w[:, None], axis=0)
+    norm = float(np.linalg.norm(total))
+    total = reference if norm == 0.0 else total / norm
+    return Rotation.from_quat(total).as_matrix()
+
+
+def blend_action_rows(actions, starts, steps, decay_m: float = 0.01) -> np.ndarray:
+    """Average v, δn, and ΔR from every chunk that predicts each absolute step.
+
+    ``actions[k][i]`` predicts absolute step ``starts[k] + i``. Other columns
+    come from the heaviest contributor, newest chunk on a tie.
+    """
+    from fixb_labels import so3_to_rot6d_rows
+
+    actions = [np.asarray(a, dtype=np.float64) for a in actions]
+    starts = [int(s) for s in starts]
+    horizon = actions[0].shape[0]
+    width = actions[0].shape[1]
+    out = np.zeros((len(steps), width), dtype=np.float64)
+    for row, step in enumerate(steps):
+        chosen = []
+        for action, start in zip(actions, starts):
+            index = int(step) - start
+            if 0 <= index < horizon:
+                chosen.append((float(np.exp(-float(decay_m) * index)), action[index]))
+        if not chosen:
+            raise KeyError(f"no action chunk covers absolute step {step}")
+        weights = np.array([item[0] for item in chosen], dtype=np.float64)
+        rows = np.stack([item[1] for item in chosen], axis=0)
+        total = float(np.sum(weights))
+        best = int(np.argmax(weights))
+        # argmax keeps the first max. Walk so a later equal weight wins.
+        for i, weight in enumerate(weights):
+            if weight >= weights[best]:
+                best = i
+        base = rows[best].copy()
+        base[0:2] = np.sum(rows[:, 0:2] * weights[:, None], axis=0) / total
+        base[2] = float(np.sum(rows[:, 2] * weights) / total)
+        if width >= 27:
+            base[21:27] = so3_to_rot6d_rows(
+                mean_rotation(rot6d_rows_to_R(rows[:, 21:27]), weights)
+            ).reshape(6)
+        out[row] = base
+    return out
+
+
+class FixBActionEnsembler:
+    """Overlap raw r4 chunks, then the runner integrates the blend once."""
+
+    def __init__(self, decay_m: float = 0.01):
+        self.decay_m = float(decay_m)
+        self._chunks: list = []
+        self._next = 0
+
+    def reset(self) -> None:
+        self._chunks.clear()
+        self._next = 0
+
+    def push(self, start_step: int, action: np.ndarray) -> None:
+        self._chunks.append((int(start_step), np.asarray(action, dtype=np.float64)))
+
+    def pop(self, n: int) -> np.ndarray:
+        if n <= 0:
+            raise ValueError(f"pop n must be > 0, got {n}")
+        steps = [self._next + i for i in range(int(n))]
+        blended = blend_action_rows(
+            [action for _start, action in self._chunks],
+            [start for start, _action in self._chunks],
+            steps,
+            decay_m=self.decay_m,
+        )
+        self._next += int(n)
+        self._chunks = [
+            (start, action)
+            for start, action in self._chunks
+            if start + len(action) > self._next
+        ]
+        return blended
 
 
 def _clamp_tilt_to_normal(R_d: np.ndarray, n: np.ndarray, max_deg: float) -> tuple:
@@ -151,6 +272,7 @@ class MoldAwareRuntime:
     dry_run: bool = True
     _prev_foot: Optional[np.ndarray] = None
     _prev_n: Optional[np.ndarray] = None
+    _wrench_over: bool = False
     last_triggers: list = field(default_factory=list)
     # Per-step bool masks from the latest decode_chunk (length H).
     last_clamp_speed: Optional[np.ndarray] = None
@@ -182,6 +304,7 @@ class MoldAwareRuntime:
     def reset(self) -> None:
         self._prev_foot = None
         self._prev_n = None
+        self._wrench_over = False
         self.last_triggers = []
         self.last_clamp_speed = None
         self.last_clamp_step = None
@@ -223,6 +346,7 @@ class MoldAwareRuntime:
         # sd of the *tool* vs foot (same as training labels)
         n = q["R"][..., 2]
         sd = np.sum((p_fb - x) * n, axis=1)
+        self.note_tcp_penetration(sd)
         if self._prev_n is not None and self.limits.stop_on_normal_flip:
             if float(np.dot(self._prev_n, n[-1])) < 0:
                 self.last_triggers.append("normal_flip")
@@ -260,11 +384,34 @@ class MoldAwareRuntime:
         if self.dry_run:
             delta_n[:] = self.limits.dry_run_hover_m
             # dry-run override is intentional hover, not a press-depth clamp
-        elif apply_safety:
+        elif apply_safety and self.limits.enable_delta_n_floor:
             floor = -self.limits.max_press_depth_m
             clamp_dn = delta_n_raw < floor
             delta_n = np.maximum(delta_n_raw, floor)
         return v_par, delta_n, a[:, 18], a[:, 19:21], a, clamp_dn
+
+    def note_tcp_penetration(self, sd: np.ndarray) -> None:
+        """Abort when the measured TCP, not the virtual target, is too deep."""
+        if not self.limits.enable_tcp_penetration_abort:
+            return
+        depth = np.asarray(sd, dtype=np.float64).reshape(-1)
+        if np.any(depth < -float(self.limits.max_tcp_penetration_m)):
+            self.last_triggers.append("tcp_penetration")
+
+    def wrench_hold_update(self, force_n: float) -> str:
+        """'ok', 'hold', or 'abort'. Hold on the first sample at the cap."""
+        if not self.limits.enable_wrench_hold:
+            return "ok"
+        if float(force_n) < float(self.limits.wrench_hold_n):
+            self._wrench_over = False
+            return "ok"
+        if self._wrench_over:
+            self._wrench_over = True
+            self.last_triggers.append("wrench_abort")
+            return "abort"
+        self._wrench_over = True
+        self.last_triggers.append("wrench_hold")
+        return "hold"
 
     def decode_chunk(
         self,
