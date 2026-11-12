@@ -93,7 +93,7 @@ apptainer exec "${APPTAINER_ARGS[@]}" "${SIF}" \
     checkpoint.topk.monitor_key=val_loss \
     checkpoint.topk.mode=min \
     checkpoint.topk.k=1 \
-    'checkpoint.topk.format_str=epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt' \
+    'checkpoint.topk.format_str="epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt"' \
     checkpoint.save_last_ckpt=true \
     task.drop_depth_inputs=true \
     task.sparse_obs_rgb_down_sample_steps=4 \
