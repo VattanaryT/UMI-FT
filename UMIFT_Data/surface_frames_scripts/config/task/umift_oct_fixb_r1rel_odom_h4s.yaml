@@ -1,0 +1,21 @@
+# October r1rel, 4.0 s lookback, on the odom-corrected TCP.
+# Inherits umift_oct_fixb_r1rel_h4s: relative obs, relative action, mold geom,
+# RGB/depth 16×4, pose and mold 51×16, wrench 118×1, action 64×1.
+# Drops bad spans and long waits. Episodes 35 and 44 stay.
+# The old pose-jump flags are not applied.
+defaults:
+  - umift_oct_fixb_r1rel_h4s
+  - _self_
+
+name: OCT-V35-FIXB-R1REL-ODOM-H4S
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r1rel_world/acp_replay_buffer.zarr
+
+dataset:
+  _target_: fixb_r1rel_dataset.UmiFTDatasetR1RelFiltered
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r1rel_odom_action_pose_normalizer_2c20fba56851.pkl
+  action_normalizer_sha256: 2c20fba56851f59ec7d1a652d4e08a979ec9f7a8ea46368737df984475a0cf05
+  pose_jump_flag_path: null
+  exclude_episodes: []
+  long_dt_mask_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/shared/long_dt_gt_100ms.npz
+  exclusion_stats_path: /mnt/data/umidata/ft/training_outputs/oct_v35_r1rel_odom_stats.json

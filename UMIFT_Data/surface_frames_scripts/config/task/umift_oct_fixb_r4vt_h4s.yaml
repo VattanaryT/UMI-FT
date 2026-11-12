@@ -1,0 +1,21 @@
+# October r4vt, 4.0 s lookback. Same horizons as umift_oct_fixb_r4_h4s.
+# Samples from the corrected-pose r4vt zarr. Episodes 35 and 44 are removed.
+# bad_span_0 and the long-dt mask drop queries whose action targets hit them.
+# The old pose-jump flags are not applied: those times were measured before the
+# teleport correction.
+defaults:
+  - umift_oct_fixb_r4_h4s
+  - _self_
+
+name: OCT-V35-FIXB-R4VT-H4S
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_world_fixb_tilt/acp_replay_buffer.zarr
+
+dataset:
+  _target_: fixb_r4vt_dataset.UmiFTDatasetR4VT
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_exbad.pkl
+  action_normalizer_sha256: ac13d3fd7b647541d093688896ff43f1edb3a025397b6037da01dfffb6707bee
+  pose_jump_flag_path: null
+  exclude_episodes: [35, 44]
+  long_dt_mask_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/shared/long_dt_gt_100ms.npz
+  exclusion_stats_path: /mnt/data/umidata/ft/training_outputs/oct_v35_r4vt_exbad_stats.json
