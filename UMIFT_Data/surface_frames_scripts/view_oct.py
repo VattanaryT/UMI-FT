@@ -6,6 +6,7 @@
 http://127.0.0.1:8765
   r1rel  source zarr, one-step motion in the current tool frame (standard BC)
   r4     mold copy with v1, v2, n and tilt
+  r4vt   corrected-pose copy; n is the virtual-target depth. Episodes 35 and 44 are excluded.
 Left/right arrows step the wrist frame and the marker on the 3D path.
 Up/down arrows change episode. Drag the 3D view to rotate.
 """
@@ -32,6 +33,11 @@ R4 = (
 FIELD = (
     "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/shared/fixb_field.npz"
 )
+ODOM_ROOT = Path("/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr")
+R1REL = ODOM_ROOT / "r1rel_world" / "acp_replay_buffer.zarr"
+R4VT = ODOM_ROOT / "r4vt_world_fixb_tilt" / "acp_replay_buffer.zarr"
+LABEL_STATS = ODOM_ROOT / "shared" / "label_stats.json"
+R4VT_EXCLUDED = (35, 44)
 BAG_DIR = Path("/mnt/data/umidata/ft/datasets/stringer_v3.5/bags")
 TAG_DIR = Path("/mnt/data/umidata/ft/datasets/stringer_v3.5/tag_traj")
 UNIFIED_DIR = Path("/mnt/data/umidata/ft/datasets/stringer_v3.5/zarr")
@@ -304,6 +310,7 @@ button { background:#222; color:#ddd; border:1px solid #444; padding:4px 10px; }
 button.on { background:#1a5276; }
 input[type=range] { width:180px; }
 #note { color:#f5b041; }
+#flag { color:#e74c3c; font-weight:700; }
 #hint { color:#888; font-size:13px; }
 .top { display:grid; grid-template-columns: 340px minmax(0,1fr); height:48vh; }
 #wrist { width:100%; height:100%; object-fit:contain; background:#000; }
@@ -313,6 +320,8 @@ input[type=range] { width:180px; }
 <div class="bar">
   <button id="rel">r1rel</button>
   <button id="r4" class="on">r4</button>
+  <button id="r4vt">r4vt</button>
+  <span id="flag"></span>
   <span>episode</span>
   <input id="ep" type="range" min="0" max="49" value="0">
   <span id="label">episode 0</span>
@@ -337,6 +346,8 @@ input[type=range] { width:180px; }
 <script>
 const relBtn = document.getElementById("rel");
 const r4Btn = document.getElementById("r4");
+const r4vtBtn = document.getElementById("r4vt");
+const flag = document.getElementById("flag");
 const ep = document.getElementById("ep");
 const time = document.getElementById("time");
 const label = document.getElementById("label");
@@ -347,7 +358,7 @@ let mode = "r4";
 let showVt = false;
 let showOdom = false;
 let showCorr = false;
-let counts = {r1rel: 50, r4: 50};
+let counts = {r1rel: 50, r4: 50, r4vt: 50};
 let mesh = null;
 let data = null;
 let fi = 0;
@@ -585,6 +596,14 @@ function jumpLine(n, t) {
   };
 }
 
+function shadeRect(n, t0, t1) {
+  return {
+    type: "rect", xref: "x" + n, yref: "y" + n + " domain",
+    x0: t0, x1: t1, y0: 0, y1: 1,
+    fillcolor: "rgba(245,176,65,0.22)", line: {width: 0}, layer: "below"
+  };
+}
+
 function plotShapes(d) {
   const shapes = [vline(""), vline("2"), vline("3")];
   const t = d.frame_t && d.frame_t.length ? d.frame_t[Math.max(0, Math.min(fi, d.frame_t.length - 1))] : 0;
@@ -596,6 +615,9 @@ function plotShapes(d) {
       shapes.push(jumpLine("3", jt));
     });
   }
+  (d.shade || []).forEach(span => {
+    ["", "2", "3"].forEach(n => shapes.push(shadeRect(n, span[0], span[1])));
+  });
   return shapes;
 }
 
@@ -670,6 +692,7 @@ async function show(keepFrame) {
   data = d;
   label.textContent = "episode " + d.episode + " / " + (counts[mode] - 1);
   note.textContent = noteText(d);
+  flag.textContent = d.excluded ? "EXCLUDED from r4vt" : (d.r4vt ? "r4vt excludes 35 and 44" : "");
   time.max = Math.max(0, d.frame_t.length - 1);
   if (!keepFrame) fi = 0;
   fi = Math.max(0, Math.min(fi, d.frame_t.length - 1));
@@ -684,6 +707,7 @@ function setMode(next) {
   mode = next;
   relBtn.classList.toggle("on", mode === "r1rel");
   r4Btn.classList.toggle("on", mode === "r4");
+  r4vtBtn.classList.toggle("on", mode === "r4vt");
   ep.max = counts[mode] - 1;
   if (+ep.value > +ep.max) ep.value = ep.max;
   show(false);
@@ -699,6 +723,7 @@ function setView(name) {
 
 relBtn.onclick = () => setMode("r1rel");
 r4Btn.onclick = () => setMode("r4");
+r4vtBtn.onclick = () => setMode("r4vt");
 document.getElementById("viewSide").onclick = () => setView("side");
 document.getElementById("viewTop").onclick = () => setView("top");
 document.getElementById("viewEnd").onclick = () => setView("end");
@@ -765,6 +790,9 @@ document.getElementById("corr").onclick = () => {
 function noteText(d) {
   const parts = [];
   if (d.gap) parts.push("RGB/depth gap > 0.5 s");
+  if (d.shade && d.shade.length) {
+    d.shade.forEach(span => parts.push("bad " + span[0] + "–" + span[1] + " s"));
+  }
   if (showCorr && d.bad_span) parts.push("flagged " + d.bad_span[0] + "–" + d.bad_span[1] + " s");
   return parts.join(" · ");
 }
@@ -794,11 +822,20 @@ window.addEventListener("keydown", (ev) => {
 """
 
 
+def shade_spans(bad_spans: dict, episode: int, t0: float) -> list:
+    spans = bad_spans.get(str(episode), {}).get("zarr_s", [])
+    return [[round(float(a) - t0, 3), round(float(b) - t0, 3)] for a, b in spans]
+
+
 class Handler(BaseHTTPRequestHandler):
     root_orig = None
     root_r4 = None
+    root_r1rel = None
+    root_r4vt = None
     ids_orig: list[int] = []
     ids_r4: list[int] = []
+    ids_r4vt: list[int] = []
+    bad_spans: dict = {}
     names: list[str] = []
     mesh = None
     manifests: dict = {}
@@ -842,7 +879,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/meta":
             body = json.dumps(
                 {
-                    "counts": {"r1rel": len(self.ids_orig), "r4": len(self.ids_r4)},
+                    "counts": {
+                        "r1rel": len(self.ids_orig),
+                        "r4": len(self.ids_r4),
+                        "r4vt": len(self.ids_r4vt),
+                    },
                     "mesh": self.mesh,
                 }
             ).encode()
@@ -852,8 +893,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
             return
         args = self._args()
-        r4 = args.get("mode", "r4") != "r1rel"
-        ids = self.ids_r4 if r4 else self.ids_orig
+        mode = args.get("mode", "r4")
+        r4 = mode != "r1rel"
+        if mode == "r4vt":
+            ids = self.ids_r4vt
+        elif r4:
+            ids = self.ids_r4
+        else:
+            ids = self.ids_orig
         try:
             episode = int(args.get("ep", "0"))
         except ValueError:
@@ -884,13 +931,23 @@ class Handler(BaseHTTPRequestHandler):
             Image.fromarray(rgb).save(buf, format="JPEG", quality=70)
             self._send(200, buf.getvalue(), "image/jpeg")
             return
-        root = self.root_r4 if r4 else self.root_orig
-        # r4's own ts_pose_virtual_target_0 is the identity placeholder.
-        # The wrench label r1rel trains on still lives on the source zarr.
-        vt_xyz = None
-        if r4:
-            vt_xyz = virtual_target_xyz(self.root_orig["data"][f"episode_{episode}"])
+        if mode == "r4vt":
+            root = self.root_r4vt
+            vt_src = self.root_r1rel
+        elif r4:
+            root = self.root_r4
+            vt_src = self.root_orig
+        else:
+            root = self.root_orig
+            vt_src = None
+        # r4 and r4vt store an identity virtual target. The press lives on the
+        # source zarr for r4, and on the corrected r1rel copy for r4vt.
+        vt_xyz = None if vt_src is None else virtual_target_xyz(vt_src["data"][f"episode_{episode}"])
         payload = episode_payload(root, episode, r4, self._frame_times(episode), vt_xyz)
+        t0 = float(np.asarray(root["data"][f"episode_{episode}"]["rgb_time_stamps_0"]).reshape(-1)[0])
+        payload["shade"] = shade_spans(self.bad_spans, episode, t0)
+        payload["r4vt"] = mode == "r4vt"
+        payload["excluded"] = mode == "r4vt" and episode in R4VT_EXCLUDED
         attach_raw_odom(payload, self.names[episode])
         attach_corrected_pose(payload, self.names[episode])
         self._send(200, json.dumps(payload).encode(), "application/json")
@@ -906,12 +963,16 @@ def main() -> None:
     Handler.mesh = mesh_payload(vertices, faces)
     Handler.root_orig = zarr.open(ORIG, "r")
     Handler.root_r4 = zarr.open(R4, "r")
+    Handler.root_r1rel = zarr.open(str(R1REL), "r")
+    Handler.root_r4vt = zarr.open(str(R4VT), "r")
+    Handler.bad_spans = json.loads(LABEL_STATS.read_text()).get("bad_spans", {})
     Handler.ids_orig = episode_ids(Handler.root_orig)
     Handler.ids_r4 = episode_ids(Handler.root_r4)
+    Handler.ids_r4vt = episode_ids(Handler.root_r4vt)
     Handler.names = recording_names()
     print(
         f"[view_oct] r1rel {len(Handler.ids_orig)} episodes, "
-        f"r4 {len(Handler.ids_r4)}, mesh {len(faces)} tris",
+        f"r4 {len(Handler.ids_r4)}, r4vt {len(Handler.ids_r4vt)}, mesh {len(faces)} tris",
         flush=True,
     )
     server = ThreadingHTTPServer((args.host, args.port), Handler)
