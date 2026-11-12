@@ -39,6 +39,16 @@ R4VT_NORMALIZER = (
     / "assets"
     / "oct_v35_h4s_r4vt_action_normalizer_minmax_exbad.pkl"
 )
+R1REL_NORMALIZER = (
+    SCRIPTS
+    / "assets"
+    / "oct_v35_h4s_r1rel_odom_action_pose_normalizer_2c20fba56851.pkl"
+)
+# Runner control_para: sparse_execution_horizon 6, ensemble_decay_m 0.01,
+# raw_time_step_s 1/15. r4vt does not multiply that step by slow_down_factor.
+EXEC_H = 6
+DECAY_M = 0.01
+RUNNER_DT_S = 1.0 / 15.0
 
 # offline_compare_driver.query_seed. Repeated here so this file does not import
 # that driver (it pulls the stock exporter). The test checks the two match.
@@ -105,14 +115,19 @@ def load_policy(ckpt: Path, device_name: str):
 def point_dataset(cfg, dataset_path: Path, normalizer: Path, out: Path):
     from omegaconf import OmegaConf
 
-    OmegaConf.update(cfg, "task.dataset.dataset_path", str(dataset_path), merge=True)
-    OmegaConf.update(cfg, "task.dataset.action_normalizer_path", str(normalizer), merge=True)
-    OmegaConf.update(cfg, "task.dataset.long_dt_mask_path", str(LONG_DT), merge=True)
-    OmegaConf.update(
-        cfg, "task.dataset.exclusion_stats_path", str(out / "exclusion_stats.json"), merge=True
-    )
-    OmegaConf.update(cfg, "task.dataset.pose_jump_flag_path", None, merge=True)
-    OmegaConf.update(cfg, "task.dataset.filter_stats_path", None, merge=True)
+    node = cfg.task.dataset
+    OmegaConf.set_struct(node, False)
+
+    def put(key, value):
+        if key in node:
+            OmegaConf.update(cfg, f"task.dataset.{key}", value, merge=True)
+
+    node.dataset_path = str(dataset_path)
+    node.action_normalizer_path = str(normalizer)
+    put("long_dt_mask_path", str(LONG_DT))
+    put("exclusion_stats_path", str(out / "exclusion_stats.json"))
+    put("pose_jump_flag_path", None)
+    put("filter_stats_path", None)
 
 
 def build_datasets(cfg):
@@ -192,13 +207,159 @@ def episode_arrays(zarr_path: Path, episode: int) -> dict:
         "wrench": wrench,
         "wrench_t": wrench_t,
         "bad": bad,
-        "v_par": np.asarray(group["fixb_v_par_0"], dtype=np.float64),
-        "delta_n": np.asarray(group["fixb_delta_n_0"], dtype=np.float64).reshape(-1),
-        "dR": np.asarray(group["fixb_delta_R_rot6d_0"], dtype=np.float64).reshape(-1, 6),
-        "stiffness": np.asarray(group["stiffness_0"], dtype=np.float64).reshape(-1),
-        "x_s": np.asarray(group["mold_x_s_0"], dtype=np.float64).reshape(-1, 3),
-        "n": np.asarray(group["mold_normal_0"], dtype=np.float64).reshape(-1, 3),
-        "R_field": np.asarray(group["mold_R_field_0"], dtype=np.float64).reshape(-1, 3, 3),
+    }
+
+
+def replan_rows(rgb_ids, exec_h: int = EXEC_H) -> list:
+    """Queries the runner would replan on: every exec_h RGB frames.
+
+    A row whose RGB index is later than that grid is a gap. The ensembler
+    restarts there so chunks from opposite sides of the hole are not blended.
+    """
+    rgb_ids = np.asarray(rgb_ids, dtype=np.int64)
+    chosen = []
+    cursor = int(rgb_ids[0])
+    for i, rgb in enumerate(rgb_ids):
+        rgb = int(rgb)
+        if rgb < cursor:
+            continue
+        gap = bool(chosen) and rgb != cursor
+        chosen.append((i, gap))
+        cursor = rgb + int(exec_h)
+    return chosen
+
+
+def _append_break(parts_break, n_new: int, gap: bool) -> None:
+    if parts_break and n_new:
+        parts_break.append(bool(gap))
+        if n_new > 1:
+            parts_break.extend([False] * (n_new - 1))
+    elif n_new > 1:
+        parts_break.extend([False] * (n_new - 1))
+
+
+def stitch_r4_path(runtime, preds, rgb, p0, R0, qtimes) -> dict:
+    """Runner loop: push the raw chunk, pop H=6, decode with fixb_decode_dt.
+
+    Same call as umift_env_runner for r4vt. dry_run is false. apply_safety
+    stays at the runner default (True) with r4_safety_limits on the runtime.
+    Each window is anchored on the recorded TCP at that replan.
+    """
+    from mold_aware_runtime import FixBActionEnsembler, fixb_decode_dt
+
+    ens = FixBActionEnsembler(decay_m=DECAY_M)
+    k = 0
+    pos, rot, times, breaks = [], [], [], []
+    chunk_pos = np.zeros((len(preds), EXEC_H, 3), dtype=np.float64)
+    chunk_R = np.broadcast_to(np.eye(3), (len(preds), EXEC_H, 3, 3)).copy()
+    chunk_n = np.zeros(len(preds), dtype=np.int64)
+    for index, gap in replan_rows(rgb):
+        if gap:
+            ens = FixBActionEnsembler(decay_m=DECAY_M)
+            k = 0
+        ens.push(k * EXEC_H, preds[index])
+        blended = ens.pop(EXEC_H)
+        dt = fixb_decode_dt(blended.shape[0], 1, RUNNER_DT_S)
+        decoded = runtime.decode_chunk(blended, p0[index], R0[index], dt)
+        xyz = np.asarray(decoded["x_d"], dtype=np.float64)
+        RR = np.asarray(decoded["R_d"], dtype=np.float64)
+        tt = float(qtimes[index]) + np.arange(len(xyz)) * RUNNER_DT_S
+        _append_break(breaks, len(xyz), gap)
+        pos.append(xyz)
+        rot.append(RR)
+        times.append(tt)
+        chunk_pos[index, : len(xyz)] = xyz
+        chunk_R[index, : len(xyz)] = RR
+        chunk_n[index] = len(xyz)
+        k += 1
+    # Fill non-replan queries with the most recent executed chunk.
+    carry_n = 0
+    carry_pos = np.zeros((EXEC_H, 3))
+    carry_R = np.repeat(np.eye(3)[None, :, :], EXEC_H, axis=0)
+    for i in range(len(preds)):
+        if chunk_n[i] > 0:
+            carry_n = int(chunk_n[i])
+            carry_pos = chunk_pos[i].copy()
+            carry_R = chunk_R[i].copy()
+        elif carry_n:
+            chunk_n[i] = carry_n
+            chunk_pos[i] = carry_pos
+            chunk_R[i] = carry_R
+    return {
+        "exec_pos": np.concatenate(pos, axis=0),
+        "exec_R": np.concatenate(rot, axis=0),
+        "exec_time_s": np.concatenate(times, axis=0),
+        "exec_break": np.asarray(breaks, dtype=bool),
+        "chunk_pos": chunk_pos,
+        "chunk_R": chunk_R,
+        "chunk_n": chunk_n,
+    }
+
+
+def stitch_r1_path(preds, p0, R0, rgb, qtimes) -> dict:
+    """r1rel runner: action21_postprocess, then the pose ensembler at H=6."""
+    import PyriteUtility.spatial_math.spatial_utilities as su
+    from PyriteConfig.tasks.umift.umift_type_conversions import action21_postprocess
+    from PyriteUtility.planning_control.temporal_ensemble import (
+        blend_pose_chunk,
+        make_pose_ensembler,
+    )
+
+    ens = make_pose_ensembler(DECAY_M)
+    k = 0
+    pos, rot, times, breaks = [], [], [], []
+    chunk_pos = np.zeros((len(preds), EXEC_H, 3), dtype=np.float64)
+    chunk_R = np.broadcast_to(np.eye(3), (len(preds), EXEC_H, 3, 3)).copy()
+    chunk_n = np.zeros(len(preds), dtype=np.int64)
+    for index, gap in replan_rows(rgb):
+        if gap:
+            ens = make_pose_ensembler(DECAY_M)
+            k = 0
+        base = np.eye(4, dtype=np.float64)
+        base[:3, :3] = R0[index]
+        base[:3, 3] = p0[index]
+        command, _vt, stiff, _eoat = action21_postprocess(preds[index], [base], [0])
+        pose7 = su.SE3_to_pose7(command[0])
+        fields = {
+            "pose7": pose7,
+            "nominal_pose7": pose7,
+            "stiffness": np.asarray(stiff[0], dtype=np.float64).reshape(-1),
+            "eoat": None,
+        }
+        blended = blend_pose_chunk(ens, k * EXEC_H, fields, EXEC_H)
+        pose = np.asarray(blended["pose7"], dtype=np.float64)
+        se3 = su.pose7_to_SE3(pose)
+        xyz = pose[:, :3]
+        RR = se3[:, :3, :3]
+        tt = float(qtimes[index]) + np.arange(len(xyz)) * RUNNER_DT_S
+        _append_break(breaks, len(xyz), gap)
+        pos.append(xyz)
+        rot.append(RR)
+        times.append(tt)
+        chunk_pos[index, : len(xyz)] = xyz
+        chunk_R[index, : len(RR)] = RR
+        chunk_n[index] = len(xyz)
+        k += 1
+    carry_n = 0
+    carry_pos = np.zeros((EXEC_H, 3))
+    carry_R = np.repeat(np.eye(3)[None, :, :], EXEC_H, axis=0)
+    for i in range(len(preds)):
+        if chunk_n[i] > 0:
+            carry_n = int(chunk_n[i])
+            carry_pos = chunk_pos[i].copy()
+            carry_R = chunk_R[i].copy()
+        elif carry_n:
+            chunk_n[i] = carry_n
+            chunk_pos[i] = carry_pos
+            chunk_R[i] = carry_R
+    return {
+        "exec_pos": np.concatenate(pos, axis=0),
+        "exec_R": np.concatenate(rot, axis=0),
+        "exec_time_s": np.concatenate(times, axis=0),
+        "exec_break": np.asarray(breaks, dtype=bool),
+        "chunk_pos": chunk_pos,
+        "chunk_R": chunk_R,
+        "chunk_n": chunk_n,
     }
 
 
@@ -216,9 +377,7 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
         raise SystemExit(f"episode {episode} has no {split} queries")
 
     preds, labels = [], []
-    pred_pos, pred_R = [], []
-    label_pos, label_R = [], []
-    pred_xs, pred_n = [], []
+    anchors_p, anchors_R = [], []
     times_rows, idx_rows = [], []
     force_rows, bad_rows, long_rows = [], [], []
     n_valids, rgb_ids, seeds, qtimes = [], [], [], []
@@ -255,12 +414,6 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
                 full_t[k] = full_t[k - 1] + dt_last
         q_robot = int(np.searchsorted(tcp["robot_t"], tcp["rgb_t"][rgb_id]))
         q_robot = min(max(q_robot, 0), len(tcp["robot_t"]) - 1)
-        p0 = tcp["p"][q_robot]
-        R0 = tcp["R"][q_robot]
-        dec_p = ol.decode_r4vt(runtime, pred, p0, R0, full_t)
-        dec_l = ol.decode_r4vt(runtime, label, p0, R0, full_t)
-        valid_idx = full_idx.copy()
-        valid_idx[n_valid:] = full_idx[n_valid - 1]
         force = nearest_wrench(tcp["wrench_t"], tcp["wrench"], full_t)
         bad = np.zeros(H, dtype=bool)
         long = np.zeros(H, dtype=bool)
@@ -270,12 +423,8 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
 
         preds.append(pred)
         labels.append(label)
-        pred_pos.append(dec_p["x_d"])
-        pred_R.append(dec_p["R_d"])
-        label_pos.append(dec_l["x_d"])
-        label_R.append(dec_l["R_d"])
-        pred_xs.append(dec_p["x_s"])
-        pred_n.append(dec_p["n"])
+        anchors_p.append(tcp["p"][q_robot])
+        anchors_R.append(tcp["R"][q_robot])
         times_rows.append(full_t)
         idx_rows.append(full_idx)
         force_rows.append(force)
@@ -288,20 +437,32 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
         if done % 25 == 0 or done == len(queries):
             print(f"  episode {episode} {split} {done}/{len(queries)}", flush=True)
 
+    stacked_p = np.stack(preds)
+    qtime = np.asarray(qtimes, dtype=np.float64)
+    rgb = np.asarray(rgb_ids, dtype=np.int64)
+    anchor_p = np.stack(anchors_p)
+    anchor_R = np.stack(anchors_R)
+    if model_key == "r4vt":
+        stitched = stitch_r4_path(runtime, preds, rgb, anchor_p, anchor_R, qtime)
+    else:
+        stitched = stitch_r1_path(preds, anchor_p, anchor_R, rgb, qtime)
     return {
         "split": split,
-        "query_rgb_idx": np.asarray(rgb_ids, dtype=np.int64),
-        "query_time_s": np.asarray(qtimes, dtype=np.float64),
+        "query_rgb_idx": rgb,
+        "query_time_s": qtime,
         "query_seed": np.asarray(seeds, dtype=np.int64),
         "n_valid": np.asarray(n_valids, dtype=np.int64),
-        "pred_action": np.stack(preds),
+        "pred_action": stacked_p,
         "label_action": np.stack(labels),
-        "pred_pos": np.stack(pred_pos),
-        "pred_R": np.stack(pred_R),
-        "label_pos": np.stack(label_pos),
-        "label_R": np.stack(label_R),
-        "pred_x_s": np.stack(pred_xs),
-        "pred_n": np.stack(pred_n),
+        "pred_pos": stitched["chunk_pos"],
+        "pred_R": stitched["chunk_R"],
+        "exec_pos": stitched["exec_pos"],
+        "exec_R": stitched["exec_R"],
+        "exec_time_s": stitched["exec_time_s"],
+        "exec_break": stitched["exec_break"],
+        "chunk_pos": stitched["chunk_pos"],
+        "chunk_R": stitched["chunk_R"],
+        "chunk_n": stitched["chunk_n"],
         "action_time_s": np.stack(times_rows),
         "action_robot_idx": np.stack(idx_rows),
         "force_n": np.stack(force_rows),
@@ -345,6 +506,20 @@ def vt_offset_for_episode(episode: int) -> dict:
     return ol.tangential_vt_offset(p_vt[:m], x_s[:m], n[:m])
 
 
+def mesh_distance(field, xyz) -> dict:
+    """Absolute signed distance of points to the mold mesh, in meters."""
+    sd = np.asarray(field.query(np.asarray(xyz, dtype=np.float64))["sd"], dtype=np.float64)
+    sd = np.abs(sd[np.isfinite(sd)])
+    return {
+        "n": int(sd.size),
+        "median_m": float(np.median(sd)),
+        "p95_m": float(np.percentile(sd, 95)),
+        "max_m": float(np.max(sd)),
+        "frac_gt_20mm": float(np.mean(sd > 0.020)),
+        "frac_gt_50mm": float(np.mean(sd > 0.050)),
+    }
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("r4vt", "r1rel"), required=True)
@@ -353,37 +528,48 @@ def main(argv=None) -> int:
     parser.add_argument("--dataset", type=Path, default=None)
     parser.add_argument("--normalizer", type=Path, default=None)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--checkpoint-epoch", type=int, default=None)
     parser.add_argument("--episodes", type=int, nargs="*", default=None)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
-    if args.role != "r4vt":
-        raise SystemExit("this run is r4vt only; r1rel export is not implemented in this pass")
 
     ckpt = args.ckpt.resolve()
     if not ckpt.is_file():
         raise SystemExit(f"missing checkpoint {ckpt}")
-    dataset_path = args.dataset or R4VT_ZARR
-    normalizer = args.normalizer or R4VT_NORMALIZER
-    for path in (dataset_path, normalizer, FIELD_NPZ, LONG_DT, R1REL_ZARR):
+    if args.role == "r4vt":
+        dataset_path = args.dataset or R4VT_ZARR
+        normalizer = args.normalizer or R4VT_NORMALIZER
+    else:
+        dataset_path = args.dataset or R1REL_ZARR
+        normalizer = args.normalizer or R1REL_NORMALIZER
+    for path in (dataset_path, normalizer, FIELD_NPZ, LONG_DT):
         if not path.exists():
             raise SystemExit(f"missing {path}")
 
     started = time.perf_counter()
     digest = sha256_file(ckpt)
-    epoch = epoch_from_name(ckpt)
-    out = args.out or (EXPORT_ROOT / f"r4vt_{digest[:12]}")
+    epoch = args.checkpoint_epoch if args.checkpoint_epoch is not None else epoch_from_name(ckpt)
+    out = args.out or (EXPORT_ROOT / f"{args.role}_{digest[:12]}_fixdt")
     require_fresh(out)
 
+    if args.role == "r4vt":
+        decode = (
+            "FixBActionEnsembler pop 6; "
+            "fixb_decode_dt(down_sample_steps=1, raw_time_step_s=1/15); "
+            "MoldAwareRuntime.decode_chunk dry_run=False r4_safety_limits"
+        )
+    else:
+        decode = "action21_postprocess then blend_pose_chunk H=6 decay_m=0.01"
     settings = {
-        "role": "r4vt",
+        "role": args.role,
         "ckpt": str(ckpt),
         "ckpt_sha256": digest,
         "checkpoint_epoch": epoch,
         "val_loss": float(args.val_loss),
-        "safety_clamps": False,
+        "execution_horizon": EXEC_H,
         "dry_run": False,
-        "decode": "MoldAwareRuntime.decode_chunk apply_safety=False dry_run=False",
-        "decode_note": "x_d = x_s + delta_n n; R_d = R(x_s) @ Gram-Schmidt(action[:, 21:27])",
+        "decode": decode,
+        "mae": "label space on the raw predicted chunk, not the blended pose",
         "seed": "sha256(f'{role}:{rgb_id}')[:8] little-endian, same as offline_compare_driver.query_seed",
         "dataset": str(dataset_path),
         "normalizer": str(normalizer),
@@ -408,8 +594,18 @@ def main(argv=None) -> int:
         chosen = [(lowest_episode(train_ds), "train"), (lowest_episode(val_ds), "val")]
 
     from fixb_field import FixBMoldField
+    from mold_aware_runtime import MoldAwareRuntime, r4_safety_limits
 
-    runtime = ol.make_r4_runtime(FixBMoldField(FIELD_NPZ), dry_run=False)
+    field = FixBMoldField(FIELD_NPZ)
+    runtime = None
+    if args.role == "r4vt":
+        runtime = MoldAwareRuntime(
+            field=field,
+            R_off=np.eye(3),
+            run_type="r4_world_fixb_tilt",
+            dry_run=False,
+            limits=r4_safety_limits(0.020, 90.0),
+        )
     long_sets = long_dt_sets(LONG_DT)
     report_eps = []
     for episode, hinted in chosen:
@@ -433,7 +629,7 @@ def main(argv=None) -> int:
             runtime,
             episode,
             split,
-            "r4vt",
+            args.role,
             tcp,
             long_sets.get(episode, set()),
         )
@@ -441,20 +637,21 @@ def main(argv=None) -> int:
         table = ol.episode_error_table(
             flat["pred"], flat["label"], flat["force_n"], flat["bad_span"], flat["long_dt"], flat["valid"]
         )
-        offset = vt_offset_for_episode(episode)
+        row = {
+            "episode": episode,
+            "split": split,
+            "n_queries": int(len(blob["query_rgb_idx"])),
+            "error": table,
+        }
+        if args.role == "r4vt":
+            row["tangential_vt_offset_m"] = vt_offset_for_episode(episode)
+            row["path_abs_sd_m"] = mesh_distance(field, blob["exec_pos"])
+            row["demo_abs_sd_m"] = mesh_distance(field, blob["tcp_xyz"])
         np.savez_compressed(out / f"episode_{episode}.npz", **blob)
-        report_eps.append(
-            {
-                "episode": episode,
-                "split": split,
-                "n_queries": int(len(blob["query_rgb_idx"])),
-                "error": table,
-                "tangential_vt_offset_m": offset,
-            }
-        )
+        report_eps.append(row)
         print(
-            f"episode {episode} {split} queries={len(blob['query_rgb_idx'])} "
-            f"vt tangential median={offset['median_m']:.6f} m max={offset['max_m']:.6f} m",
+            f"episode {episode} {split} queries={row['n_queries']} "
+            f"exec_steps={len(blob['exec_pos'])}",
             flush=True,
         )
 

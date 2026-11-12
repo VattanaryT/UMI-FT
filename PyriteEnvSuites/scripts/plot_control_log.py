@@ -127,6 +127,19 @@ def main():
             linewidth=2,
             label="virtual",
         )
+        demo_key = f"ts_demo_{robot_id}"
+        if demo_key in action_log:
+            demo = np.asarray(action_log[demo_key][:])
+            ax3d.plot3D(
+                demo[::downsample, 0],
+                demo[::downsample, 1],
+                demo[::downsample, 2],
+                color="#3ec1ff",
+                marker="o",
+                markersize=4,
+                linewidth=2,
+                label="demo",
+            )
         for i in range(0, exe_horizon, downsample):
             ax3d.plot3D(
                 [ts_nominal[i, 0], ts_virtual[i, 0]],

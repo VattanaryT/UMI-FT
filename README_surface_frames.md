@@ -30,6 +30,39 @@ source /home/boeing/umi_ft_ws/worktrees/activate.sh UMI-FT-surface_frames
 
 Reads `stringer_scanner_v2_fixb` episode 5, `shared/fixb_field.npz`, and the r2 epoch-0035 open-loop export `episode_5.npz`. Max obs error ~1e-11 m. Decode error 0.
 
+## Run
+
+From this worktree:
+
+```bash
+source /home/boeing/umi_ft_ws/worktrees/activate.sh UMI-FT-surface_frames
+source "$HOME/miniforge3/etc/profile.d/conda.sh"
+conda activate pyrite
+```
+
+Both scripts source these again.
+
+Replay check, no robot. Episodes 0 and 9, horizon 6. Refuses if `DIR` exists. r4vt foot median under 1 mm; r1rel position and rotation 0.000 mm and 0.0000 deg.
+
+```bash
+scripts/run_replay_check.sh --out /mnt/data/umidata/ft/replay_exports/gt_925b83f
+```
+
+Rollout. This moves the right arm. The script sets `UMIFT_CKPT_PATH`; the file default stays the r4vt epoch-185 checkpoint.
+
+```bash
+scripts/run_rollout.sh r4vt    # epoch=0185-train_loss=0.011.ckpt
+scripts/run_rollout.sh r1rel   # checkpoints/latest.ckpt
+scripts/run_rollout.sh r4vt --replay-episode 0   # labels, no policy call
+scripts/run_rollout.sh r1rel --replay-episode 0
+```
+
+`--replay-episode` plays that episode's recorded actions through the same unnormalize, decode, ensemble, and safety path. Control log, policy-vision log, and rollout cameras stay on. The folder is `gt_replay_ep0_{unix}`, and `rollout_log.jsonl` gets `mode=gt_replay`. `plot_control_log.py --log_subdir <that folder>` draws the commanded targets and the demo (`ts_demo_0`).
+
+r4vt, for a policy run and a replay, holds a commanded step larger than 248.70 mm or 75.96 deg and aborts after 3 holds in a row. Before the episode it moves at 5 cm/s to 5 cm above the start along the mold normal, waits for Enter, descends, and waits again. Replay uses the recorded pose. A policy run uses the current TCP. If the move is outside the safe zone, jog instead. r1rel still waits for you to jog.
+
+Switch to remote before Enter. The episode returns to the menu at 8 minutes; `b` lifts and quits. Pendant stop halts immediately.
+
 ## Baseline
 
 | | |

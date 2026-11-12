@@ -7,6 +7,7 @@ No checkpoint and no robot. Scores episodes offline and writes
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import pickle
@@ -29,6 +30,7 @@ from PyriteUtility.planning_control.temporal_ensemble import (
     resolve_execution_horizon,
 )
 import PyriteUtility.spatial_math.spatial_utilities as su
+from jump_guard import MAX_STEP_DEG, MAX_STEP_MM, TargetJumpGuard
 from mold_aware_runtime import (
     FixBActionEnsembler,
     blend_action_rows,
@@ -364,6 +366,41 @@ def _windows(robot_t, rgb_t, exec_h: int):
     return windows
 
 
+def pushed_action_chunks(arm: str, episode: int, exec_h: int):
+    """Actions the runner ensembler receives for one episode.
+
+    r4vt: round-tripped action27, one (64, 27) array per window. These are the
+    arrays ``FixBActionEnsembler.push`` gets. r1rel: relative action21 against
+    the demo TCP at the window start, the array ``action21_postprocess`` gets
+    before the pose ensembler. Windows step by ``exec_h`` RGB frames.
+    """
+    if arm == "r4vt":
+        zarr_path, norm_path, sha = R4VT_ZARR, R4VT_NORMALIZER, R4VT_SHA
+        with_delta_r = True
+    elif arm == "r1rel":
+        zarr_path, norm_path, sha = R1REL_ZARR, R1REL_NORMALIZER, R1REL_SHA
+        with_delta_r = False
+    else:
+        raise ValueError(arm)
+    group = _open_episode(zarr_path, episode)
+    scale, offset = load_action_scale(norm_path, sha)
+    robot_t = np.asarray(group["robot_time_stamps_0"], dtype=np.float64).reshape(-1)
+    rgb_t = np.asarray(group["rgb_time_stamps_0"], dtype=np.float64).reshape(-1)
+    demo = np.asarray(group["ts_pose_fb_0"], dtype=np.float64)
+    actions = []
+    windows = _windows(robot_t, rgb_t, exec_h)
+    for indices in windows:
+        action = roundtrip_action(
+            _action_rows(group, indices, with_delta_r=with_delta_r), scale, offset
+        )
+        if arm == "r1rel":
+            base = su.pose7_to_SE3(demo[int(indices[0])].reshape(1, 7))[0]
+            relative = action21_to_action_sample(action, np.zeros((0,)), [0], [base])["sparse"]
+            action = roundtrip_action(relative, scale, offset)
+        actions.append(np.asarray(action, dtype=np.float64))
+    return actions, windows
+
+
 def _nominal_pose(action_or_pose, base, kind: str, decoded=None) -> np.ndarray:
     if kind == "r1rel":
         nominal, _vt, stiff, _eoat = action21_postprocess(action_or_pose, [base], [0])
@@ -680,10 +717,8 @@ def _column(values, mask) -> dict:
 def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) -> dict:
     """Ensemble off, pose blend, and action blend at one dt. Re-anchors every window."""
     group = _open_episode(R4VT_ZARR, episode)
-    scale, offset = load_action_scale(R4VT_NORMALIZER, R4VT_SHA)
     runtime = _r4_runtime()
     robot_t = np.asarray(group["robot_time_stamps_0"], dtype=np.float64).reshape(-1)
-    rgb_t = np.asarray(group["rgb_time_stamps_0"], dtype=np.float64).reshape(-1)
     demo = np.asarray(group["ts_pose_fb_0"], dtype=np.float64)
     bad = np.asarray(group["bad_span_0"]).reshape(-1) > 0
     long_dt = _long_dt_mask(episode, len(robot_t))
@@ -691,20 +726,17 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
     stored_n = np.asarray(group["mold_normal_0"], dtype=np.float64)
     stored_dn = np.asarray(group["fixb_delta_n_0"], dtype=np.float64).reshape(-1)
     stored_r = np.asarray(group["mold_R_field_0"], dtype=np.float64).reshape(-1, 3, 3)
-    windows = _windows(robot_t, rgb_t, exec_h)
-    actions = []
-    for indices in windows:
-        actions.append(
-            roundtrip_action(_action_rows(group, indices, with_delta_r=True), scale, offset)
-        )
+    actions, windows = pushed_action_chunks("r4vt", episode, exec_h)
     chunks = []
     foot = {"off": [], "pose": [], "action": []}
     depth = {"off": [], "pose": [], "action": []}
     rot = {"off": [], "pose": [], "action": []}
     used_idx = []
+    kept_idx = []
     outliers = []
     field = _mold_field()
     ensembler = FixBActionEnsembler(decay_m=DECAY_M)
+    jump_guard = TargetJumpGuard()
     dt_chunk = fixb_decode_dt(ACTION_HORIZON, 1, RUNNER_DT_S)
     dt_exec = fixb_decode_dt(exec_h, 1, RUNNER_DT_S)
     for k, indices in enumerate(windows):
@@ -746,19 +778,55 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
             dt_exec,
             apply_safety=False,
         )
+        x_g, R_g, _field_g, aborted = jump_guard.apply(
+            action_decoded["x_d"],
+            action_decoded["R_d"],
+            robot_index=used,
+            R_field=action_decoded["R_field"],
+        )
+        n_keep = int(x_g.shape[0])
+        if n_keep == 0:
+            chunks.pop()
+            foot["off"].pop()
+            depth["off"].pop()
+            rot["off"].pop()
+            break
+        if n_keep < len(used):
+            foot["off"][-1] = foot["off"][-1][:n_keep]
+            depth["off"][-1] = depth["off"][-1][:n_keep]
+            rot["off"][-1] = rot["off"][-1][:n_keep]
+            used = used[:n_keep]
+            tool_r = tool_r[:n_keep]
+            action_decoded["x_s"] = action_decoded["x_s"][:n_keep]
+            action_decoded["sd"] = action_decoded["sd"][:n_keep]
+        action_decoded["x_d"] = x_g
+        action_decoded["R_d"] = R_g
+        kept_idx.append(used)
         foot["action"].append(
             _inplane(action_decoded["x_s"], stored_foot[used], stored_n[used])
         )
         depth["action"].append(np.abs(np.asarray(action_decoded["sd"]) - stored_dn[used]))
         rot["action"].append(geodesic_deg(action_decoded["R_d"], tool_r))
-        used_idx.append(used)
-    idx = np.concatenate(used_idx)
-    clean = ~(bad[idx] | long_dt[idx])
-    blended = blend_executed(chunks, exec_h)
-    queried = field.query(blended["nominal_pose7"][:, :3])
-    foot["pose"].append(_inplane(queried["x_s"], stored_foot[idx], stored_n[idx]))
-    depth["pose"].append(np.abs(queried["sd"] - stored_dn[idx]))
-    rot["pose"].append(geodesic_deg(_pose_R(blended["nominal_pose7"]), _pose_R(demo[idx])))
+        if n_keep < exec_h:
+            chunks.pop()
+        else:
+            used_idx.append(used)
+        if aborted:
+            break
+    kept = np.concatenate(kept_idx) if kept_idx else np.zeros(0, dtype=np.int64)
+    idx = np.concatenate(used_idx) if used_idx else np.zeros(0, dtype=np.int64)
+    clean_kept = ~(bad[kept] | long_dt[kept]) if kept.size else np.zeros(0, dtype=bool)
+    clean = ~(bad[idx] | long_dt[idx]) if idx.size else np.zeros(0, dtype=bool)
+    blended = blend_executed(chunks, exec_h) if chunks else None
+    if blended is not None and idx.size:
+        queried = field.query(blended["nominal_pose7"][:, :3])
+        foot["pose"].append(_inplane(queried["x_s"], stored_foot[idx], stored_n[idx]))
+        depth["pose"].append(np.abs(queried["sd"] - stored_dn[idx]))
+        rot["pose"].append(geodesic_deg(_pose_R(blended["nominal_pose7"]), _pose_R(demo[idx])))
+    else:
+        foot["pose"].append(np.zeros(0))
+        depth["pose"].append(np.zeros(0))
+        rot["pose"].append(np.zeros(0))
     report = {
         "episode": int(episode),
         "split": split_name(episode, R4VT_ZARR),
@@ -767,12 +835,20 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
         "label_dt": _rgb_aligned_dt(group),
         "decode_dt_s": float(dt_chunk[0]),
         "rotation_gt_90_ensemble_off": outliers,
+        "jump_guard": {
+            "max_step_mm": float(MAX_STEP_MM),
+            "max_step_deg": float(MAX_STEP_DEG),
+            "n_holds": int(sum(1 for row in jump_guard.holds if not row["abort"])),
+            "aborted": bool(jump_guard.aborted),
+            "holds": jump_guard.holds,
+        },
     }
+    clean_for = {"off": clean_kept, "action": clean_kept, "pose": clean}
     for name in ("off", "pose", "action"):
         report[name] = {
-            "foot_m": _column(np.concatenate(foot[name]), clean),
-            "depth_m": _column(np.concatenate(depth[name]), clean),
-            "rotation_deg": _column(np.concatenate(rot[name]), clean),
+            "foot_m": _column(np.concatenate(foot[name]), clean_for[name]),
+            "depth_m": _column(np.concatenate(depth[name]), clean_for[name]),
+            "rotation_deg": _column(np.concatenate(rot[name]), clean_for[name]),
         }
     return report
 
@@ -882,11 +958,55 @@ def _format_action_blend(report: dict) -> str:
             f"depth {_mm(block['depth_m']['median'])}/{_mm(block['depth_m']['max'])} "
             f"rot {block['rotation_deg']['median']:.3f}/{block['rotation_deg']['max']:.3f}"
         )
+    guard = report.get("jump_guard")
+    if guard:
+        lines.append(
+            f"  jump guard {guard['max_step_mm']:.2f} mm / {guard['max_step_deg']:.2f} deg, "
+            f"holds {guard['n_holds']}, abort {guard['aborted']}"
+        )
+        for row in guard["holds"]:
+            kind = "ABORT" if row["abort"] else "hold"
+            lines.append(
+                f"    {kind} idx {row['robot_index']} step {row['step']} "
+                f"pos {row['pos_mm']:.1f} mm rot {row['rot_deg']:.1f} deg run {row['run']}"
+            )
     return "\n".join(lines)
 
 
-def main() -> None:
-    write_exports((0, 9))
+def write_runner_replay(out: Path, episodes, horizon: int) -> None:
+    """r4vt action blend and r1rel pose blend, the runner's H-step path."""
+    out = Path(out)
+    if out.exists():
+        raise SystemExit(f"refusing to overwrite {out}")
+    r4 = out / "r4vt"
+    r1 = out / "r1rel"
+    r4.mkdir(parents=True)
+    r1.mkdir(parents=True)
+    for episode in episodes:
+        report = action_blend_episode(int(episode), int(horizon))
+        path = r4 / f"episode_{int(episode)}_h{int(horizon)}.json"
+        path.write_text(json.dumps(report, indent=2) + "\n")
+        print(_format_action_blend(report), flush=True)
+        report = replay_episode("r1rel", int(episode), exec_horizons=(int(horizon),))
+        path = r1 / f"episode_{int(episode)}.json"
+        path.write_text(json.dumps(report, indent=2) + "\n")
+        print(format_report(report), flush=True)
+    print(f"wrote {out}")
+
+
+def main(argv=None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("exports", "runner"), default="exports")
+    parser.add_argument("--episodes", type=int, nargs="+", default=[0, 9])
+    parser.add_argument("--horizon", type=int, default=6)
+    parser.add_argument("--out", type=Path, default=None)
+    args = parser.parse_args(argv)
+    if args.mode == "runner":
+        if args.out is None:
+            raise SystemExit("runner mode needs --out")
+        write_runner_replay(args.out, args.episodes, args.horizon)
+        return
+    write_exports(tuple(args.episodes))
 
 
 if __name__ == "__main__":

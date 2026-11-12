@@ -165,17 +165,31 @@ def episode_payload(exports: list, episode: int, mesh_t0_ok: bool = True) -> dic
         gaps = spans_from_edges(np.asarray(blob["query_time_s"], dtype=np.float64), q_gap, t0)
         step_pred = pred[:, 0]
         step_label = label[:, 0]
-        ang = ol.delta_r_deg(step_pred, step_label)
-        pos = np.asarray(blob["pred_pos"], dtype=np.float64)[:, 0]
+        if pred.shape[-1] >= 27:
+            ang = ol.delta_r_deg(step_pred, step_label)
+        else:
+            ang = ol.relative_command_rot_deg(step_pred, step_label)
+        if "exec_pos" in blob.files:
+            exec_pos = np.asarray(blob["exec_pos"], dtype=np.float64)
+            exec_edge = np.asarray(blob["exec_break"], dtype=bool)
+            ipath = stride_idx(len(exec_pos), PATH_CAP)
+            path = rounded(exec_pos[ipath], 4)
+            path_break = breaks_for_keep(exec_edge, ipath)
+        else:
+            pos = np.asarray(blob["pred_pos"], dtype=np.float64)[:, 0]
+            path = rounded(pos[iser], 4)
+            path_break = q_break
         runs.append(
             {
                 "label": exp["label"],
+                "role": exp["settings"].get("role", "r4vt"),
                 "split": str(blob["split"]),
                 "q_i": [int(i) for i in iser],
                 "q_t": rounded(q_t[iser], 3),
                 "q_break": q_break,
                 "gaps": gaps,
-                "path": rounded(pos[iser], 4),
+                "path": path,
+                "path_break": path_break,
                 "v1_p": rounded(step_pred[iser, 0], 4),
                 "v1_l": rounded(step_label[iser, 0], 4),
                 "v2_p": rounded(step_pred[iser, 1], 4),
@@ -228,14 +242,23 @@ def cursor_payload(exports: list, episode: int, query: int) -> dict:
         blob = exp["episodes"].get(episode)
         if blob is None or query < 0 or query >= len(blob["query_time_s"]):
             continue
-        n_valid = int(blob["n_valid"][query])
         t0 = float(np.asarray(blob["rgb_time_s"])[0])
+        if "chunk_pos" in blob.files:
+            n_chunk = int(blob["chunk_n"][query])
+            future = np.asarray(blob["chunk_pos"][query, :n_chunk])
+            press = np.asarray(blob["chunk_pos"][query, 0])
+            rot = np.asarray(blob["chunk_R"][query, 0])
+        else:
+            n_valid = int(blob["n_valid"][query])
+            future = np.asarray(blob["pred_pos"][query, :n_valid])
+            press = np.asarray(blob["pred_pos"][query, 0])
+            rot = np.asarray(blob["pred_R"][query, 0])
         out.append(
             {
                 "label": exp["label"],
-                "future": rounded(np.asarray(blob["pred_pos"][query, :n_valid]), 4),
-                "press": rounded(np.asarray(blob["pred_pos"][query, 0]), 4),
-                "R": rounded(np.asarray(blob["pred_R"][query, 0]), 4),
+                "future": rounded(future, 4),
+                "press": rounded(press, 4),
+                "R": rounded(rot, 4),
                 "t": round(float(blob["query_time_s"][query]) - t0, 3),
             }
         )
@@ -411,7 +434,7 @@ function scatter(pts, name, color, width, cut) {
   return {type: "scatter3d", x, y, z, mode: "lines", name, line: {color, width: width || 4}};
 }
 function paintTable(run) {
-  const dims = ["v1", "v2", "delta_n", "delta_R_deg", "stiffness"];
+  const dims = Object.keys(run.error.mae);
   const cols = ["contact", "free", "clean", "bad_span"];
   let html = "<tr><th>dim</th>" + cols.map(c => "<th>" + c + "</th>").join("") + "</tr>";
   dims.forEach(dim => {
@@ -435,10 +458,11 @@ async function paintCursor() {
   const p = data.path[nearest(data.path_t, t)];
   const demoR = data.tool_R[nearest(data.path_t, t)];
   traces.push(axesAt(p, demoR, "#ffffff", "demo axes"));
-  data.runs.forEach((run, i) => {
+  const visible = data.runs.filter(run => shown[run.label] !== false);
+  data.runs.forEach(run => {
     if (shown[run.label] === false) return;
-    const style = runStyle(i, data.runs.length);
-    traces.push(scatter(run.path, run.label, style.path, 5, run.q_break));
+    const style = runStyle(visible.indexOf(run), visible.length);
+    traces.push(scatter(run.path, run.label, style.path, 5, run.path_break));
     const item = (cursor.runs || []).find(r => r.label === run.label);
     if (!item) return;
     traces.push(scatter(item.future, run.label + " chunk", style.chunk, 9));
@@ -465,15 +489,20 @@ async function paintCursor() {
   });
   const x = {domain: [0, 1], automargin: false, title: ""};
   const br = run.q_break;
+  const rel = run.role === "r1rel";
+  const a = rel ? "x" : "v1";
+  const b = rel ? "y" : "v2";
+  const c = rel ? "z" : "δn";
+  const d = rel ? "rot deg" : "ΔR deg";
   const plots = [
-    line(run.q_t, run.v1_p, "v1 pred", DIM.v1.pred, "x", "dash", br),
-    line(run.q_t, run.v2_p, "v2 pred", DIM.v2.pred, "x", "dash", br),
-    line(run.q_t, run.v1_l, "v1 label", DIM.v1.label, "x", null, br),
-    line(run.q_t, run.v2_l, "v2 label", DIM.v2.label, "x", null, br),
+    line(run.q_t, run.v1_p, a + " pred", DIM.v1.pred, "x", "dash", br),
+    line(run.q_t, run.v2_p, b + " pred", DIM.v2.pred, "x", "dash", br),
+    line(run.q_t, run.v1_l, a + " label", DIM.v1.label, "x", null, br),
+    line(run.q_t, run.v2_l, b + " label", DIM.v2.label, "x", null, br),
     line(data.force_t, data.force, "||F||", "#e67e22", "x2", null, data.force_break),
-    line(run.q_t, run.n_p, "δn pred", DIM.n.pred, "x3", "dash", br),
-    line(run.q_t, run.n_l, "δn label", DIM.n.label, "x3", null, br),
-    line(run.q_t, run.ang, "ΔR deg", DIM.ang.pred, "x4", "dash", br),
+    line(run.q_t, run.n_p, c + " pred", DIM.n.pred, "x3", "dash", br),
+    line(run.q_t, run.n_l, c + " label", DIM.n.label, "x3", null, br),
+    line(run.q_t, run.ang, d, DIM.ang.pred, "x4", "dash", br),
     line(run.q_t, run.stiff_p, "stiff pred", DIM.stiff.pred, "x5", "dash", br),
     line(run.q_t, run.stiff_l, "stiff label", DIM.stiff.label, "x5", null, br)
   ];
@@ -482,13 +511,13 @@ async function paintCursor() {
     margin: {l: 64, r: 16, t: 28, b: 28}, legend: {orientation: "h", y: 1.12},
     shapes,
     xaxis: Object.assign({anchor: "y"}, x),
-    yaxis: {title: "v m/s", domain: [0.80, 1], anchor: "x"},
+    yaxis: {title: rel ? "x m" : "v m/s", domain: [0.80, 1], anchor: "x"},
     xaxis2: Object.assign({anchor: "y2", matches: "x"}, x),
     yaxis2: {title: "N", domain: [0.60, 0.78], anchor: "x2"},
     xaxis3: Object.assign({anchor: "y3", matches: "x"}, x),
-    yaxis3: {title: "δn m", domain: [0.40, 0.58], anchor: "x3"},
+    yaxis3: {title: rel ? "z m" : "δn m", domain: [0.40, 0.58], anchor: "x3"},
     xaxis4: Object.assign({anchor: "y4", matches: "x"}, x),
-    yaxis4: {title: "ΔR deg", domain: [0.20, 0.38], anchor: "x4"},
+    yaxis4: {title: rel ? "rot deg" : "ΔR deg", domain: [0.20, 0.38], anchor: "x4"},
     xaxis5: Object.assign({anchor: "y5", matches: "x", title: "s"}, x),
     yaxis5: {title: "stiff", domain: [0, 0.18], anchor: "x5"}
   }, {responsive: true});

@@ -125,6 +125,17 @@ def delta_r_deg(pred_action, label_action) -> np.ndarray:
     return geodesic_deg(rp, rl)
 
 
+def relative_command_rot_deg(pred_action, label_action) -> np.ndarray:
+    """Geodesic degrees between the relative command rotations (pose9 rot6d)."""
+    import PyriteUtility.spatial_math.spatial_utilities as su
+
+    pred_action = np.asarray(pred_action, dtype=np.float64)
+    label_action = np.asarray(label_action, dtype=np.float64)
+    rp = su.pose9_to_SE3(pred_action[..., :9])[..., :3, :3]
+    rl = su.pose9_to_SE3(label_action[..., :9])[..., :3, :3]
+    return geodesic_deg(rp, rl)
+
+
 def _mae(err, mask) -> float | None:
     err = np.asarray(err, dtype=np.float64).reshape(-1)
     mask = np.asarray(mask, dtype=bool).reshape(-1)
@@ -139,8 +150,9 @@ def _mae(err, mask) -> float | None:
 def episode_error_table(pred, label, force_n, bad_span, long_dt, valid) -> dict:
     """Mean absolute error. Contact is ||F|| > 8 N. Clean drops bad spans and long-dt.
 
-    pred and label are (N, 27) already flattened over queries and steps.
-    ΔR is the geodesic angle, not a difference of rot6d components.
+    pred and label are flattened over queries and steps.
+    r4vt (width 27): v1, v2, δn, geodesic ΔR, stiffness.
+    r1rel (width 21): relative command x, y, z, geodesic rotation, stiffness.
     """
     pred = np.asarray(pred, dtype=np.float64)
     label = np.asarray(label, dtype=np.float64)
@@ -158,13 +170,24 @@ def episode_error_table(pred, label, force_n, bad_span, long_dt, valid) -> dict:
         "clean": clean,
         "bad_span": bad_m,
     }
-    per_dim = {
-        "v1": pred[:, 0] - label[:, 0],
-        "v2": pred[:, 1] - label[:, 1],
-        "delta_n": pred[:, 2] - label[:, 2],
-        "delta_R_deg": delta_r_deg(pred, label),
-        "stiffness": pred[:, 18] - label[:, 18],
-    }
+    if pred.shape[1] >= 27:
+        per_dim = {
+            "v1": pred[:, 0] - label[:, 0],
+            "v2": pred[:, 1] - label[:, 1],
+            "delta_n": pred[:, 2] - label[:, 2],
+            "delta_R_deg": delta_r_deg(pred, label),
+            "stiffness": pred[:, 18] - label[:, 18],
+        }
+    elif pred.shape[1] >= 21:
+        per_dim = {
+            "x": pred[:, 0] - label[:, 0],
+            "y": pred[:, 1] - label[:, 1],
+            "z": pred[:, 2] - label[:, 2],
+            "rot_deg": relative_command_rot_deg(pred, label),
+            "stiffness": pred[:, 18] - label[:, 18],
+        }
+    else:
+        raise ValueError(f"action width {pred.shape[1]} is neither r4vt nor r1rel")
     table = {}
     for name, err in per_dim.items():
         table[name] = {group: _mae(err, mask) for group, mask in groups.items()}

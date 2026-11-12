@@ -186,6 +186,109 @@ def home_to_pose7(
         time.sleep(duration_s + 0.5)
 
 
+APPROACH_SPEED_MPS = 0.05
+APPROACH_HOVER_M = 0.05
+APPROACH_MAX_MESH_M = 0.15
+
+
+def _slow_move_l(env, goal_pose7: np.ndarray, max_speed_mps: float = APPROACH_SPEED_MPS) -> None:
+    """Cartesian move of robot 0. Duration keeps the TCP at or under max_speed_mps."""
+    obs_raw = env.get_observation_from_buffer()
+    current = np.asarray(obs_raw["ts_pose_fb_0"][-1], dtype=np.float64).reshape(7)
+    goal = np.asarray(goal_pose7, dtype=np.float64).reshape(7)
+    dist = float(np.linalg.norm(goal[:3] - current[:3]))
+    duration_s = max(dist / float(max_speed_mps), 0.5)
+    n_samples = max(2, int(round(duration_s / 0.02)))
+    alpha = np.linspace(0.0, 1.0, n_samples)
+    waypoints = su.pose7_interp(current, goal, alpha)
+    timestamps = alpha * duration_s
+    ids = list(getattr(env, "id_list", [0]))
+    if ids == [0]:
+        pose_cmd = waypoints.T
+    else:
+        pose_cmd = np.zeros((7 * len(ids), n_samples))
+        for i, rid in enumerate(ids):
+            if int(rid) == 0:
+                pose_cmd[i * 7 : (i + 1) * 7] = waypoints.T
+            else:
+                held = np.asarray(obs_raw[f"ts_pose_fb_{rid}"][-1], dtype=np.float64).reshape(7)
+                pose_cmd[i * 7 : (i + 1) * 7] = np.repeat(held.reshape(7, 1), n_samples, axis=1)
+    env.schedule_controls(
+        pose7_cmd=pose_cmd,
+        timestamps=(timestamps + env.current_hardware_time_s) * 1000,
+    )
+    time.sleep(duration_s + 0.3)
+
+
+def _segment_inside_safe_zone(start_xyz, goal_xyz, safe_zone, n: int = 25) -> bool:
+    start_xyz = np.asarray(start_xyz, dtype=np.float64).reshape(3)
+    goal_xyz = np.asarray(goal_xyz, dtype=np.float64).reshape(3)
+    for t in np.linspace(0.0, 1.0, n):
+        if not tcp_inside_safe_zone((1.0 - t) * start_xyz + t * goal_xyz, safe_zone):
+            return False
+    return True
+
+
+def approach_start_pose(
+    env,
+    start_pose7: np.ndarray,
+    field,
+    T_fixture_from_base: np.ndarray,
+    hardware_config_path: str,
+) -> bool:
+    """Move to 5 cm above the start along the mold normal, then down to it.
+
+    Both waits are on the caller. Returns False when the pose is unreachable
+    or outside the workcell, without moving.
+    """
+    start = np.asarray(start_pose7, dtype=np.float64).reshape(7)
+    start_fix = pose7_change_frame(start, T_fixture_from_base)
+    queried = field.query(start_fix[:3])
+    sd = float(np.asarray(queried["sd"]).reshape(-1)[0])
+    if not np.isfinite(sd) or abs(sd) > APPROACH_MAX_MESH_M:
+        print_red(
+            f"[approach] Start is {sd * 1e3:.0f} mm from the mold. Not moving."
+        )
+        return False
+    normal = np.asarray(queried["R"], dtype=np.float64).reshape(3, 3)[:, 2]
+    hover_fix = start_fix.copy()
+    hover_fix[:3] = start_fix[:3] + APPROACH_HOVER_M * normal
+    hover = pose7_change_frame(hover_fix, np.linalg.inv(T_fixture_from_base))
+    safe_zone = read_cartesian_safe_zone(hardware_config_path)
+    if safe_zone is None:
+        print_red("[approach] No cartesian safe zone in the hardware config. Not moving.")
+        return False
+    obs_raw = env.get_observation_from_buffer()
+    current = np.asarray(obs_raw["ts_pose_fb_0"][-1], dtype=np.float64).reshape(7)
+    for name, pose in (("hover", hover), ("start", start)):
+        if not tcp_inside_safe_zone(pose[:3], safe_zone):
+            print_red(f"[approach] {name} pose is outside the safe zone {safe_zone}. Not moving.")
+            return False
+    if not _segment_inside_safe_zone(current[:3], hover[:3], safe_zone):
+        print_red("[approach] The move to the hover leaves the safe zone. Not moving.")
+        return False
+    if not _segment_inside_safe_zone(hover[:3], start[:3], safe_zone):
+        print_red("[approach] The descent leaves the safe zone. Not moving.")
+        return False
+    print(
+        "[approach] moveL to 5 cm above the start along the mold normal, "
+        f"at most {APPROACH_SPEED_MPS * 100:.0f} cm/s."
+    )
+    try:
+        _slow_move_l(env, hover)
+    except Exception as exc:
+        print_red(f"[approach] Move to the hover failed ({exc}).")
+        return False
+    input("At the hover. Press Enter to descend to the start pose.")
+    print("[approach] descending to the start pose.")
+    try:
+        _slow_move_l(env, start)
+    except Exception as exc:
+        print_red(f"[approach] Descent failed ({exc}).")
+        return False
+    return True
+
+
 def move_to_dataset_start_pose(
     env,
     id_list: list,
@@ -373,6 +476,11 @@ def run_compare_pointcloud(
         )
     print(f"[layup-eval] [bg] Heatmap: {result['heatmap_png']}")
     return result
+
+
+def gt_replay_rollout_id(episode: int, ts: int) -> str:
+    """Folder name for a label replay: gt_replay_ep{N}_{unix}."""
+    return f"gt_replay_ep{int(episode)}_{int(ts)}"
 
 
 def make_rollout_id(ckpt_path: str, episode_id: int, ts: Optional[int] = None) -> str:
@@ -944,7 +1052,7 @@ def main():
         # seconds during an episode. Each call cold-starts run_layup_scan.py
         # (no persistent daemon) and resumes control only after the new
         # scan_heatmap_0 has been loaded, since the policy conditions on it.
-        "periodic_scan_enabled": True,
+        "periodic_scan_enabled": False,
         "periodic_scan_interval_s": 60.0,
         "periodic_scan_timeout_s": 90.0,
         "periodic_scan_compare_timeout_s": 30.0,
@@ -959,7 +1067,7 @@ def main():
         # are enabled automatically. dry_run forces δn to a positive hover height.
         "mold_aware_dry_run": False,
         "mold_aware_field_npz": (
-            "/mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/"
+            "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/"
             "shared/fixb_field.npz"
         ),
         "mold_aware_abort_on_safety": True,
@@ -988,7 +1096,8 @@ def main():
         #   /scanner_fixb/r1_world_world/epoch=0035-train_loss=0.018.ckpt
         #   /scanner_fixb/r2_world_fixb/epoch=0035-train_loss=0.016.ckpt
         #   /scanner_fixb/r4_world_fixb_tilt/epoch=0060-train_loss=0.018.ckpt
-        "ckpt_path": "/oct_v35_h4s/r4_world_fixb_tilt/epoch=0195-train_loss=0.011.ckpt",
+        "ckpt_path": "/oct_v35_h4s_odom_r4vt/checkpoints/epoch=0185-train_loss=0.011.ckpt",
+        # r1rel: "/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt",
         "hardware_config_path": hardware_config_folder_path
         + "/ur5e_wrist_ft.yaml",
         "audio_device_id": [5],  # only needed for audio input
@@ -999,6 +1108,9 @@ def main():
         "robot_downsample_correction": 500.0 / 200.0,
         "wrench_downsample_correction": 500.0 / 28.0,
     }
+    # run_rollout.sh sets this so the checkpoint can change without editing the file.
+    if os.environ.get("UMIFT_CKPT_PATH"):
+        pipeline_para["ckpt_path"] = os.environ["UMIFT_CKPT_PATH"]
     if not pipeline_para["use_layup_env"]:
         control_para["raw_time_step_s"] = 0.0167
         pipeline_para["hardware_config_path"] = (
@@ -1051,6 +1163,7 @@ def main():
     mold_runtime = None
     mold_run_type = "none"
     r4vt = False
+    r4_jump_guard = None
     _task_name = ""
     _dataset_path_cfg = ""
     try:
@@ -1104,11 +1217,19 @@ def main():
             f"field={control_para['mold_aware_field_npz']}"
         )
         if r4vt:
+            from jump_guard import MAX_CONSECUTIVE_HOLDS, MAX_STEP_DEG, MAX_STEP_MM, TargetJumpGuard
+
+            r4_jump_guard = TargetJumpGuard()
             print(
                 f"[mold] r4vt action blend, "
                 f"dn_floor={mold_runtime.limits.enable_delta_n_floor} "
                 f"tcp_penetration_m={mold_runtime.limits.max_tcp_penetration_m} "
                 f"wrench_hold_n={mold_runtime.limits.wrench_hold_n}"
+            )
+            print(
+                f"[jump-guard] step limit {MAX_STEP_MM:.2f} mm, {MAX_STEP_DEG:.2f} deg "
+                f"(1.5 x commanded-target p99.9 on episodes 0 and 9, frame flips excluded). "
+                f"Abort after {MAX_CONSECUTIVE_HOLDS} holds in a row."
             )
         print(
             f"[mold] set_depth_to_zero={control_para['set_depth_to_zero']}, "
@@ -1600,15 +1721,86 @@ def main():
     else:
         print(f"[dataset-start] option d uses {dataset_start_zarr}")
 
+    gt_replay = None
+    replay_ep = os.environ.get("UMIFT_REPLAY_EPISODE", "").strip()
+    if replay_ep:
+        from gt_replay import GtReplay
+
+        gt_arm = "r4vt" if r4vt else "r1rel"
+        gt_replay = GtReplay(
+            arm=gt_arm,
+            episode=int(replay_ep),
+            exec_h=int(control_para["sparse_execution_horizon"]),
+            normalizer=policy.sparse_normalizer["action"],
+        )
+        control_para["enable_control_log"] = True
+        control_para["log_policy_vision"] = True
+        control_para["record_rollout_cameras"] = True
+        print(
+            f"[gt-replay] {gt_arm} episode {gt_replay.episode}: "
+            f"{len(gt_replay.actions)} label chunks, "
+            f"H={gt_replay.exec_h}, no policy call"
+        )
+
     #########################################
     # main loop starts
     #########################################
     while True:
         printOrNot(vbs_h1, "New episode. Episode ID: ", episode_id)
-        start_cmd = input(
-            "Press Enter to start the episode. "
-            "d: move to a dataset start pose first. "
-        )
+        if gt_replay is not None:
+            gt_replay.reset()
+        if r4_jump_guard is not None:
+            r4_jump_guard.reset()
+        if r4vt:
+            if gt_replay is not None and mold_T_fixture_from_base is not None:
+                start_base = gt_replay.start_pose_base(mold_T_fixture_from_base)
+                pose_note = f"recorded episode {gt_replay.episode}"
+            elif gt_replay is not None:
+                start_base = gt_replay.start_pose7
+                pose_note = f"recorded episode {gt_replay.episode}, fixture frame"
+            else:
+                start_base = np.asarray(
+                    env.get_observation_from_buffer()["ts_pose_fb_0"][-1],
+                    dtype=np.float64,
+                ).reshape(7)
+                pose_note = "current TCP"
+            pose_txt = " ".join(f"{float(v):.5f}" for v in np.asarray(start_base).reshape(7))
+            print(f"[r4vt] start pose (right_base, {pose_note}): {pose_txt}")
+            approached = False
+            if mold_runtime is not None and mold_T_fixture_from_base is not None:
+                approached = approach_start_pose(
+                    env,
+                    start_base,
+                    mold_runtime.field,
+                    mold_T_fixture_from_base,
+                    pipeline_para["hardware_config_path"],
+                )
+            if approached:
+                input("At the start pose. Press Enter to begin.")
+            else:
+                print("[r4vt] Jog the right arm to that pose, then press Enter.")
+                input()
+            start_cmd = ""
+        else:
+            if gt_replay is not None:
+                if mold_T_fixture_from_base is not None:
+                    start_base = gt_replay.start_pose_base(mold_T_fixture_from_base)
+                    frame_name = "right_base"
+                else:
+                    start_base = gt_replay.start_pose7
+                    frame_name = "fixture"
+                pose_txt = " ".join(
+                    f"{float(v):.5f}" for v in np.asarray(start_base).reshape(7)
+                )
+                print(
+                    f"[gt-replay] recorded start pose ({frame_name}) "
+                    f"episode {gt_replay.episode}: {pose_txt}"
+                )
+                print("[gt-replay] Jog the right arm to that pose, then press Enter.")
+            start_cmd = input(
+                "Press Enter to start the episode. "
+                "d: move to a dataset start pose first. "
+            )
         if start_cmd.strip().lower() == "d":
             move_to_dataset_start_pose(
                 env,
@@ -1624,9 +1816,12 @@ def main():
         log = None
         horizon_count = 0
         episode_ts = int(time.time())
-        rollout_id = make_rollout_id(
-            pipeline_para["ckpt_path"], episode_id, ts=episode_ts
-        )
+        if gt_replay is not None:
+            rollout_id = gt_replay_rollout_id(gt_replay.episode, episode_ts)
+        else:
+            rollout_id = make_rollout_id(
+                pipeline_para["ckpt_path"], episode_id, ts=episode_ts
+            )
         episode_log_path = os.path.join(control_log_folder_path, rollout_id)
         # Per-episode mold metrics (filled when mold_runtime is on).
         ep_sd: List[float] = []
@@ -1637,6 +1832,9 @@ def main():
         ep_n_clamp_steps = 0
         ep_n_action_steps = 0
         ep_n_safety_stops = 0
+        ep_n_holds = 0
+        ep_jump_holds: List[dict] = []
+        ep_jump_aborted = False
         ep_safety_reasons: List[str] = []
         prev_seam_x: Optional[np.ndarray] = None
         prev_seam_R: Optional[np.ndarray] = None
@@ -1702,6 +1900,9 @@ def main():
                     )
                     log.attrs["wrench_hold_n"] = float(control_para["wrench_hold_n"])
             log.attrs["log_policy_vision"] = bool(control_para["log_policy_vision"])
+            if gt_replay is not None:
+                log.attrs["mode"] = "gt_replay"
+                log.attrs["gt_replay_episode"] = int(gt_replay.episode)
             printOrNot(vbs_h1, "Control log:", episode_log_path)
             printOrNot(vbs_h1, "Rollout ID:", rollout_id)
 
@@ -1724,6 +1925,12 @@ def main():
         while not killer.kill_now:
             horizon_initial_time_s = env.current_hardware_time_s
             printOrNot(vbs_h1, "Starting new horizon at ", horizon_initial_time_s)
+            gt_meas_pose = None
+            r4_keep_len = None
+            r4_jump_abort = False
+            if gt_replay is not None and not gt_replay.remaining():
+                print("[gt-replay] recorded labels are finished")
+                break
 
             # Periodic mid-episode laser scan interrupt: pauses RTDE control,
             # runs a one-shot run_layup_scan.py, loads the new heatmap, then
@@ -1818,6 +2025,8 @@ def main():
                 mold_fill = mold_runtime.fill_obs_raw(obs_raw, robot_id=0)
                 pose_fix = np.asarray(obs_raw["ts_pose_fb_0"], dtype=np.float64)
                 obs_raw["ts_pose_fb_0"] = pose_base
+                if gt_replay is not None and len(pose_fix):
+                    gt_meas_pose = pose_fix[-1].copy()
                 hard_obs = mold_runtime.last_hard_triggers
                 if hard_obs:
                     print_red(f"[mold][safety] obs hard_triggers={hard_obs}")
@@ -1860,6 +2069,7 @@ def main():
                             ep_safety_reasons.append("wrench_abort")
                             break
                         if decision == "hold":
+                            ep_n_holds += 1
                             print_yellow(
                                 f"[mold][hold] wrench {ep_force[-1]:.1f} N "
                                 f">= {mold_runtime.limits.wrench_hold_n:.0f} N; "
@@ -1899,8 +2109,38 @@ def main():
                 or action_type == "pose9g1"
             ), f"Unsupported action type: {action_type}"
 
-            # Run inference
-            if action_type == "pose9":
+            # Run inference. GT replay never calls the policy; it fills
+            # last_raw_action with the next label chunk and then uses the
+            # same postprocess (r1rel) or the same decode block (r4vt).
+            if gt_replay is not None:
+                raw_action, _label_idx = gt_replay.current()
+                controller.last_raw_action = np.asarray(raw_action, dtype=np.float64)
+                if r4vt:
+                    n_rows = controller.last_raw_action.shape[0]
+                    eye = np.repeat(np.eye(4)[None], n_rows, axis=0)
+                    action_sparse_target_mats = [eye]
+                    action_sparse_vt_mats = [eye.copy()]
+                    action_stiffnesses = [controller.last_raw_action[:, 18]]
+                    action_eoat = [controller.last_raw_action[:, 19:21]]
+                else:
+                    obs_sampled = controller.sample_sparse_obs(obs_task)
+                    _obs_policy, SE3_WBase = controller.preprocess_policy_obs(
+                        obs_sampled
+                    )
+                    controller.SE3_WBase = SE3_WBase
+                    controller.last_obs_policy = _obs_policy
+                    (
+                        action_sparse_target_mats,
+                        action_sparse_vt_mats,
+                        action_stiffnesses,
+                        action_eoat,
+                    ) = controller.action_postprocess(
+                        controller.last_raw_action,
+                        SE3_WBase,
+                        controller.id_list,
+                        controller.fix_orientation,
+                    )
+            elif action_type == "pose9":
                 action_sparse_target_mats = controller.compute_one_horizon_action(
                     obs_task["obs"], device
                 )
@@ -2011,6 +2251,66 @@ def main():
                     if control_para["mold_aware_abort_on_safety"]:
                         print_red("[mold] aborting episode due to safety trigger")
                         break
+                if r4vt and r4_jump_guard is not None:
+                    label_idx = None
+                    if gt_replay is not None:
+                        label_idx = np.asarray(
+                            gt_replay.windows[gt_replay.k][: decoded["x_d"].shape[0]]
+                        )
+                    n_before = len(r4_jump_guard.holds)
+                    x_g, R_g, field_g, aborted = r4_jump_guard.apply(
+                        decoded["x_d"],
+                        decoded["R_d"],
+                        robot_index=label_idx,
+                        R_field=decoded["R_field"],
+                    )
+                    for row in r4_jump_guard.holds[n_before:]:
+                        ep_jump_holds.append(row)
+                        where = (
+                            f"idx {row['robot_index']}"
+                            if row["robot_index"] is not None
+                            else f"h={horizon_count}"
+                        )
+                        text = (
+                            f"[jump-guard] {'ABORT' if row['abort'] else 'hold'} "
+                            f"{where} step {row['step']} "
+                            f"pos {row['pos_mm']:.1f} mm rot {row['rot_deg']:.1f} deg "
+                            f"run {row['run']}"
+                        )
+                        if row["abort"]:
+                            print_red(text)
+                        else:
+                            print_yellow(text)
+                    n_keep = int(x_g.shape[0])
+                    if n_keep == 0:
+                        r4_jump_abort = True
+                        ep_jump_aborted = True
+                        break
+                    for key in (
+                        "x_s",
+                        "sd",
+                        "stiffness",
+                        "eoat",
+                        "v_par",
+                        "delta_n",
+                        "clamp_speed",
+                        "clamp_step",
+                        "clamp_dn",
+                        "clamp_tilt",
+                        "clamp_rot_rate",
+                        "mesh_jump_hold",
+                    ):
+                        arr = decoded.get(key)
+                        if arr is not None and len(arr) == decoded["x_d"].shape[0]:
+                            decoded[key] = arr[:n_keep]
+                    decoded["x_d"] = x_g
+                    decoded["R_d"] = R_g
+                    decoded["R_field"] = field_g
+                    exe_h_preview = n_keep
+                    r4_keep_len = n_keep
+                    if aborted:
+                        r4_jump_abort = True
+                        ep_jump_aborted = True
                 # Chunk-seam jump vs previous executed endpoint.
                 if prev_seam_x is not None:
                     dx = float(np.linalg.norm(decoded["x_d"][0] - prev_seam_x) * 1e3)
@@ -2278,6 +2578,8 @@ def main():
 
             # Blend overlapping chunk predictions (or hard-cut) down to execution horizon.
             exec_h = int(control_para["sparse_execution_horizon"])
+            if r4_keep_len is not None:
+                exec_h = min(exec_h, int(r4_keep_len))
             if action_ensemblers is not None and not r4vt:
                 start_step = horizon_count * exec_h
                 for id in id_list:
@@ -2342,6 +2644,17 @@ def main():
                     log_policy_vision=control_para["log_policy_vision"],
                     scan_encoder_stats=scan_encoder_stats,
                 )
+                if gt_replay is not None:
+                    exe = min(exec_h, outputs_ts_targets[0].shape[0])
+                    demo_idx = np.asarray(gt_replay.windows[gt_replay.k][:exe], dtype=np.int64)
+                    demo_pose = gt_replay.demo[demo_idx]
+                    if mold_T_fixture_from_base is not None:
+                        demo_pose = pose7_change_frame(
+                            demo_pose, np.linalg.inv(mold_T_fixture_from_base)
+                        )
+                    log[f"horizon_{horizon_count}"]["action"].create_dataset(
+                        "ts_demo_0", data=np.asarray(demo_pose, dtype=np.float64)
+                    )
 
             action_start_time_s = env.current_hardware_time_s
 
@@ -2375,7 +2688,14 @@ def main():
             # horizon_log.create_dataset(
             #     "timestamps_s", data=timestamps + action_start_time_s
             # )
+            if gt_replay is not None:
+                if gt_meas_pose is not None:
+                    gt_replay.note_tcp(gt_meas_pose)
+                gt_replay.advance()
             horizon_count += 1
+            if r4_jump_abort:
+                print_red("[jump-guard] aborting episode")
+                break
 
             if control_para["pausing_mode"]:
                 c = input("Press Enter to start the next horizon. q to quit.")
@@ -2402,6 +2722,22 @@ def main():
         if scan_monitor is not None:
             print(scan_monitor.summary())
         printOrNot(vbs_h1, "End of episode.")
+        if gt_replay is not None:
+            err = gt_replay.error_summary()
+            if err["n"] == 0:
+                print("[gt-replay] TCP vs demo: no samples")
+            else:
+                print(
+                    "[gt-replay] TCP vs demo: "
+                    f"n={err['n']} "
+                    f"median {err['pos_median_mm']:.2f} mm "
+                    f"p95 {err['pos_p95_mm']:.2f} mm, "
+                    f"median {err['rot_median_deg']:.2f} deg "
+                    f"p95 {err['rot_p95_deg']:.2f} deg"
+                )
+            print(
+                f"[gt-replay] holds={ep_n_holds} aborts={ep_n_safety_stops}"
+            )
         finished_episode_id = episode_id
         finished_rollout_id = rollout_id
         finished_episode_log_path = episode_log_path
@@ -2457,6 +2793,16 @@ def main():
             "control_log": finished_episode_log_path,
             "camera_hz_expected": CAMERA_HZ,
         }
+        if gt_replay is not None:
+            journal["mode"] = "gt_replay"
+            journal["gt_replay_episode"] = int(gt_replay.episode)
+            journal["n_holds"] = int(ep_n_holds)
+            journal["n_aborts"] = int(ep_n_safety_stops)
+        if r4vt:
+            journal["n_jump_holds"] = int(
+                sum(1 for row in ep_jump_holds if not row["abort"])
+            )
+            journal["jump_aborted"] = bool(ep_jump_aborted)
         if mold_runtime is not None:
             journal["max_distance_from_mesh_m"] = float(
                 mold_runtime.limits.max_distance_from_mesh_m

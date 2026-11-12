@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
@@ -840,6 +841,7 @@ class Handler(BaseHTTPRequestHandler):
     mesh = None
     manifests: dict = {}
     raws: dict = {}
+    bag_dir: Path = BAG_DIR
 
     def log_message(self, fmt, *args):
         return
@@ -858,7 +860,7 @@ class Handler(BaseHTTPRequestHandler):
     def _bag(self, episode: int):
         name = self.names[episode]
         if name not in self.manifests:
-            path = BAG_DIR / f"{name}_camera"
+            path = self.bag_dir / f"{name}_camera"
             self.manifests[name] = json.loads((path / "manifest.json").read_text())
             self.raws[name] = np.memmap(path / "color.raw", dtype=np.uint8, mode="r")
         return name, self.manifests[name], self.raws[name]
@@ -957,7 +959,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument(
+        "--bags-dir",
+        type=Path,
+        default=Path(os.environ.get("UMIFT_OCT_BAGS", str(BAG_DIR))),
+        help="Camera bags root. Default is UMIFT_OCT_BAGS, then stringer_v3.5/bags.",
+    )
     args = parser.parse_args()
+    Handler.bag_dir = args.bags_dir
     field = np.load(FIELD)
     vertices, faces = decimate_mesh(field["vertices"], field["faces"], field["is_apron"])
     Handler.mesh = mesh_payload(vertices, faces)
@@ -975,6 +984,7 @@ def main() -> None:
         f"r4 {len(Handler.ids_r4)}, r4vt {len(Handler.ids_r4vt)}, mesh {len(faces)} tris",
         flush=True,
     )
+    print(f"[view_oct] bags {Handler.bag_dir}", flush=True)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"[view_oct] http://{args.host}:{args.port}", flush=True)
     server.serve_forever()
