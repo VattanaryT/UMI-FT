@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Start the layup runner for one arm. The checkpoint is passed in UMIFT_CKPT_PATH.
-# Usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N]
+# Usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--extrinsics PATH] [--ckpt PATH]
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N]"
+  echo "usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--extrinsics PATH] [--ckpt PATH]"
   echo "  r4vt   UMIFT_CKPT_PATH=/oct_v35_h4s_odom_r4vt/checkpoints/epoch=0185-train_loss=0.011.ckpt"
   echo "  r1rel  UMIFT_CKPT_PATH=/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt"
   echo "  --replay-episode N   play that episode's labels through the runner (no policy call)"
+  echo "  --extrinsics PATH    set UMIFT_WORKCELL_EXTRINSICS to that yaml"
+  echo "  --ckpt PATH          checkpoint path relative to PYRITE_CHECKPOINT_FOLDERS, leading /"
   echo "  r4vt, policy and replay: jump guard holds a commanded step over 248.70 mm or 75.96 deg"
   echo "    and aborts after 3 holds in a row. r1rel is unchanged."
   echo "  r4vt, before the episode: moveL at <= 5 cm/s to 5 cm above the start along the mold"
@@ -23,11 +25,23 @@ die() {
 arm="${1:-}"
 shift || true
 replay_episode=""
+extrinsics=""
+ckpt=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --replay-episode)
       [[ $# -ge 2 && -n "${2:-}" ]] || die "--replay-episode needs an episode id"
       replay_episode="$2"
+      shift 2
+      ;;
+    --extrinsics)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--extrinsics needs a yaml path"
+      extrinsics="$2"
+      shift 2
+      ;;
+    --ckpt)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--ckpt needs a checkpoint path"
+      ckpt="$2"
       shift 2
       ;;
     *)
@@ -49,6 +63,15 @@ case "$arm" in
     exit 2
     ;;
 esac
+
+if [[ -n "$ckpt" ]]; then
+  export UMIFT_CKPT_PATH="$ckpt"
+fi
+
+if [[ -n "$extrinsics" ]]; then
+  [[ -f "$extrinsics" ]] || die "extrinsics file not found: $extrinsics"
+  export UMIFT_WORKCELL_EXTRINSICS="$(realpath "$extrinsics")"
+fi
 
 if [[ -n "$replay_episode" ]]; then
   export UMIFT_REPLAY_EPISODE="$replay_episode"

@@ -12,8 +12,10 @@ if str(_SCRIPTS) not in sys.path:
 from fixb_labels import pose7_to_Rp
 from mold_aware_runtime import DEFAULT_FIELD
 from mold_calib_check import (
+    closest_on_patch,
     expected_xyz,
     fit_rigid_offset,
+    kabsch_rigid,
     load_points,
     measure_contact,
     normal_error_deg,
@@ -22,6 +24,7 @@ from mold_calib_check import (
     resolve_field,
     rotvec_to_pose7,
     spot_distance_mm,
+    tag_poses_in_fixture,
 )
 from PyriteEnvSuites.env_runners.umift_env_runner import pose7_batch_to_fixture
 
@@ -73,6 +76,55 @@ def test_yaml_defines_six_corners_in_fixture_axes():
     far = expected_xyz(by_label["flange_l_far"], "train")
     assert left[2] > right[2]
     assert left[0] > far[0]
+
+
+def test_patch_match_ignores_a_closer_vertex_outside_the_target():
+    target = np.zeros(3)
+    patch_vertex = np.zeros(3)
+    tcp = np.array([0.05, 0.02, 0.0])
+    decoy = np.array([0.07, 0.0, 0.0])
+    vertices = np.stack([patch_vertex, decoy, np.array([0.02, 0.0, 0.0])])
+    foot = closest_on_patch(tcp, target, vertices, radius_m=0.060)
+    assert foot is not None
+    assert np.allclose(foot, [0.02, 0.0, 0.0])
+    src = np.stack([tcp, tcp + np.array([0.3, 0.0, 0.1])])
+    dst = src - np.array([0.04, 0.02, 0.0])
+    fit = kabsch_rigid(src, dst)
+    assert fit["rms_m"] < 1e-9
+    assert np.allclose(fit["t_m"], [-0.04, -0.02, 0.0], atol=1e-9)
+
+
+def test_working_surface_points_stay_on_the_stringer():
+    path = _SCRIPTS / "mold_calib_points_working.yaml"
+    catalog = load_points(path)
+    labels = [p["label"] for p in catalog["points"]]
+    assert 6 <= len(labels) <= 8
+    assert "crown_near" in labels and "crown_far" in labels
+    assert any(name.startswith("wall_l_") for name in labels)
+    assert any(name.startswith("wall_r_") for name in labels)
+    assert any(name.startswith("flange_l_") for name in labels)
+    assert any(name.startswith("flange_r_") for name in labels)
+    xs, zs = [], []
+    for point in catalog["points"]:
+        xyz = expected_xyz(point, "train")
+        xs.append(xyz[0])
+        zs.append(xyz[2])
+        assert -0.40 < xyz[0] < -0.01
+        assert -0.05 < xyz[2] < 0.20
+    assert max(xs) - min(xs) > 0.25
+    assert max(zs) - min(zs) > 0.10
+
+
+def test_april_tags_map_from_the_master_tag_into_the_fixture():
+    path = Path("/home/boeing/umi_ft_ws/ee_tag_traj/configs/example_stringer.yaml")
+    poses = tag_poses_in_fixture(path)
+    by_id = {item["id"]: item["xyz_m"] for item in poses}
+    assert [item["id"] for item in poses] == [0, 1, 2, 3]
+    assert np.allclose(by_id[0], [0.0, 0.0, 0.0])
+    assert np.allclose(by_id[1], [-0.380, 0.0, 0.0])
+    assert np.allclose(by_id[2], [0.0, 0.0, 0.1356])
+    assert np.allclose(by_id[3], [-0.380, 0.0, 0.1356])
+    assert np.allclose(poses[0]["R"][:, 2], [0.0, -1.0, 0.0])
 
 
 def test_rigid_offset_recovers_translation_and_yaw():

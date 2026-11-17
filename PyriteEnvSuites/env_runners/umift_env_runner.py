@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -1115,6 +1116,10 @@ def main():
     # run_rollout.sh sets this so the checkpoint can change without editing the file.
     if os.environ.get("UMIFT_CKPT_PATH"):
         pipeline_para["ckpt_path"] = os.environ["UMIFT_CKPT_PATH"]
+    extrinsics = load_workcell_extrinsics()
+    extrinsics_sha = hashlib.sha256(Path(extrinsics.path).read_bytes()).hexdigest()
+    print(f"[frames] extrinsics: {extrinsics.path}")
+    print(f"[frames] extrinsics sha256: {extrinsics_sha}")
     if not pipeline_para["use_layup_env"]:
         control_para["raw_time_step_s"] = 0.0167
         pipeline_para["hardware_config_path"] = (

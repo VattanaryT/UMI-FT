@@ -1,0 +1,50 @@
+# Working-surface touches for the train mesh (fixb_field.npz sha256 f841837b…).
+# Does not replace mold_calib_points.yaml. Those outer-plate corners (z = +0.43
+# and z = -0.29) are the scan apron, not the stringer you lay up.
+#
+# The stringer is the hat around z ≈ +0.03 (right wall) to z ≈ +0.11 (left wall).
+# Points below are vertices on that hat and on the flat immediately outside
+# each wall. Near = +X, the end closer to the right-arm base. Far = -X.
+# Left = +Z (operator side). Right = -Z. Crown is the top of the hat, y ≈ -0.07.
+# Each end is about 40 mm in from the cutoff, on the working surface.
+# Flanges sit on opposite ends so the set spans the length and both sides.
+
+spot_warn_mm: 20
+
+stringer_axis: [1.0, 0.0, 0.0]
+across_axis: [0.0, 0.0, 1.0]
+crown_normal: [0.0, -1.0, 0.0]
+
+points:
+  - label: crown_near
+    description: "Top of the stringer, near end (+X, closer to the robot). Center of the crest, a short way in from the cutoff."
+    train_xyz_m: [-0.0501, -0.0715, 0.0735]
+    heldout_xyz_m: [-0.0501, -0.0715, 0.0735]
+  - label: wall_l_near
+    description: "Left wall (+Z, operator side), near end, about halfway up the wall."
+    train_xyz_m: [-0.0500, -0.0363, 0.1108]
+    heldout_xyz_m: [-0.0500, -0.0363, 0.1108]
+  - label: wall_r_near
+    description: "Right wall (-Z, away from the operator), near end, about halfway up the wall."
+    train_xyz_m: [-0.0496, -0.0362, 0.0341]
+    heldout_xyz_m: [-0.0496, -0.0362, 0.0341]
+  - label: flange_l_near
+    description: "Flat immediately outside the left wall, near end. Not the outer edge of the plate."
+    train_xyz_m: [-0.0501, -0.0031, 0.1443]
+    heldout_xyz_m: [-0.0501, -0.0031, 0.1443]
+  - label: crown_far
+    description: "Top of the stringer, far end (-X). Center of the crest, a short way in from the cutoff."
+    train_xyz_m: [-0.3610, -0.0683, 0.0736]
+    heldout_xyz_m: [-0.3610, -0.0683, 0.0736]
+  - label: wall_l_far
+    description: "Left wall (+Z, operator side), far end, about halfway up the wall."
+    train_xyz_m: [-0.3592, -0.0341, 0.1031]
+    heldout_xyz_m: [-0.3592, -0.0341, 0.1031]
+  - label: wall_r_far
+    description: "Right wall (-Z, away from the operator), far end, about halfway up the wall."
+    train_xyz_m: [-0.3593, -0.0339, 0.0409]
+    heldout_xyz_m: [-0.3593, -0.0339, 0.0409]
+  - label: flange_r_far
+    description: "Flat immediately outside the right wall, far end. Not the outer edge of the plate."
+    train_xyz_m: [-0.3597, -0.0024, -0.0142]
+    heldout_xyz_m: [-0.3597, -0.0024, -0.0142]

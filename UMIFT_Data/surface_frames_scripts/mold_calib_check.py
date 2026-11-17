@@ -47,6 +47,13 @@ HELDOUT_FIELD = Path(
     "/mnt/data/umidata/ft/mold_aware_datasets/heldout_mold/shared/fixb_field.npz"
 )
 POINTS_PATH = Path(__file__).with_name("mold_calib_points.yaml")
+# Flat master AprilTag -> fixture (Ry(180) @ Rx(-90)). Same matrix as
+# frame_conventions.R_FIXTURE_MASTER_TAG. example_stringer.yaml stores tag
+# translations in the master-tag frame.
+R_FIXTURE_MASTER_TAG = np.array(
+    [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+    dtype=np.float64,
+)
 DEFAULT_ROBOT_IP = "192.168.1.2"
 DEFAULT_RTDE_PYTHON = Path("/home/boeing/keyence_scan_ws/.venv/bin/python")
 SD_FAIL_MM = 3.0
@@ -104,6 +111,28 @@ def load_points(path: Path = POINTS_PATH) -> dict:
         "crown_normal": np.asarray(raw["crown_normal"], dtype=np.float64).reshape(3),
         "points": points,
     }
+
+
+def tag_poses_in_fixture(config_path: Path) -> list[dict]:
+    """AprilTag origins in the fixture frame, sorted by tag id.
+
+    ``example_stringer.yaml`` translations are in the master-tag frame.
+    Every tag there is aligned with the master tag, so each fixture rotation
+    is ``R_FIXTURE_MASTER_TAG``.
+    """
+    raw = yaml.safe_load(Path(config_path).read_text())
+    poses = []
+    for tid, pose in raw["tags"]["poses"].items():
+        p_tag = np.asarray(pose["translation"], dtype=np.float64).reshape(3)
+        poses.append(
+            {
+                "id": int(tid),
+                "xyz_m": R_FIXTURE_MASTER_TAG @ p_tag,
+                "R": R_FIXTURE_MASTER_TAG.copy(),
+            }
+        )
+    poses.sort(key=lambda item: item["id"])
+    return poses
 
 
 def expected_xyz(point: dict, mold: str) -> np.ndarray:
@@ -213,6 +242,55 @@ def fit_rigid_offset(
         "crown_m": float(np.dot(t, crown)),
         "yaw_deg": float(np.degrees(np.dot(omega, crown))),
         "center_m": center,
+    }
+
+
+PATCH_RADIUS_M = 0.060
+
+
+def closest_on_patch(
+    tcp_m: np.ndarray,
+    target_m: np.ndarray,
+    vertices: np.ndarray,
+    radius_m: float = PATCH_RADIUS_M,
+) -> Optional[np.ndarray]:
+    """Closest mesh vertex to the TCP inside the labeled target's neighborhood.
+
+    The global closest point can slide onto another face. Vertices farther
+    than ``radius_m`` from the labeled target are ignored.
+    """
+    vertices = np.asarray(vertices, dtype=np.float64).reshape(-1, 3)
+    tcp_m = np.asarray(tcp_m, dtype=np.float64).reshape(3)
+    target_m = np.asarray(target_m, dtype=np.float64).reshape(3)
+    patch = vertices[np.linalg.norm(vertices - target_m, axis=1) <= float(radius_m)]
+    if patch.shape[0] == 0:
+        return None
+    return patch[np.argmin(np.linalg.norm(patch - tcp_m, axis=1))].copy()
+
+
+def kabsch_rigid(src_m: np.ndarray, dst_m: np.ndarray) -> dict:
+    """Rigid map dst ≈ R @ src + t. Residual is dst - predicted."""
+    src_m = np.asarray(src_m, dtype=np.float64).reshape(-1, 3)
+    dst_m = np.asarray(dst_m, dtype=np.float64).reshape(-1, 3)
+    center_src = src_m.mean(axis=0)
+    center_dst = dst_m.mean(axis=0)
+    cov = (src_m - center_src).T @ (dst_m - center_dst)
+    u_mat, _s, vt = np.linalg.svd(cov)
+    rot = vt.T @ u_mat.T
+    if np.linalg.det(rot) < 0:
+        vt = vt.copy()
+        vt[-1] *= -1.0
+        rot = vt.T @ u_mat.T
+    trans = center_dst - rot @ center_src
+    predicted = (rot @ src_m.T).T + trans
+    resid = dst_m - predicted
+    per = np.linalg.norm(resid, axis=1)
+    return {
+        "R": rot,
+        "t_m": trans,
+        "resid_m": resid,
+        "resid_norm_m": per,
+        "rms_m": float(np.sqrt(np.mean(per * per))),
     }
 
 
