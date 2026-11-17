@@ -187,6 +187,32 @@ def test_foot_cannot_ratchet_more_than_10mm_per_replan_without_contact():
     assert np.allclose(third["x_s"][0], [0.005, 0.0, 0.0])
 
 
+def test_rd_slew_caps_three_degrees_across_replans():
+    runtime = _runtime(r4_safety_limits())
+    tcp = np.array([0.0, 0.0, 0.02])
+    first = runtime.decode_chunk(
+        _action(0.0, steps=2), tcp, np.eye(3), np.full(2, 1.0 / 15.0)
+    )
+    turned = _action(0.0, steps=2)
+    angle = np.radians(30.0)
+    cosine, sine = np.cos(angle), np.sin(angle)
+    turned[:, 21:27] = [cosine, -sine, 0.0, sine, cosine, 0.0]
+    second = runtime.decode_chunk(
+        turned, tcp, np.eye(3), np.full(2, 1.0 / 15.0)
+    )
+    from scipy.spatial.transform import Rotation
+
+    def step(a, b):
+        return np.degrees((Rotation.from_matrix(a).inv() * Rotation.from_matrix(b)).magnitude())
+
+    seam = step(first["R_d"][-1], second["R_d"][0])
+    inside = step(second["R_d"][0], second["R_d"][1])
+    assert seam <= 3.0 + 1e-6
+    assert inside <= 3.0 + 1e-6
+    assert "rd_slew" in runtime.last_triggers
+    assert bool(runtime.last_rd_slew[0])
+
+
 def test_bench_lift_is_fixture_up():
     lifted = shift_fixture_up(np.array([[1.0, 2.0, 3.0]]), 0.08)
     assert np.allclose(lifted, [[1.0, 1.92, 3.0]])

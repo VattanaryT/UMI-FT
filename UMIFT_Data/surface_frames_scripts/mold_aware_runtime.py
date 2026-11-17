@@ -96,6 +96,9 @@ class SafetyLimits:
     enable_tilt_clamp: bool = False
     enable_rot_rate_clamp: bool = False
     enable_mesh_jump_hold: bool = False
+    # Cross-chunk cap on commanded R_d. On for the r4 runtime.
+    enable_rd_slew: bool = False
+    max_rd_slew_deg: float = 3.0
 
 
 # Soft clamps (applied / flagged) vs hard stops (abort-worthy).
@@ -106,6 +109,7 @@ SOFT_CLAMP_KEYS = (
     "max_tilt",
     "max_rot_rate",
     "mesh_jump_hold",
+    "rd_slew",
 )
 HARD_STOP_KEYS = (
     "normal_flip",
@@ -131,6 +135,8 @@ def r4_safety_limits(
 ) -> SafetyLimits:
     """r4vt limits. The δn floor stays off unless a bench replay asks for it.
 
+    Commanded orientation slews at 3° per step, including across replans.
+
     Abort on measured TCP depth. Hold, then abort, on force. The measured-mesh
     flag skips the commanded-depth abort and checks the TCP instead.
     """
@@ -141,6 +147,7 @@ def r4_safety_limits(
         enable_wrench_hold=True,
         wrench_hold_n=float(wrench_hold_n),
         abort_on_measured_mesh_distance=bool(abort_on_measured_mesh_distance),
+        enable_rd_slew=True,
     )
 
 
@@ -344,18 +351,38 @@ def _clamp_tilt_to_normal(R_d: np.ndarray, n: np.ndarray, max_deg: float) -> tup
 
 def _clamp_rot_rate(R_d: np.ndarray, max_deg: float) -> tuple:
     """Cap geodesic step between consecutive R_d. Returns (R_out, clamp_mask)."""
+    return _slew_orientations(R_d, None, max_deg)
+
+
+def _slew_orientations(
+    R_d: np.ndarray, prev: np.ndarray | None, max_deg: float
+) -> tuple:
+    """Walk R_d toward each target, at most max_deg from the previous command.
+
+    ``prev`` is the last commanded orientation of the previous chunk. The first
+    step of this chunk slews from it, so a seam is capped the same way as a step.
+    """
     R = np.asarray(R_d, dtype=np.float64).reshape(-1, 3, 3).copy()
     hit = np.zeros(len(R), dtype=bool)
-    if len(R) < 2 or max_deg <= 0:
+    if max_deg <= 0 or len(R) == 0:
         return R, hit
+    if prev is not None:
+        R[0], hit[0] = _slew_one(
+            np.asarray(prev, dtype=np.float64).reshape(3, 3), R[0], max_deg
+        )
     for i in range(1, len(R)):
-        rel = R[i - 1].T @ R[i]
-        rv = Rotation.from_matrix(rel).as_rotvec()
-        ang = float(np.degrees(np.linalg.norm(rv)))
-        if ang > max_deg and ang > 1e-9:
-            hit[i] = True
-            R[i] = R[i - 1] @ Rotation.from_rotvec(rv * (max_deg / ang)).as_matrix()
+        R[i], hit[i] = _slew_one(R[i - 1], R[i], max_deg)
     return R, hit
+
+
+def _slew_one(origin: np.ndarray, target: np.ndarray, max_deg: float) -> tuple:
+    rel = origin.T @ target
+    rv = Rotation.from_matrix(rel).as_rotvec()
+    ang = float(np.degrees(np.linalg.norm(rv)))
+    if ang > max_deg and ang > 1e-9:
+        stepped = origin @ Rotation.from_rotvec(rv * (max_deg / ang)).as_matrix()
+        return stepped, True
+    return target, False
 
 
 @dataclass
@@ -384,6 +411,7 @@ class MoldAwareRuntime:
     # Last commanded foot. The next replan holds this face and this point.
     _cmd_foot: Optional[np.ndarray] = None
     _cmd_R: Optional[np.ndarray] = None
+    _cmd_Rd: Optional[np.ndarray] = None
     last_triggers: list = field(default_factory=list)
     # Per-step bool masks from the latest decode_chunk (length H).
     last_clamp_speed: Optional[np.ndarray] = None
@@ -431,17 +459,20 @@ class MoldAwareRuntime:
         self._wrench_over = False
         self._cmd_foot = None
         self._cmd_R = None
+        self._cmd_Rd = None
         self.last_triggers = []
 
     def release_command_foot(self) -> None:
         """Next decode queries the TCP. Offline windows do this; the live runner does not."""
         self._cmd_foot = None
         self._cmd_R = None
+        self._cmd_Rd = None
         self.last_clamp_speed = None
         self.last_clamp_step = None
         self.last_clamp_dn = None
         self.last_clamp_tilt = None
         self.last_clamp_rot_rate = None
+        self.last_rd_slew = None
         self.last_mesh_jump_hold = None
 
     @property
@@ -697,6 +728,7 @@ class MoldAwareRuntime:
         self.last_clamp_dn = np.zeros(H, dtype=bool)
         self.last_clamp_tilt = np.zeros(H, dtype=bool)
         self.last_clamp_rot_rate = np.zeros(H, dtype=bool)
+        self.last_rd_slew = np.zeros(H, dtype=bool)
         self.last_mesh_jump_hold = np.zeros(H, dtype=bool)
 
         if self.run_type == "r1_world_world":
@@ -807,6 +839,13 @@ class MoldAwareRuntime:
             self.last_clamp_rot_rate = rate_hit
             if np.any(rate_hit):
                 self.last_triggers.append("max_rot_rate")
+        if apply_safety and self.limits.enable_rd_slew:
+            R_d, slew_hit = _slew_orientations(
+                R_d, self._cmd_Rd, float(self.limits.max_rd_slew_deg)
+            )
+            self.last_rd_slew = slew_hit
+            if np.any(slew_hit):
+                self.last_triggers.append("rd_slew")
 
         if apply_safety and H > 1:
             steps = np.linalg.norm(np.diff(x_d, axis=0), axis=1)
@@ -825,6 +864,7 @@ class MoldAwareRuntime:
 
         self._cmd_foot = np.asarray(x_s[-1], dtype=np.float64).copy()
         self._cmd_R = np.asarray(R_field[-1], dtype=np.float64).reshape(3, 3).copy()
+        self._cmd_Rd = np.asarray(R_d[-1], dtype=np.float64).reshape(3, 3).copy()
 
         return {
             "x_d": x_d,
@@ -842,8 +882,13 @@ class MoldAwareRuntime:
             "clamp_dn": self.last_clamp_dn,
             "clamp_tilt": self.last_clamp_tilt,
             "clamp_rot_rate": self.last_clamp_rot_rate,
+            "rd_slew": self.last_rd_slew,
             "mesh_jump_hold": self.last_mesh_jump_hold,
         }
+
+    def note_commanded_rd(self, rotation: np.ndarray) -> None:
+        """Last R_d that was actually scheduled, in the fixture frame."""
+        self._cmd_Rd = np.asarray(rotation, dtype=np.float64).reshape(3, 3).copy()
 
     def decoded_to_action_mats(
         self, decoded: Dict[str, np.ndarray]

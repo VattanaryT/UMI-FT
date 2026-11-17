@@ -2238,6 +2238,7 @@ def main():
                         dtype=np.float64,
                     )
                 decoded = mold_runtime.decode_chunk(raw_a, p0[0], R0[0], dt)
+                R_d_fixture = np.asarray(decoded["R_d"], dtype=np.float64).copy()
                 # Fixture +Y is down. Lift the commanded foot and the virtual
                 # target along −Y so a free-space bench stays off the table.
                 # The surface normal is −Y on the flange and −Z on the wall, so
@@ -2276,6 +2277,9 @@ def main():
                     cr = decoded.get("clamp_rot_rate")
                     if cr is not None and bool(cr[i]):
                         flags.append("rot_rate")
+                    slew = decoded.get("rd_slew")
+                    if slew is not None and bool(slew[i]):
+                        flags.append("rd_slew")
                     mj = decoded.get("mesh_jump_hold")
                     if mj is not None and bool(mj[i]):
                         flags.append("mesh_jump_hold")
@@ -2343,6 +2347,7 @@ def main():
                         "clamp_dn",
                         "clamp_tilt",
                         "clamp_rot_rate",
+                        "rd_slew",
                         "mesh_jump_hold",
                     ):
                         arr = decoded.get(key)
@@ -2351,6 +2356,7 @@ def main():
                     decoded["x_d"] = x_g
                     decoded["R_d"] = R_g
                     decoded["R_field"] = field_g
+                    mold_runtime.note_commanded_rd(R_d_fixture[n_keep - 1])
                     exe_h_preview = n_keep
                     r4_keep_len = n_keep
                     if aborted:
