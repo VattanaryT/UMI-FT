@@ -85,6 +85,9 @@ class SafetyLimits:
     # 0.030 aborted the 2026-10-29 contact runs (commanded δn already ~27 mm).
     # 0.10 lets those chunks run; still stops a large fly-off. Demos peak ~0.32 m.
     max_distance_from_mesh_m: float = 0.10
+    # Off: abort on commanded ||x_d - x_s||. On: skip that check and abort on
+    # the measured TCP's distance to the surface. Penetration abort is separate.
+    abort_on_measured_mesh_distance: bool = False
     max_foot_hop_m: float = 0.020
     stop_on_normal_flip: bool = True
     max_tilt_from_normal_deg: float = 45.0
@@ -122,7 +125,9 @@ def fixb_decode_dt(
 
 
 def r4_safety_limits(
-    max_tcp_penetration_m: float = 0.020, wrench_hold_n: float = 90.0
+    max_tcp_penetration_m: float = 0.020,
+    wrench_hold_n: float = 90.0,
+    abort_on_measured_mesh_distance: bool = False,
 ) -> SafetyLimits:
     """r4vt: no δn floor. Abort on measured TCP depth. Hold, then abort, on force."""
     return SafetyLimits(
@@ -131,6 +136,7 @@ def r4_safety_limits(
         max_tcp_penetration_m=float(max_tcp_penetration_m),
         enable_wrench_hold=True,
         wrench_hold_n=float(wrench_hold_n),
+        abort_on_measured_mesh_distance=bool(abort_on_measured_mesh_distance),
     )
 
 
@@ -347,6 +353,7 @@ class MoldAwareRuntime:
         n = q["R"][..., 2]
         sd = np.sum((p_fb - x) * n, axis=1)
         self.note_tcp_penetration(sd)
+        self.note_measured_mesh_distance(p_fb, x)
         if self._prev_n is not None and self.limits.stop_on_normal_flip:
             if float(np.dot(self._prev_n, n[-1])) < 0:
                 self.last_triggers.append("normal_flip")
@@ -397,6 +404,22 @@ class MoldAwareRuntime:
         depth = np.asarray(sd, dtype=np.float64).reshape(-1)
         if np.any(depth < -float(self.limits.max_tcp_penetration_m)):
             self.last_triggers.append("tcp_penetration")
+
+    def note_measured_mesh_distance(self, p_meas: np.ndarray, x_s: np.ndarray) -> None:
+        """Abort when the measured TCP is farther than max_distance_from_mesh_m.
+
+        Off unless abort_on_measured_mesh_distance is set. On, decode_chunk
+        does not abort on the commanded ||x_d - x_s||.
+        """
+        if not self.limits.abort_on_measured_mesh_distance:
+            return
+        dist = np.linalg.norm(
+            np.asarray(p_meas, dtype=np.float64).reshape(-1, 3)
+            - np.asarray(x_s, dtype=np.float64).reshape(-1, 3),
+            axis=1,
+        )
+        if np.any(dist > float(self.limits.max_distance_from_mesh_m)):
+            self.last_triggers.append("max_distance_from_mesh")
 
     def wrench_hold_update(self, force_n: float) -> str:
         """'ok', 'hold', or 'abort'. Hold on the first sample at the cap."""
@@ -547,7 +570,11 @@ class MoldAwareRuntime:
             self.last_clamp_step[1:] = step_hit
             if np.any(step_hit):
                 self.last_triggers.append("max_step")
-        if apply_safety and not self.dry_run:
+        if (
+            apply_safety
+            and not self.dry_run
+            and not self.limits.abort_on_measured_mesh_distance
+        ):
             dist = np.linalg.norm(x_d - x_s, axis=1)
             if np.any(dist > self.limits.max_distance_from_mesh_m):
                 self.last_triggers.append("max_distance_from_mesh")
