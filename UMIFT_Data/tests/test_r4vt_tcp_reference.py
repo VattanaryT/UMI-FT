@@ -1,0 +1,163 @@
+"""r4vt reference pose is the TCP foot. Virtual target carries delta_n. No robot."""
+
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+SCRIPTS = Path(__file__).resolve().parents[1] / "surface_frames_scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+from fixb_field import FixBMoldField  # noqa: E402
+from fixb_labels import pose7_to_Rp  # noqa: E402
+from mold_aware_runtime import MoldAwareRuntime, r4_safety_limits  # noqa: E402
+
+CAUSAL = Path(
+    "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/"
+    "r4vt_frame_continuity_causal/acp_replay_buffer.zarr"
+)
+FIELD = Path(
+    "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/"
+    "shared/fixb_field.npz"
+)
+EYE6 = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0])
+FEW_MM = 0.005
+FEW_DEG = 5.0
+
+
+class _Flat:
+    """z = 0, outward normal +z."""
+
+    def query(self, p):
+        p = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+        foot = p.copy()
+        foot[:, 2] = 0.0
+        frames = np.broadcast_to(np.eye(3), (len(p), 3, 3)).copy()
+        return {"x_s": foot, "R": frames, "sd": p[:, 2].copy()}
+
+
+def _runtime(limits=None):
+    return MoldAwareRuntime(
+        field=_Flat(),
+        R_off=np.eye(3),
+        run_type="r4_world_fixb_tilt",
+        limits=limits or r4_safety_limits(),
+        dry_run=False,
+    )
+
+
+def _action(delta_n, steps=1):
+    action = np.zeros((steps, 27))
+    action[:, 2] = delta_n
+    action[:, 18] = 200.0
+    action[:, 21:27] = EYE6
+    return action
+
+
+def _axis_deg(offset, normal):
+    length = np.linalg.norm(offset, axis=-1)
+    unit = offset / np.clip(length[:, None], 1e-12, None)
+    cos = np.clip(np.abs(np.sum(unit * normal, axis=-1)), 0.0, 1.0)
+    return np.degrees(np.arccos(cos)), length
+
+
+def test_nominal_is_foot_and_vt_carries_delta_n():
+    runtime = _runtime()
+    tcp = np.array([0.1, -0.2, 0.02])
+    decoded = runtime.decode_chunk(
+        _action(-0.15), tcp, np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+    )
+    nominal, virtual = runtime.decoded_to_action_mats(decoded)
+    foot = runtime.field.query(tcp.reshape(1, 3))["x_s"][0]
+    assert np.linalg.norm(nominal[0, :3, 3] - foot) < FEW_MM
+    offset = virtual[0, :3, 3] - nominal[0, :3, 3]
+    assert np.allclose(offset, [0.0, 0.0, -0.15], atol=1e-8)
+    # The deep point is the attractor, not the reference.
+    assert np.linalg.norm(nominal[0, :3, 3] - (foot + offset)) > 0.1
+
+
+def test_bench_floor_limits_the_virtual_target_to_5mm():
+    runtime = _runtime(r4_safety_limits(enable_delta_n_floor=True))
+    tcp = np.array([0.0, 0.0, 0.01])
+    decoded = runtime.decode_chunk(
+        _action(-0.15), tcp, np.eye(3), np.array([1.0 / 15.0])
+    )
+    nominal, virtual = runtime.decoded_to_action_mats(decoded)
+    offset = np.linalg.norm(virtual[0, :3, 3] - nominal[0, :3, 3])
+    assert offset <= 0.005 + 1e-9
+    assert np.allclose(decoded["delta_n"], -0.005)
+
+
+def test_episode0_nominal_tracks_tcp_foot():
+    zarr = pytest.importorskip("zarr")
+    if not CAUSAL.exists() or not FIELD.exists():
+        pytest.skip("causal r4vt zarr or mold field is not on this machine")
+    from diffusion_policy.common.sampler_umift import (
+        sparse_action_indices_from_rgb_timestamps,
+    )
+
+    group = zarr.open(str(CAUSAL), "r")["data"]["episode_0"]
+    fb = np.asarray(group["ts_pose_fb_0"], dtype=np.float64)
+    tool_r, tcp = pose7_to_Rp(fb)
+    v_par = np.asarray(group["fixb_v_par_0"], dtype=np.float64)
+    delta_n = np.asarray(group["fixb_delta_n_0"], dtype=np.float64).reshape(-1)
+    robot_t = np.asarray(group["robot_time_stamps_0"], dtype=np.float64).reshape(-1)
+    rgb_t = np.asarray(group["rgb_time_stamps_0"], dtype=np.float64).reshape(-1)
+    field = FixBMoldField(FIELD)
+    runtime = MoldAwareRuntime(
+        field=field,
+        R_off=np.eye(3),
+        run_type="r4_world_fixb_tilt",
+        limits=r4_safety_limits(),
+        dry_run=False,
+    )
+    checked = 0
+    press = 0
+    for rgb_id in range(0, len(rgb_t), 6):
+        indices, _times = sparse_action_indices_from_rgb_timestamps(
+            robot_t, rgb_t, rgb_id, 6, 1
+        )
+        if len(indices) < 6:
+            break
+        indices = np.asarray(indices[:6], dtype=np.int64)
+        action = _action(delta_n[indices], steps=6)
+        action[:, 0:2] = v_par[indices]
+        decoded = runtime.decode_chunk(
+            action,
+            tcp[indices[0]],
+            tool_r[indices[0]],
+            np.full(6, 1.0 / 15.0),
+            apply_safety=False,
+        )
+        nominal, virtual = runtime.decoded_to_action_mats(decoded)
+        contact = field.query(tcp[indices[0]].reshape(1, 3))["x_s"][0]
+        assert np.linalg.norm(nominal[0, :3, 3] - contact) < FEW_MM
+        offset = virtual[:, :3, 3] - nominal[:, :3, 3]
+        normal = decoded["R_field"][:, :, 2]
+        angle, length = _axis_deg(offset, normal)
+        live = np.abs(decoded["delta_n"]) > 1e-3
+        assert np.all(angle[live] < FEW_DEG)
+        assert np.allclose(length, np.abs(decoded["delta_n"]), atol=1e-6)
+        deep = np.abs(delta_n[indices[0]]) > 0.05
+        if deep:
+            press += 1
+            assert np.linalg.norm(nominal[0, :3, 3] - contact) < FEW_MM
+        checked += 1
+    assert checked > 100
+    assert press > 10
+
+
+def test_runner_keeps_standard_bc_stiffness_path():
+    """Stiffness still comes from VT − nominal in the runner. No second builder."""
+    runner = (
+        Path(__file__).resolve().parents[2]
+        / "PyriteEnvSuites"
+        / "env_runners"
+        / "umift_env_runner.py"
+    ).read_text()
+    assert "compliance_direction_tool" in runner
+    assert "default_stiffness = 5000" in runner
+    assert "outputs_ts_targets[id] = ts_targets_virtual" in runner
+    assert "UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE" in runner
+    assert "UMIFT_ENABLE_DELTA_N_FLOOR" in runner

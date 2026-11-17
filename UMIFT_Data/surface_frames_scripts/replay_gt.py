@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import pickle
 import subprocess
 from pathlib import Path
@@ -39,7 +40,12 @@ from mold_aware_runtime import (
 )
 
 DATA = Path("/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr")
-R4VT_ZARR = DATA / "r4vt_world_fixb_tilt" / "acp_replay_buffer.zarr"
+R4VT_ZARR = Path(
+    os.environ.get(
+        "UMIFT_R4VT_ZARR",
+        str(DATA / "r4vt_world_fixb_tilt" / "acp_replay_buffer.zarr"),
+    )
+)
 R1REL_ZARR = DATA / "r1rel_world" / "acp_replay_buffer.zarr"
 FIELD_NPZ = DATA / "shared" / "fixb_field.npz"
 LONG_DT = DATA / "shared" / "long_dt_gt_100ms.npz"

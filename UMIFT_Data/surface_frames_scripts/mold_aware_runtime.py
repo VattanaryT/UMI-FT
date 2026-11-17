@@ -1,6 +1,6 @@
 """Live mold-aware obs + Fix B decode for umift_env_runner.
 
-Reuses FixBMoldField / integrate_fixb / heading_branch / tracked_project from the
+Reuses FixBMoldField / heading_branch / tracked_project from the
 training/eval scripts. Training stringer assets default to
 ``stringer_scanner_v2_fixb/shared/fixb_field.npz``.
 """
@@ -15,7 +15,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from fixb_field import FixBMoldField, integrate_fixb
+from fixb_field import FixBMoldField
 from fixb_labels import QUERY_SMOOTH_S, heading_branch, pose7_to_Rp, smooth_positions, so3_to_rot6d_rows
 
 DEFAULT_FIELD = Path(
@@ -84,6 +84,9 @@ class SafetyLimits:
     # 0.030 aborted the 2026-10-29 contact runs (commanded δn already ~27 mm).
     # 0.10 lets those chunks run; still stops a large fly-off. Demos peak ~0.32 m.
     max_distance_from_mesh_m: float = 0.10
+    # Off: abort when commanded ||x_d - x_s|| exceeds max_distance_from_mesh_m.
+    # On: skip that check and abort when the measured TCP is that far from its foot.
+    abort_on_measured_mesh_distance: bool = False
     max_foot_hop_m: float = 0.020
     stop_on_normal_flip: bool = True
     max_tilt_from_normal_deg: float = 45.0
@@ -121,16 +124,62 @@ def fixb_decode_dt(
 
 
 def r4_safety_limits(
-    max_tcp_penetration_m: float = 0.020, wrench_hold_n: float = 90.0
+    max_tcp_penetration_m: float = 0.020,
+    wrench_hold_n: float = 90.0,
+    abort_on_measured_mesh_distance: bool = False,
+    enable_delta_n_floor: bool = False,
 ) -> SafetyLimits:
-    """r4vt: no δn floor. Abort on measured TCP depth. Hold, then abort, on force."""
+    """r4vt limits. The δn floor stays off unless a bench replay asks for it.
+
+    Abort on measured TCP depth. Hold, then abort, on force. The measured-mesh
+    flag skips the commanded-depth abort and checks the TCP instead.
+    """
     return SafetyLimits(
-        enable_delta_n_floor=False,
+        enable_delta_n_floor=bool(enable_delta_n_floor),
         enable_tcp_penetration_abort=True,
         max_tcp_penetration_m=float(max_tcp_penetration_m),
         enable_wrench_hold=True,
         wrench_hold_n=float(wrench_hold_n),
+        abort_on_measured_mesh_distance=bool(abort_on_measured_mesh_distance),
     )
+
+
+def integrate_tcp_foot(
+    field,
+    p0: np.ndarray,
+    v_par: np.ndarray,
+    delta_n: np.ndarray,
+    dt: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """Foot of the measured TCP, then tangent steps re-projected onto the mesh.
+
+    Each replan starts at ``field.query(TCP)``. Later steps closest-point the
+    point ``foot + (v_t1, v_t2)·dt``. ``track_step`` holds the previous face and
+    can walk the foot onto a face the tool is not touching.
+    """
+    v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
+    delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
+    dt = np.asarray(dt, dtype=np.float64).reshape(-1)
+    h = len(delta_n)
+    cur = field.query(np.asarray(p0, dtype=np.float64).reshape(1, 3))
+    xs = np.asarray(cur["x_s"], dtype=np.float64).reshape(3).copy()
+    rk = np.asarray(cur["R"], dtype=np.float64).reshape(3, 3).copy()
+    x_s = np.zeros((h, 3))
+    frames = np.zeros((h, 3, 3))
+    for k in range(h):
+        x_s[k] = xs
+        frames[k] = rk
+        if k + 1 < h:
+            step = rk[:, :2] @ v_par[k] * float(dt[k])
+            nxt = field.query((xs + step).reshape(1, 3))
+            xs = np.asarray(nxt["x_s"], dtype=np.float64).reshape(3).copy()
+            rk = np.asarray(nxt["R"], dtype=np.float64).reshape(3, 3).copy()
+    normal = frames[:, :, 2]
+    return {
+        "x_s": x_s,
+        "x_d": x_s + delta_n[:, None] * normal,
+        "R": frames,
+    }
 
 
 def mean_rotation(rotations: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -353,6 +402,7 @@ class MoldAwareRuntime:
         R_fb, p_fb = pose7_to_Rp(pose7)
         if len(p_fb) == 0:
             return {}
+        p_meas = np.asarray(p_fb, dtype=np.float64).copy()
 
         # Same tracker as the labels: 0.1 s causal position smooth, 5 mm gate,
         # tool-rotation switch, 25° slew. The decision face stays unslewed.
@@ -387,6 +437,7 @@ class MoldAwareRuntime:
             curv = np.asarray(q["curv"], dtype=np.float64)
         n = R[..., 2]
         self.note_tcp_penetration(sd)
+        self.note_measured_mesh_distance(p_meas, x)
         if self._prev_n is not None and self.limits.stop_on_normal_flip:
             if float(np.dot(self._prev_n, n[-1])) < 0:
                 self.last_triggers.append("normal_flip")
@@ -538,6 +589,22 @@ class MoldAwareRuntime:
         if np.any(depth < -float(self.limits.max_tcp_penetration_m)):
             self.last_triggers.append("tcp_penetration")
 
+    def note_measured_mesh_distance(self, p_meas: np.ndarray, x_s: np.ndarray) -> None:
+        """Abort when the measured TCP is farther than max_distance_from_mesh_m.
+
+        Off unless abort_on_measured_mesh_distance is set. On, decode_chunk
+        does not abort on the commanded ||x_d - x_s||.
+        """
+        if not self.limits.abort_on_measured_mesh_distance:
+            return
+        dist = np.linalg.norm(
+            np.asarray(p_meas, dtype=np.float64).reshape(-1, 3)
+            - np.asarray(x_s, dtype=np.float64).reshape(-1, 3),
+            axis=1,
+        )
+        if np.any(dist > float(self.limits.max_distance_from_mesh_m)):
+            self.last_triggers.append("max_distance_from_mesh")
+
     def wrench_hold_update(self, force_n: float) -> str:
         """'ok', 'hold', or 'abort'. Hold on the first sample at the cap."""
         if not self.limits.enable_wrench_hold:
@@ -622,20 +689,16 @@ class MoldAwareRuntime:
         self.last_clamp_speed = clamp_speed
 
         dt = np.asarray(dt, dtype=np.float64).reshape(H)
-        dec = integrate_fixb(
-            self.field,
-            np.asarray(p0, dtype=np.float64).reshape(1, 3),
-            v_par[None],
-            delta_n[None],
-            dt[None],
-        )
-        R_field = dec["R"][0]
-        x_d = dec["x_d"][0]
-        x_s = dec["x_s"][0]
+        # Re-project from this replan's measured TCP. integrate_fixb's track_step
+        # holds the previous face and can leave the contact.
+        dec = integrate_tcp_foot(self.field, p0, v_par, delta_n, dt)
+        R_field = dec["R"]
+        x_d = dec["x_d"]
+        x_s = dec["x_s"]
 
         if self.run_type == "r4_world_fixb_tilt":
             # Learned ΔR in action[..., 21:27]; project rot6d → SO(3).
-            # Same mesh R_f as integrate_fixb / r2 labels — no twist re-resolution
+            # Same mesh R_f as the re-projected foot — no twist re-resolution
             # (flipping R_f here without flipping v_par would reverse the slide).
             # Hover keeps the predicted ΔR (only δn is overridden in unpack).
             if raw_action.shape[-1] < 27:
@@ -687,7 +750,11 @@ class MoldAwareRuntime:
             self.last_clamp_step[1:] = step_hit
             if np.any(step_hit):
                 self.last_triggers.append("max_step")
-        if apply_safety and not self.dry_run:
+        if (
+            apply_safety
+            and not self.dry_run
+            and not self.limits.abort_on_measured_mesh_distance
+        ):
             dist = np.linalg.norm(x_d - x_s, axis=1)
             if np.any(dist > self.limits.max_distance_from_mesh_m):
                 self.last_triggers.append("max_distance_from_mesh")
@@ -714,9 +781,16 @@ class MoldAwareRuntime:
     def decoded_to_action_mats(
         self, decoded: Dict[str, np.ndarray]
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Nominal target = x_d; VT slightly deeper along -n for compliance direction."""
-        x_d, R_d = decoded["x_d"], decoded["R_d"]
-        n = decoded["R_field"][..., 2]
-        target = Rp_to_SE3(R_d, x_d)
-        vt = Rp_to_SE3(R_d, x_d - 0.002 * n)
+        """Reference pose is the foot. Virtual target is foot + delta_n along n.
+
+        The runner already schedules the virtual target and builds stiffness
+        from VT − nominal (label stiffness on that axis, 5000 on the other two),
+        the same way as standard_bc. The wrench command stays zero.
+        """
+        x_s = np.asarray(decoded["x_s"], dtype=np.float64)
+        r_d = decoded["R_d"]
+        n = np.asarray(decoded["R_field"][..., 2], dtype=np.float64)
+        delta_n = np.asarray(decoded["delta_n"], dtype=np.float64).reshape(-1)
+        target = Rp_to_SE3(r_d, x_s)
+        vt = Rp_to_SE3(r_d, x_s + delta_n[:, None] * n)
         return target, vt

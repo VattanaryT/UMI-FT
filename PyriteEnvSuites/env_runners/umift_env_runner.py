@@ -1074,6 +1074,10 @@ def main():
         # Read only when the checkpoint action is r4vt. Ignored for r1rel.
         # Measured TCP (p_meas - x_s)·n. 20 mm is past the demo contact tail.
         "max_tcp_penetration_m": 0.020,
+        # Off: abort when commanded ||x_d - x_s|| exceeds 0.10 m.
+        # On: skip that check and abort when the measured TCP is 0.10 m from
+        # the surface. UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE=1 turns this on.
+        "abort_on_measured_mesh_distance": False,
         # Hold this replan at the cap; abort if the next replan is still there.
         "wrench_hold_n": 90.0,
         # Per-rollout MP4s next to the control log: wrist D405 + center Orbbec.
@@ -1192,10 +1196,20 @@ def main():
 
         mold_run_type = infer_run_type(_task_name, shape_meta)
         r4vt = mold_run_type == "r4_world_fixb_tilt"
+        abort_measured = bool(control_para["abort_on_measured_mesh_distance"])
+        env_abort = os.environ.get("UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE")
+        if env_abort is not None and env_abort.strip() != "":
+            abort_measured = env_abort.strip().lower() in ("1", "true", "yes")
+        delta_n_floor = False
+        env_floor = os.environ.get("UMIFT_ENABLE_DELTA_N_FLOOR")
+        if env_floor is not None and env_floor.strip() != "":
+            delta_n_floor = env_floor.strip().lower() in ("1", "true", "yes")
         r4_limits = (
             r4_safety_limits(
                 max_tcp_penetration_m=float(control_para["max_tcp_penetration_m"]),
                 wrench_hold_n=float(control_para["wrench_hold_n"]),
+                abort_on_measured_mesh_distance=abort_measured,
+                enable_delta_n_floor=delta_n_floor,
             )
             if r4vt
             else None
@@ -1224,7 +1238,9 @@ def main():
                 f"[mold] r4vt action blend, "
                 f"dn_floor={mold_runtime.limits.enable_delta_n_floor} "
                 f"tcp_penetration_m={mold_runtime.limits.max_tcp_penetration_m} "
-                f"wrench_hold_n={mold_runtime.limits.wrench_hold_n}"
+                f"wrench_hold_n={mold_runtime.limits.wrench_hold_n} "
+                f"abort_on_measured_mesh_distance="
+                f"{mold_runtime.limits.abort_on_measured_mesh_distance}"
             )
             print(
                 f"[jump-guard] step limit {MAX_STEP_MM:.2f} mm, {MAX_STEP_DEG:.2f} deg "
@@ -1894,7 +1910,12 @@ def main():
                     mold_runtime.limits.max_tangential_speed_mps
                 )
                 if r4vt:
-                    log.attrs["enable_delta_n_floor"] = False
+                    log.attrs["enable_delta_n_floor"] = bool(
+                        mold_runtime.limits.enable_delta_n_floor
+                    )
+                    log.attrs["abort_on_measured_mesh_distance"] = bool(
+                        mold_runtime.limits.abort_on_measured_mesh_distance
+                    )
                     log.attrs["max_tcp_penetration_m"] = float(
                         control_para["max_tcp_penetration_m"]
                     )
@@ -2815,7 +2836,12 @@ def main():
                 mold_runtime.limits.enable_mesh_jump_hold
             )
             if r4vt:
-                journal["enable_delta_n_floor"] = False
+                journal["enable_delta_n_floor"] = bool(
+                    mold_runtime.limits.enable_delta_n_floor
+                )
+                journal["abort_on_measured_mesh_distance"] = bool(
+                    mold_runtime.limits.abort_on_measured_mesh_distance
+                )
                 journal["max_tcp_penetration_m"] = float(
                     control_para["max_tcp_penetration_m"]
                 )
