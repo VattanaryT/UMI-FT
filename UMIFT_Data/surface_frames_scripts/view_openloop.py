@@ -5,6 +5,12 @@
     --export /mnt/data/umidata/ft/open_loop_exports/r4vt_<sha> \\
     --mesh /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/shared/fixb_field.npz
 
+  # optional: old frames faded, new frames solid, old jumps marked
+  python UMIFT_Data/surface_frames_scripts/view_openloop.py \\
+    --export /mnt/data/umidata/ft/open_loop_exports/r4vt_<sha> \\
+    --mesh /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/shared/fixb_field.npz \\
+    --frames_npz /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_frame_continuity_causal/train_episode_frames.npz
+
 Mesh loading, fixture-frame rounding, and bad-span shading are imported from
 view_oct. The camera, time slider, and plot shading in this page are the same
 JavaScript functions. They are copied here because they live inside view_oct's
@@ -105,6 +111,141 @@ def spans_from_edges(times, edge_gap, t0: float) -> list:
     return spans
 
 
+def _step_deg(R: np.ndarray) -> np.ndarray:
+    """Per-sample geodesic step of a frame series, degrees. Sample 0 is 0."""
+    R = np.asarray(R, dtype=np.float64)
+    out = np.zeros(len(R), dtype=np.float64)
+    if len(R) > 1:
+        rel = np.einsum("nji,njk->nik", R[:-1], R[1:])
+        c = np.clip((np.trace(rel, axis1=1, axis2=2) - 1.0) * 0.5, -1.0, 1.0)
+        out[1:] = np.degrees(np.arccos(c))
+    return out
+
+
+def _event_rows(blob, prefix: str, with_xyz: bool) -> list:
+    if f"{prefix}_episode" not in blob.files:
+        return []
+    rows = []
+    n = len(blob[f"{prefix}_episode"])
+    xyz = np.asarray(blob[f"{prefix}_xyz"]) if with_xyz and f"{prefix}_xyz" in blob.files else None
+    for i in range(n):
+        row = {
+            "ep": int(blob[f"{prefix}_episode"][i]),
+            "i": int(blob[f"{prefix}_index"][i]),
+            "time_s": float(blob[f"{prefix}_time_s"][i]),
+            "frame": round(float(blob[f"{prefix}_frame_deg"][i]), 3),
+            "tool": round(float(blob[f"{prefix}_tool_deg"][i]), 3),
+        }
+        if xyz is not None:
+            row["x"] = [round(float(v), 4) for v in xyz[i]]
+        rows.append(row)
+    return rows
+
+
+def load_frames_npz(path: Path) -> dict:
+    """epN -> old/new feet and frames. Optional event tables stay under "events"."""
+    blob = np.load(path)
+    out = {}
+    for name in blob.files:
+        if not (name.startswith("ep") and name.endswith("_R_old")):
+            continue
+        ep = int(name[2:].split("_", 1)[0])
+        prefix = f"ep{ep}_"
+        pack = {
+            "x_old": np.asarray(blob[f"{prefix}x_old"]),
+            "x_new": np.asarray(blob[f"{prefix}x_new"]),
+            "R_old": np.asarray(blob[f"{prefix}R_old"]),
+            "R_new": np.asarray(blob[f"{prefix}R_new"]),
+            "old_jump": np.asarray(blob[f"{prefix}old_jump"]).astype(bool),
+        }
+        if f"{prefix}robot_time_s" in blob.files:
+            pack["robot_time_s"] = np.asarray(blob[f"{prefix}robot_time_s"], dtype=np.float64)
+            pack["t0"] = float(np.asarray(blob[f"{prefix}t0"]).reshape(-1)[0])
+            pack["tcp_xyz"] = np.asarray(blob[f"{prefix}tcp_xyz"])
+            pack["tcp_R"] = np.asarray(blob[f"{prefix}tcp_R"])
+            pack["split"] = str(np.asarray(blob[f"{prefix}split"]).reshape(-1)[0])
+        out[ep] = pack
+    if not out:
+        raise SystemExit(f"no ep*_R_old arrays in {path}")
+    switches = _event_rows(blob, "switch", True)
+    nearcap = _event_rows(blob, "nearcap", False)
+    for row in switches + nearcap:
+        pack = out.get(row["ep"])
+        if pack and "t0" in pack:
+            row["t"] = round(float(row["time_s"]) - float(pack["t0"]), 3)
+    if switches or nearcap:
+        out["events"] = {"switches": switches, "nearcap": nearcap}
+    return out
+
+
+def frame_episode_ids(frames: dict | None) -> list:
+    if not frames:
+        return []
+    return sorted(ep for ep in frames if isinstance(ep, int))
+
+
+def _switches_for(frames: dict | None, episode: int, t0: float) -> list:
+    events = (frames or {}).get("events") or {}
+    rows = []
+    for row in events.get("switches") or []:
+        if int(row["ep"]) != int(episode):
+            continue
+        item = {
+            "t": round(float(row["time_s"]) - t0, 3),
+            "frame": row["frame"],
+            "tool": row["tool"],
+            "i": row["i"],
+        }
+        if "x" in row:
+            item["x"] = row["x"]
+        rows.append(item)
+    return rows
+
+
+def _nearest_index(times: np.ndarray, t: float) -> int:
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    i = int(np.searchsorted(times, t))
+    if i <= 0:
+        return 0
+    if i >= len(times):
+        return len(times) - 1
+    if abs(float(times[i - 1]) - t) < abs(float(times[i]) - t):
+        return i - 1
+    return i
+
+
+def frame_overlay(pack: dict, robot_t: np.ndarray, t0: float) -> dict | None:
+    """Downsampled |ΔR| and the old jump feet. None when the series length differs."""
+    robot_t = np.asarray(robot_t, dtype=np.float64).reshape(-1)
+    if len(pack["R_old"]) != len(robot_t) or len(pack["R_new"]) != len(robot_t):
+        return None
+    d_old = _step_deg(pack["R_old"])
+    d_new = _step_deg(pack["R_new"])
+    ip = stride_idx(len(robot_t), SERIES_CAP)
+    gap = edge_gaps(np.arange(len(robot_t)), times=robot_t, dt_cap=_time_cap(robot_t, 0.05))
+    jump = np.asarray(pack["old_jump"], dtype=bool).reshape(-1)
+    return {
+        "t": rounded(robot_t[ip] - t0, 3),
+        "dR_old": rounded(d_old[ip], 3),
+        "dR_new": rounded(d_new[ip], 3),
+        "break": breaks_for_keep(gap, ip),
+        "jump_t": rounded(robot_t[jump] - t0, 3),
+        "jump_y": rounded(d_old[jump], 3),
+        "jumps": rounded(np.asarray(pack["x_old"])[jump], 4),
+    }
+
+
+def frame_at(pack: dict, robot_t: np.ndarray, t_abs: float) -> dict:
+    i = _nearest_index(robot_t, t_abs)
+    return {
+        "x_old": rounded(np.asarray(pack["x_old"])[i], 4),
+        "R_old": rounded(np.asarray(pack["R_old"])[i], 4),
+        "x_new": rounded(np.asarray(pack["x_new"])[i], 4),
+        "R_new": rounded(np.asarray(pack["R_new"])[i], 4),
+        "jump": bool(np.asarray(pack["old_jump"])[i]),
+    }
+
+
 def load_export(path: Path) -> dict:
     settings = json.loads((path / "settings.json").read_text())
     report = {}
@@ -124,7 +265,7 @@ def query_step0(blob, key: str) -> np.ndarray:
     return np.asarray(blob[key])[:, 0]
 
 
-def episode_payload(exports: list, episode: int, mesh_t0_ok: bool = True) -> dict:
+def episode_payload(exports: list, episode: int, mesh_t0_ok: bool = True, frames: dict | None = None) -> dict:
     first = None
     for exp in exports:
         if episode in exp["episodes"]:
@@ -205,7 +346,7 @@ def episode_payload(exports: list, episode: int, mesh_t0_ok: bool = True) -> dic
             }
         )
     # Full per-query chunks stay out of this summary. The cursor endpoint loads one.
-    return {
+    payload = {
         "episode": episode,
         "split": runs[0]["split"] if runs else "",
         "path_t": rounded(robot_t[ip] - t0, 3),
@@ -219,6 +360,50 @@ def episode_payload(exports: list, episode: int, mesh_t0_ok: bool = True) -> dic
         "q_index": [int(i) for i in range(len(np.asarray(first["query_time_s"])))],
         "runs": runs,
     }
+    if frames and episode in frames:
+        overlay = frame_overlay(frames[episode], robot_t, t0)
+        if overlay is not None:
+            payload["frames"] = overlay
+        switches = _switches_for(frames, episode, t0)
+        if switches:
+            payload["switches"] = switches
+        if "t0" in frames[episode] or switches:
+            payload["t0"] = t0
+    return payload
+
+
+def frames_only_payload(frames: dict, episode: int) -> dict:
+    """Foot path and frame step when this episode has no open-loop export."""
+    pack = frames.get(episode)
+    if not pack or "robot_time_s" not in pack:
+        raise KeyError(episode)
+    robot_t = np.asarray(pack["robot_time_s"], dtype=np.float64)
+    t0 = float(pack["t0"])
+    ip = stride_idx(len(robot_t), PATH_CAP)
+    gap = edge_gaps(np.arange(len(robot_t)), times=robot_t, dt_cap=_time_cap(robot_t, 0.05))
+    overlay = frame_overlay(pack, robot_t, t0)
+    payload = {
+        "episode": episode,
+        "split": pack.get("split", ""),
+        "policy": False,
+        "path_t": rounded(robot_t[ip] - t0, 3),
+        "path": rounded(np.asarray(pack["tcp_xyz"])[ip], 4),
+        "path_break": breaks_for_keep(gap, ip),
+        "tool_R": rounded(np.asarray(pack["tcp_R"])[ip], 4),
+        "force_t": [],
+        "force": [],
+        "force_break": [],
+        "shade": [],
+        "q_index": [],
+        "runs": [],
+        "path_i": [int(i) for i in ip],
+        "t0": t0,
+        "frames": overlay,
+    }
+    switches = _switches_for(frames, episode, t0)
+    if switches:
+        payload["switches"] = switches
+    return payload
 
 
 def flatten_for_table(blob):
@@ -236,13 +421,19 @@ def flatten_for_table(blob):
     )
 
 
-def cursor_payload(exports: list, episode: int, query: int) -> dict:
+def cursor_payload(exports: list, episode: int, query: int, frames: dict | None = None) -> dict:
     out = []
+    frame = None
     for exp in exports:
         blob = exp["episodes"].get(episode)
         if blob is None or query < 0 or query >= len(blob["query_time_s"]):
             continue
         t0 = float(np.asarray(blob["rgb_time_s"])[0])
+        if frame is None and frames and episode in frames and "robot_time_s" in blob.files:
+            robot_t = np.asarray(blob["robot_time_s"], dtype=np.float64)
+            if len(frames[episode]["R_old"]) == len(robot_t):
+                t_abs = float(np.asarray(blob["query_time_s"])[query])
+                frame = frame_at(frames[episode], robot_t, t_abs)
         if "chunk_pos" in blob.files:
             n_chunk = int(blob["chunk_n"][query])
             future = np.asarray(blob["chunk_pos"][query, :n_chunk])
@@ -262,7 +453,16 @@ def cursor_payload(exports: list, episode: int, query: int) -> dict:
                 "t": round(float(blob["query_time_s"][query]) - t0, 3),
             }
         )
-    return {"runs": out}
+    if frame is None and frames and episode in frames and not out:
+        pack = frames[episode]
+        if "robot_time_s" in pack:
+            robot_t = np.asarray(pack["robot_time_s"], dtype=np.float64)
+            i = int(np.clip(query, 0, len(robot_t) - 1))
+            frame = frame_at(pack, robot_t, float(robot_t[i]))
+    payload = {"runs": out}
+    if frame is not None:
+        payload["frame"] = frame
+    return payload
 
 
 PAGE = r"""<!DOCTYPE html>
@@ -276,6 +476,11 @@ button.on { background:#1a5276; }
 input[type=range] { width:220px; }
 #view3d { height:42vh; }
 #plots { height:52vh; }
+#events { display:none; margin:8px 12px 24px; font-size:13px; max-height:46vh; overflow:auto; }
+#events table { margin:4px 0 12px; }
+#events tr[data-kind] { cursor:pointer; }
+#events tr[data-kind]:hover { background:#222; }
+#events h3 { margin:12px 0 4px; font-size:14px; }
 table { border-collapse:collapse; margin:8px 12px 16px; font-size:13px; }
 td, th { border:1px solid #333; padding:3px 8px; }
 </style></head>
@@ -285,12 +490,14 @@ td, th { border:1px solid #333; padding:3px 8px; }
   <span id="split"></span>
   <span>checkpoint</span><select id="ckpt"></select>
   <span id="toggles"></span>
+  <span id="frame_toggles"></span>
   <span>time</span><input id="time" type="range" min="0" max="0" value="0">
   <span id="readout"></span>
 </div>
 <div id="view3d"></div>
 <div id="plots"></div>
 <table id="summary"></table>
+<div id="events"></div>
 <script>
 const VIEWS = {
   side: {eye: {x: 0.15, y: -1.7, z: 1.7}, center: {x: 0, y: 0, z: 0}, up: {x: 0, y: -1, z: 0}},
@@ -303,6 +510,7 @@ let mesh = null;
 let data = null;
 let fi = 0;
 let shown = {};
+let shownFrame = {old: true, new: true};
 
 function nearest(times, t) {
   if (!times || !times.length) return 0;
@@ -410,7 +618,7 @@ function gapRect(n, t0, t1) {
     fillcolor: "rgba(255,255,255,0.10)", line: {width: 0}, layer: "below"
   };
 }
-function axesAt(origin, R, color, name) {
+function axesAt(origin, R, color, name, width) {
   const scale = 0.04;
   const x = [origin[0]], y = [origin[1]], z = [origin[2]];
   for (let a = 0; a < 3; a++) {
@@ -418,7 +626,7 @@ function axesAt(origin, R, color, name) {
     y.push(origin[1] + scale * R[1][a], null);
     z.push(origin[2] + scale * R[2][a], null);
   }
-  return {type: "scatter3d", x, y, z, mode: "lines", name, line: {color, width: 4}, showlegend: false};
+  return {type: "scatter3d", x, y, z, mode: "lines", name, line: {color, width: width || 4}, showlegend: false};
 }
 function runStyle(i, n) {
   if (n <= 1) return {path: "#ff9f1a", chunk: "#ff4fd8", press: "#ffe14a"};
@@ -447,17 +655,121 @@ function paintTable(run) {
   });
   document.getElementById("summary").innerHTML = html;
 }
+async function paintFrameSeries(t) {
+  const shapes = [{
+    type: "line", xref: "x", yref: "y domain", x0: t, x1: t, y0: 0, y1: 1,
+    line: {color: "#fff", width: 1}
+  }];
+  (data.switches || []).forEach(s => shapes.push({
+    type: "line", xref: "x", yref: "y domain", x0: s.t, x1: s.t, y0: 0, y1: 1,
+    line: {color: "#5dade2", width: 1, dash: "dot"}
+  }));
+  const plots = [
+    line(data.frames.t, data.frames.dR_old, "old |ΔR|", "rgba(255,255,255,0.55)", "x", "dash", data.frames.break),
+    line(data.frames.t, data.frames.dR_new, "new |ΔR|", "#ff9f1a", "x", null, data.frames.break),
+    {
+      x: data.frames.jump_t, y: data.frames.jump_y, name: "old jump",
+      type: "scatter", mode: "markers",
+      marker: {color: "#e74c3c", size: 7, symbol: "diamond"}
+    }
+  ];
+  if (data.switches && data.switches.length) {
+    plots.push({
+      x: data.switches.map(s => s.t), y: data.switches.map(s => s.frame),
+      name: "crown-wall", type: "scatter", mode: "markers",
+      marker: {color: "#5dade2", size: 9, symbol: "triangle-up"}
+    });
+  }
+  await Plotly.react("plots", plots, {
+    paper_bgcolor: "#111", plot_bgcolor: "#1c1c1c", font: {color: "#ddd"},
+    margin: {l: 64, r: 16, t: 28, b: 28}, legend: {orientation: "h", y: 1.12},
+    shapes,
+    xaxis: {title: "s"},
+    yaxis: {title: "frame deg"}
+  }, {responsive: true});
+}
+function buildEvents(meta) {
+  const root = document.getElementById("events");
+  const sw = meta.switches || [];
+  const cap = meta.nearcap || [];
+  let html = "<h3>Crown-to-wall (" + sw.length + ")</h3>";
+  html += "<table><tr><th>ep</th><th>sample</th><th>time</th><th>frame step</th><th>tool</th></tr>";
+  sw.forEach((row, n) => {
+    html += "<tr data-kind='switch' data-n='" + n + "'><td>" + row.ep + "</td><td>" + row.i
+      + "</td><td>" + Number(row.t).toFixed(2) + " s</td><td>" + Number(row.frame).toFixed(2)
+      + "°</td><td>" + Number(row.tool).toFixed(2) + "°</td></tr>";
+  });
+  html += "</table><h3>Near-cap steps (" + cap.length + ")</h3>";
+  const groups = {};
+  cap.forEach((row, n) => { (groups[row.ep] = groups[row.ep] || []).push(n); });
+  Object.keys(groups).map(Number).sort((a, b) => a - b).forEach(ep => {
+    html += "<details><summary>ep " + ep + " · " + groups[ep].length + "</summary><table>";
+    groups[ep].forEach(n => {
+      const row = cap[n];
+      html += "<tr data-kind='near' data-n='" + n + "'><td>" + row.i + "</td><td>"
+        + Number(row.t).toFixed(2) + " s</td><td>" + Number(row.frame).toFixed(2)
+        + "°</td><td>tool " + Number(row.tool).toFixed(2) + "°</td></tr>";
+    });
+    html += "</table></details>";
+  });
+  root.innerHTML = html;
+  root.style.display = "block";
+  root.onclick = async (ev) => {
+    const tr = ev.target.closest("tr");
+    if (!tr || !tr.dataset.kind) return;
+    const row = (tr.dataset.kind === "switch" ? sw : cap)[+tr.dataset.n];
+    await jumpTo(row.ep, row.t);
+  };
+}
+async function jumpTo(ep, tRel) {
+  const sel = document.getElementById("ep");
+  if (![...sel.options].some(opt => opt.value === String(ep))) return;
+  if (String(sel.value) !== String(ep)) {
+    sel.value = String(ep);
+    await show();
+  }
+  fi = nearest(data.path_t, tRel);
+  document.getElementById("time").value = fi;
+  await paintCursor();
+}
 async function paintCursor() {
   const t = data.path_t[fi];
   const qTimes = data.runs[0] ? data.runs[0].q_t : data.path_t;
   const jLocal = nearest(qTimes, t);
-  const j = data.runs[0] && data.runs[0].q_i ? data.runs[0].q_i[jLocal] : jLocal;
+  let j = jLocal;
+  if (data.path_i) j = data.path_i[Math.min(fi, data.path_i.length - 1)];
+  else if (data.runs[0] && data.runs[0].q_i) j = data.runs[0].q_i[jLocal];
   const cam = liveCamera();
   const cursor = await (await fetch("/api/cursor?ep=" + data.episode + "&q=" + j)).json();
   const traces = [scatter(data.path, "demo TCP", "#3ec1ff", 5, data.path_break)];
   const p = data.path[nearest(data.path_t, t)];
   const demoR = data.tool_R[nearest(data.path_t, t)];
   traces.push(axesAt(p, demoR, "#ffffff", "demo axes"));
+  if (data.frames && cursor.frame && shownFrame.old) {
+    traces.push(axesAt(cursor.frame.x_old, cursor.frame.R_old, "rgba(255,255,255,0.28)", "old frame", 3));
+  }
+  if (data.frames && cursor.frame && shownFrame.new) {
+    traces.push(axesAt(cursor.frame.x_new, cursor.frame.R_new, "#ff9f1a", "new frame", 6));
+  }
+  if (data.switches && data.switches.length) {
+    const sx = [], sy = [], sz = [];
+    data.switches.forEach(s => {
+      if (!s.x) return;
+      sx.push(s.x[0]); sy.push(s.x[1]); sz.push(s.x[2]);
+    });
+    if (sx.length) traces.push({
+      type: "scatter3d", x: sx, y: sy, z: sz, mode: "markers", name: "crown-wall",
+      marker: {size: 5, color: "#5dade2", symbol: "diamond"}
+    });
+  }
+  if (data.frames && shownFrame.old && data.frames.jumps && data.frames.jumps.length) {
+    const jx = [], jy = [], jz = [];
+    data.frames.jumps.forEach(pt => { jx.push(pt[0]); jy.push(pt[1]); jz.push(pt[2]); });
+    traces.push({
+      type: "scatter3d", x: jx, y: jy, z: jz, mode: "markers", name: "old jump",
+      marker: {size: 3.5, color: "#e74c3c", symbol: "diamond"}
+    });
+  }
   const visible = data.runs.filter(run => shown[run.label] !== false);
   data.runs.forEach(run => {
     if (shown[run.label] === false) return;
@@ -480,12 +792,24 @@ async function paintCursor() {
   sceneBox = sceneBoxFrom([data.path]);
   await Plotly.react("view3d", traces, sceneLayout(), {responsive: true});
   applyCamera(cam);
+  if (data.policy === false) {
+    await paintFrameSeries(t);
+    document.getElementById("summary").innerHTML = "";
+    document.getElementById("readout").textContent = t.toFixed(2) + " s";
+    document.getElementById("time").value = fi;
+    return;
+  }
   const run = data.runs[Math.max(0, data.runs.findIndex(r => r.label === document.getElementById("ckpt").value))];
+  const hasFrames = !!(data.frames && data.frames.t);
   const shapes = [];
-  ["", "2", "3", "4", "5"].forEach(n => {
+  (hasFrames ? ["", "2", "3", "4", "5", "6"] : ["", "2", "3", "4", "5"]).forEach(n => {
     (data.shade || []).forEach(s => shapes.push(shadeRect(n, s[0], s[1])));
     (run.gaps || []).forEach(s => shapes.push(gapRect(n, s[0], s[1])));
     shapes.push({type: "line", xref: "x" + n, yref: "y" + n + " domain", x0: t, x1: t, y0: 0, y1: 1, line: {color: "#fff", width: 1}});
+    (data.switches || []).forEach(s => shapes.push({
+      type: "line", xref: "x" + n, yref: "y" + n + " domain",
+      x0: s.t, x1: s.t, y0: 0, y1: 1, line: {color: "#5dade2", width: 1, dash: "dot"}
+    }));
   });
   const x = {domain: [0, 1], automargin: false, title: ""};
   const br = run.q_break;
@@ -506,21 +830,41 @@ async function paintCursor() {
     line(run.q_t, run.stiff_p, "stiff pred", DIM.stiff.pred, "x5", "dash", br),
     line(run.q_t, run.stiff_l, "stiff label", DIM.stiff.label, "x5", null, br)
   ];
-  await Plotly.react("plots", plots, {
+  const layout = {
     paper_bgcolor: "#111", plot_bgcolor: "#1c1c1c", font: {color: "#ddd"},
     margin: {l: 64, r: 16, t: 28, b: 28}, legend: {orientation: "h", y: 1.12},
     shapes,
     xaxis: Object.assign({anchor: "y"}, x),
-    yaxis: {title: rel ? "x m" : "v m/s", domain: [0.80, 1], anchor: "x"},
+    yaxis: {title: rel ? "x m" : "v m/s", domain: hasFrames ? [0.86, 1] : [0.80, 1], anchor: "x"},
     xaxis2: Object.assign({anchor: "y2", matches: "x"}, x),
-    yaxis2: {title: "N", domain: [0.60, 0.78], anchor: "x2"},
+    yaxis2: {title: "N", domain: hasFrames ? [0.70, 0.84] : [0.60, 0.78], anchor: "x2"},
     xaxis3: Object.assign({anchor: "y3", matches: "x"}, x),
-    yaxis3: {title: rel ? "z m" : "δn m", domain: [0.40, 0.58], anchor: "x3"},
+    yaxis3: {title: rel ? "z m" : "δn m", domain: hasFrames ? [0.54, 0.68] : [0.40, 0.58], anchor: "x3"},
     xaxis4: Object.assign({anchor: "y4", matches: "x"}, x),
-    yaxis4: {title: rel ? "rot deg" : "ΔR deg", domain: [0.20, 0.38], anchor: "x4"},
-    xaxis5: Object.assign({anchor: "y5", matches: "x", title: "s"}, x),
-    yaxis5: {title: "stiff", domain: [0, 0.18], anchor: "x5"}
-  }, {responsive: true});
+    yaxis4: {title: rel ? "rot deg" : "ΔR deg", domain: hasFrames ? [0.38, 0.52] : [0.20, 0.38], anchor: "x4"},
+    xaxis5: Object.assign({anchor: "y5", matches: "x", title: hasFrames ? "" : "s"}, x),
+    yaxis5: {title: "stiff", domain: hasFrames ? [0.22, 0.36] : [0, 0.18], anchor: "x5"}
+  };
+  if (hasFrames) {
+    plots.push(line(data.frames.t, data.frames.dR_old, "old |ΔR|", "rgba(255,255,255,0.55)", "x6", "dash", data.frames.break));
+    plots.push(line(data.frames.t, data.frames.dR_new, "new |ΔR|", "#ff9f1a", "x6", null, data.frames.break));
+    plots.push({
+      x: data.frames.jump_t, y: data.frames.jump_y, name: "old jump",
+      type: "scatter", mode: "markers", xaxis: "x6", yaxis: "y6",
+      marker: {color: "#e74c3c", size: 7, symbol: "diamond"}
+    });
+    if (data.switches && data.switches.length) {
+      plots.push({
+        x: data.switches.map(s => s.t), y: data.switches.map(s => s.frame),
+        name: "crown-wall", type: "scatter", mode: "markers",
+        xaxis: "x6", yaxis: "y6",
+        marker: {color: "#5dade2", size: 9, symbol: "triangle-up"}
+      });
+    }
+    layout.xaxis6 = Object.assign({anchor: "y6", matches: "x", title: "s"}, x);
+    layout.yaxis6 = {title: "frame deg", domain: [0, 0.18], anchor: "x6"};
+  }
+  await Plotly.react("plots", plots, layout, {responsive: true});
   paintTable(run);
   document.getElementById("readout").textContent = t.toFixed(2) + " s";
   document.getElementById("time").value = fi;
@@ -547,6 +891,21 @@ async function show() {
     box.appendChild(document.createTextNode(" " + run.label));
     toggles.appendChild(box);
   });
+  const frameToggles = document.getElementById("frame_toggles");
+  frameToggles.innerHTML = "";
+  if (data.frames) {
+    [["old", "old frames"], ["new", "new frames"]].forEach(pair => {
+      const box = document.createElement("label");
+      box.style.color = "#ddd";
+      const input = document.createElement("input");
+      input.type = "checkbox";
+      input.checked = shownFrame[pair[0]];
+      input.onchange = () => { shownFrame[pair[0]] = input.checked; paintCursor(); };
+      box.appendChild(input);
+      box.appendChild(document.createTextNode(" " + pair[1] + " "));
+      frameToggles.appendChild(box);
+    });
+  }
   await paintCursor();
 }
 document.getElementById("time").oninput = () => { fi = +document.getElementById("time").value; paintCursor(); };
@@ -556,7 +915,12 @@ document.getElementById("ckpt").onchange = () => paintCursor();
   const meta = await (await fetch("/api/meta")).json();
   mesh = meta.mesh;
   const ep = document.getElementById("ep");
-  ep.innerHTML = meta.episodes.map(e => "<option value='" + e + "'>" + e + "</option>").join("");
+  ep.innerHTML = meta.episodes.map(e => {
+    const split = meta.splits && meta.splits[String(e)];
+    const label = split ? (e + " " + split) : String(e);
+    return "<option value='" + e + "'>" + label + "</option>";
+  }).join("");
+  if (meta.switches || meta.nearcap) buildEvents(meta);
   show();
 })();
 </script>
@@ -567,6 +931,7 @@ document.getElementById("ckpt").onchange = () => paintCursor();
 class Handler(BaseHTTPRequestHandler):
     exports: list = []
     mesh = None
+    frames = None
 
     def log_message(self, fmt, *args):
         return
@@ -587,8 +952,23 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/meta":
             episodes = sorted({ep for exp in self.exports for ep in exp["episodes"]})
-            body = json.dumps({"episodes": episodes, "mesh": self.mesh}).encode()
-            self._send(200, body, "application/json")
+            body = {"episodes": episodes, "mesh": self.mesh}
+            extra = frame_episode_ids(self.frames)
+            if extra:
+                body["episodes"] = sorted(set(episodes) | set(extra))
+                splits = {
+                    str(ep): self.frames[ep]["split"]
+                    for ep in extra
+                    if self.frames[ep].get("split")
+                }
+                if splits:
+                    body["splits"] = splits
+                events = self.frames.get("events") or {}
+                if events.get("switches"):
+                    body["switches"] = events["switches"]
+                if events.get("nearcap"):
+                    body["nearcap"] = events["nearcap"]
+            self._send(200, json.dumps(body).encode(), "application/json")
             return
         try:
             episode = int(args.get("ep", "0"))
@@ -596,11 +976,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, b"{}", "application/json")
             return
         if path == "/api/episode":
-            body = json.dumps(episode_payload(self.exports, episode)).encode()
-            self._send(200, body, "application/json")
+            try:
+                payload = episode_payload(self.exports, episode, frames=self.frames)
+            except KeyError:
+                if not self.frames or episode not in self.frames:
+                    self._send(404, b"{}", "application/json")
+                    return
+                payload = frames_only_payload(self.frames, episode)
+            self._send(200, json.dumps(payload).encode(), "application/json")
             return
         if path == "/api/cursor":
-            body = json.dumps(cursor_payload(self.exports, episode, int(args.get("q", "0")))).encode()
+            body = json.dumps(cursor_payload(self.exports, episode, int(args.get("q", "0")), frames=self.frames)).encode()
             self._send(200, body, "application/json")
             return
         self._send(404, b"not found", "text/plain")
@@ -612,11 +998,15 @@ def main() -> None:
     parser.add_argument("--mesh", type=Path, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--frames_npz", type=Path, default=None)
     args = parser.parse_args()
     field = np.load(args.mesh)
     vertices, faces = decimate_mesh(field["vertices"], field["faces"], field["is_apron"])
     Handler.mesh = mesh_payload(vertices, faces)
     Handler.exports = [load_export(path) for path in args.export]
+    Handler.frames = load_frames_npz(args.frames_npz) if args.frames_npz else None
+    if Handler.frames is not None:
+        print(f"[view_openloop] frame overlay on episodes {frame_episode_ids(Handler.frames)}", flush=True)
     print(f"[view_openloop] http://{args.host}:{args.port}", flush=True)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 

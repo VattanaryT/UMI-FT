@@ -40,8 +40,17 @@ def episode_masks_from_zarr(
     ip = np.linalg.norm((p - x) - sd[:, None] * n, axis=-1)
     off_edge = ip > off_edge_m
     jump = np.zeros(len(R_f), dtype=bool)
-    if len(R_f) > 1:
-        jump[1:] = rot_angle_deg(R_f[1:], R_f[:-1]) > jump_deg
+    if len(R_f) > 1 and "ts_pose_fb_0" in ep:
+        pose = np.asarray(ep["ts_pose_fb_0"], dtype=np.float64).reshape(-1, 7)
+        if len(pose) == len(R_f):
+            R_tool = Rotation.from_quat(pose[:, [4, 5, 6, 3]]).as_matrix()
+            Rf = np.einsum("nji,njk->nik", R_f[:-1], R_f[1:])
+            Rt = np.einsum("nji,njk->nik", R_tool[:-1], R_tool[1:])
+            jump[1:] = rot_angle_deg(Rf, Rt) > jump_deg
+        else:
+            jump[1:] = rot_angle_deg(R_f[:-1], R_f[1:]) > jump_deg
+    elif len(R_f) > 1:
+        jump[1:] = rot_angle_deg(R_f[:-1], R_f[1:]) > jump_deg
     return {"off_edge": off_edge, "field_jump": jump, "x_s": x, "R_f": R_f}
 
 

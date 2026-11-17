@@ -16,8 +16,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from fixb_field import FixBMoldField, integrate_fixb
-from fixb_labels import heading_branch, pose7_to_Rp, so3_to_rot6d_rows
-from fixb_labels_tracked import HOP_EXCESS_M, tracked_project
+from fixb_labels import QUERY_SMOOTH_S, heading_branch, pose7_to_Rp, smooth_positions, so3_to_rot6d_rows
 
 DEFAULT_FIELD = Path(
     "/mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/shared/fixb_field.npz"
@@ -272,6 +271,19 @@ class MoldAwareRuntime:
     dry_run: bool = True
     _prev_foot: Optional[np.ndarray] = None
     _prev_n: Optional[np.ndarray] = None
+    _prev_R: Optional[np.ndarray] = None
+    _prev_R_out: Optional[np.ndarray] = None
+    _prev_p: Optional[np.ndarray] = None
+    _prev_R_tool: Optional[np.ndarray] = None
+    _cache_t: Optional[np.ndarray] = None
+    _cache_x: Optional[np.ndarray] = None
+    _cache_R: Optional[np.ndarray] = None
+    _cache_sd: Optional[np.ndarray] = None
+    _cache_curv: Optional[np.ndarray] = None
+    _cache_reason: Optional[np.ndarray] = None
+    _raw_t: Optional[np.ndarray] = None
+    _raw_p: Optional[np.ndarray] = None
+    _raw_s: Optional[np.ndarray] = None
     _wrench_over: bool = False
     last_triggers: list = field(default_factory=list)
     # Per-step bool masks from the latest decode_chunk (length H).
@@ -304,6 +316,19 @@ class MoldAwareRuntime:
     def reset(self) -> None:
         self._prev_foot = None
         self._prev_n = None
+        self._prev_R = None
+        self._prev_R_out = None
+        self._prev_p = None
+        self._prev_R_tool = None
+        self._cache_t = None
+        self._cache_x = None
+        self._cache_R = None
+        self._cache_sd = None
+        self._cache_curv = None
+        self._cache_reason = None
+        self._raw_t = None
+        self._raw_p = None
+        self._raw_s = None
         self._wrench_over = False
         self.last_triggers = []
         self.last_clamp_speed = None
@@ -329,23 +354,38 @@ class MoldAwareRuntime:
         if len(p_fb) == 0:
             return {}
 
-        # Online tracked foot: batch project with hop repair, seeded by previous foot.
-        x = tracked_project(self.field, p_fb)
-        if self._prev_foot is not None and len(x) > 0:
-            hop = np.linalg.norm(x[0] - self._prev_foot)
-            if hop > HOP_EXCESS_M:
-                x[0] = self.field.project((self._prev_foot + (p_fb[0] - self._prev_foot))[None])[0]
-                for i in range(1, len(x)):
-                    step = p_fb[i] - p_fb[i - 1]
-                    cand = self.field.project((x[i - 1] + step)[None])[0]
-                    if np.linalg.norm(x[i] - x[i - 1]) - np.linalg.norm(step) > HOP_EXCESS_M:
-                        x[i] = cand
-        self._prev_foot = x[-1].copy()
-
-        q = self.field.query(x, with_curvature=True)
-        # sd of the *tool* vs foot (same as training labels)
-        n = q["R"][..., 2]
-        sd = np.sum((p_fb - x) * n, axis=1)
+        # Same tracker as the labels: 0.1 s causal position smooth, 5 mm gate,
+        # tool-rotation switch, 25° slew. The decision face stays unslewed.
+        # The published frame is the slew. With robot timestamps, each sample
+        # is smoothed and tracked once from episode reset.
+        times = obs_raw.get(f"robot_time_stamps_{robot_id}")
+        times = None if times is None else np.asarray(times, dtype=np.float64).reshape(-1)
+        if times is not None and len(times) == len(p_fb):
+            p_fb = self._smooth_query(times, p_fb)
+            self._track_new_samples(times, p_fb, R_fb)
+            idx = self._cache_index(times)
+            x = self._cache_x[idx]
+            R = self._cache_R[idx]
+            sd = self._cache_sd[idx]
+            curv = self._cache_curv[idx]
+            reason = self._cache_reason[idx]
+        else:
+            q = self.field.query(
+                p_fb,
+                with_curvature=True,
+                R_tool=R_fb,
+                prev_x=self._prev_foot,
+                prev_R=self._prev_R,
+                prev_R_tool=self._prev_R_tool,
+                prev_p=self._prev_p,
+                prev_R_out=self._prev_R_out,
+            )
+            self._remember_tail(p_fb, R_fb, q)
+            x = np.asarray(q["x_s"], dtype=np.float64)
+            R = np.asarray(q["R"], dtype=np.float64)
+            sd = np.asarray(q["sd"], dtype=np.float64).reshape(-1)
+            curv = np.asarray(q["curv"], dtype=np.float64)
+        n = R[..., 2]
         self.note_tcp_penetration(sd)
         if self._prev_n is not None and self.limits.stop_on_normal_flip:
             if float(np.dot(self._prev_n, n[-1])) < 0:
@@ -354,21 +394,121 @@ class MoldAwareRuntime:
 
         signed = sd.reshape(-1, 1).astype(np.float32)
         normal = n.astype(np.float32)
-        rot6d = so3_to_rot6d_rows(q["R"]).astype(np.float32)
-        curv = q["curv"].astype(np.float32)
+        rot6d = so3_to_rot6d_rows(R).astype(np.float32)
+        curv = np.asarray(curv, dtype=np.float32)
 
         obs_raw[f"mold_signed_distance_{robot_id}"] = signed
         obs_raw[f"mold_normal_{robot_id}"] = normal
         obs_raw[f"mold_R_field_rot6d_{robot_id}"] = rot6d
         obs_raw[f"mold_curvature_{robot_id}"] = curv
         obs_raw[f"mold_x_s_{robot_id}"] = x.astype(np.float32)
-        return {
+        out = {
             "sd": sd,
             "normal": n,
             "x_s": x,
-            "R": q["R"],
-            "curv": q["curv"],
+            "R": R,
+            "curv": curv,
         }
+        if times is not None and len(times) == len(pose7):
+            out["reason"] = reason
+        return out
+
+    def _remember_tail(self, p, R_tool, q) -> None:
+        """Face state for the next decision, and the published frame for the next slew."""
+        face = q["R_face"] if "R_face" in q else np.asarray(q["R"])[-1]
+        self._prev_foot = np.asarray(q["x_s"][-1], dtype=np.float64).copy()
+        self._prev_R = np.asarray(face, dtype=np.float64).reshape(3, 3).copy()
+        self._prev_R_out = np.asarray(q["R"][-1], dtype=np.float64).reshape(3, 3).copy()
+        self._prev_p = np.asarray(p[-1], dtype=np.float64).reshape(3).copy()
+        self._prev_R_tool = np.asarray(R_tool[-1], dtype=np.float64).reshape(3, 3).copy()
+
+    def _append_cache(self, times, q) -> None:
+        x = np.asarray(q["x_s"], dtype=np.float64)
+        R = np.asarray(q["R"], dtype=np.float64)
+        sd = np.asarray(q["sd"], dtype=np.float64).reshape(-1)
+        curv = np.asarray(q["curv"], dtype=np.float64)
+        reason = np.asarray(q.get("reason", np.zeros(len(sd))), dtype=np.int8).reshape(-1)
+        times = np.asarray(times, dtype=np.float64).reshape(-1)
+        if self._cache_t is None:
+            self._cache_t = times.copy()
+            self._cache_x = x.copy()
+            self._cache_R = R.copy()
+            self._cache_sd = sd.copy()
+            self._cache_curv = curv.copy()
+            self._cache_reason = reason.copy()
+            return
+        self._cache_t = np.concatenate([self._cache_t, times])
+        self._cache_x = np.concatenate([self._cache_x, x])
+        self._cache_R = np.concatenate([self._cache_R, R])
+        self._cache_sd = np.concatenate([self._cache_sd, sd])
+        self._cache_curv = np.concatenate([self._cache_curv, curv])
+        self._cache_reason = np.concatenate([self._cache_reason, reason])
+
+    def _smooth_query(self, times: np.ndarray, p: np.ndarray) -> np.ndarray:
+        """Same 0.1 s trailing smooth as the labels. Past samples only, kept across calls."""
+        times = np.asarray(times, dtype=np.float64).reshape(-1)
+        p = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+        if self._raw_t is None:
+            self._raw_t = times.copy()
+            self._raw_p = p.copy()
+            self._raw_s = smooth_positions(self._raw_t, self._raw_p, QUERY_SMOOTH_S)
+        else:
+            new = times > float(self._raw_t[-1]) + 1e-9
+            if np.any(new):
+                if not bool(np.all(new[int(np.flatnonzero(new)[0]) :])):
+                    raise RuntimeError("mold tracker expects new robot timestamps as a suffix")
+                start = len(self._raw_t)
+                self._raw_t = np.concatenate([self._raw_t, times[new]])
+                self._raw_p = np.concatenate([self._raw_p, p[new]])
+                extra = smooth_positions(self._raw_t, self._raw_p, QUERY_SMOOTH_S, start=start)
+                self._raw_s = np.concatenate([self._raw_s, extra])
+        idx = self._match_times(self._raw_t, times)
+        return self._raw_s[idx]
+
+    @staticmethod
+    def _match_times(have: np.ndarray, want: np.ndarray) -> np.ndarray:
+        pos = np.searchsorted(have, want)
+        pos = np.clip(pos, 0, len(have) - 1)
+        prev = np.clip(pos - 1, 0, len(have) - 1)
+        use_prev = np.abs(have[prev] - want) < np.abs(have[pos] - want)
+        idx = np.where(use_prev, prev, pos)
+        if float(np.max(np.abs(have[idx] - want))) > 1e-6:
+            raise RuntimeError("mold tracker is missing a robot timestamp")
+        return idx
+
+    def _track_new_samples(self, times, p, R_tool) -> None:
+        if self._cache_t is None:
+            q = self.field.query(p, with_curvature=True, R_tool=R_tool)
+            self._append_cache(times, q)
+            self._remember_tail(p, R_tool, q)
+            return
+        new = np.asarray(times) > float(self._cache_t[-1]) + 1e-9
+        if not np.any(new):
+            return
+        if not bool(np.all(new[int(np.flatnonzero(new)[0]) :])):
+            raise RuntimeError("mold tracker expects new robot timestamps as a suffix")
+        q = self.field.query(
+            p[new],
+            with_curvature=True,
+            R_tool=R_tool[new],
+            prev_x=self._prev_foot,
+            prev_R=self._prev_R,
+            prev_R_tool=self._prev_R_tool,
+            prev_p=self._prev_p,
+            prev_R_out=self._prev_R_out,
+        )
+        self._append_cache(times[new], q)
+        self._remember_tail(p[new], R_tool[new], q)
+
+    def _cache_index(self, times) -> np.ndarray:
+        pos = np.searchsorted(self._cache_t, times)
+        pos = np.clip(pos, 0, len(self._cache_t) - 1)
+        prev = np.clip(pos - 1, 0, len(self._cache_t) - 1)
+        use_prev = np.abs(self._cache_t[prev] - times) < np.abs(self._cache_t[pos] - times)
+        idx = np.where(use_prev, prev, pos)
+        if float(np.max(np.abs(self._cache_t[idx] - times))) > 1e-6:
+            raise RuntimeError("mold tracker cache is missing a robot timestamp")
+        return idx
 
     def unpack_fixb_action(
         self,

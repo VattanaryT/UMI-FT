@@ -205,3 +205,66 @@ def test_viewer_reads_r4vt_export():
     val = episode_payload([loaded], 9)
     assert val["split"] == "val"
     assert val["runs"][0]["error"]["n"]["valid"] > 0
+
+
+def test_frames_overlay_is_off_unless_asked():
+    from view_openloop import cursor_payload, episode_payload, load_export, load_frames_npz
+
+    export = Path("/mnt/data/umidata/ft/open_loop_exports/r4vt_e66520fae9ae")
+    frames_path = Path(
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr"
+        "/r4vt_frame_continuity/ep0_ep9_frames.npz"
+    )
+    loaded = load_export(export)
+    plain = episode_payload([loaded], 0)
+    assert "frames" not in plain
+    assert "frame" not in cursor_payload([loaded], 0, 0)
+    frames = load_frames_npz(frames_path)
+    over = episode_payload([loaded], 0, frames=frames)
+    assert over["frames"]["dR_old"]
+    assert over["frames"]["dR_new"]
+    assert over["frames"]["jumps"]
+    assert len(over["frames"]["t"]) == len(over["frames"]["dR_old"]) == len(over["frames"]["dR_new"])
+    missing = episode_payload([loaded], 9, frames={0: frames[0]})
+    assert "frames" not in missing
+    cursor = cursor_payload([loaded], 0, 0, frames=frames)
+    assert cursor["frame"]["x_old"] and cursor["frame"]["R_old"]
+    assert cursor["frame"]["x_new"] and cursor["frame"]["R_new"]
+    assert "switches" not in plain
+    assert "events" not in frames
+
+
+def test_frames_only_episode_and_switch_time():
+    from view_openloop import cursor_payload, frames_only_payload
+
+    n = 6
+    eye = np.repeat(np.eye(3)[None], n, axis=0)
+    robot_t = np.arange(n, dtype=np.float64) * 0.1 + 10.0
+    frames = {
+        4: {
+            "x_old": np.zeros((n, 3)),
+            "x_new": np.arange(n)[:, None] * np.array([0.01, 0.0, 0.0]),
+            "R_old": eye,
+            "R_new": eye,
+            "old_jump": np.array([False, False, True, False, False, False]),
+            "robot_time_s": robot_t,
+            "t0": 10.0,
+            "tcp_xyz": np.zeros((n, 3)),
+            "tcp_R": eye,
+            "split": "train",
+        },
+        "events": {
+            "switches": [
+                {"ep": 4, "i": 2, "time_s": 10.2, "t": 0.2, "frame": 25.0, "tool": 0.1, "x": [0.0, 0.0, 0.0]}
+            ],
+            "nearcap": [],
+        },
+    }
+    payload = frames_only_payload(frames, 4)
+    assert payload["policy"] is False
+    assert payload["split"] == "train"
+    assert payload["switches"][0]["t"] == 0.2
+    assert payload["switches"][0]["frame"] == 25.0
+    assert payload["frames"]["dR_old"]
+    cursor = cursor_payload([], 4, payload["path_i"][0], frames=frames)
+    assert cursor["frame"]["x_new"]

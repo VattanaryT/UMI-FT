@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Dict
 
 import numpy as np
-from scipy.signal import savgol_filter
+from scipy.signal import savgol_coeffs
 from scipy.spatial.transform import Rotation
 
 from fixb_field import FixBMoldField
@@ -54,12 +54,49 @@ def next_control_times(robot_t: np.ndarray, rgb_t: np.ndarray) -> np.ndarray:
     return robot_t[i_next]
 
 
-def smooth_positions(robot_t: np.ndarray, p: np.ndarray, window_s: float) -> np.ndarray:
-    dt = float(np.median(np.diff(robot_t)))
-    win = max(5, int(round(window_s / dt)) | 1)
-    if len(p) <= win:
-        return p.copy()
-    return savgol_filter(p, win, 2, axis=0)
+QUERY_SMOOTH_S = 0.1
+_SMOOTH_POLY = 2
+
+
+def smooth_positions(
+    robot_t: np.ndarray, p: np.ndarray, window_s: float, start: int = 0
+) -> np.ndarray:
+    """Trailing Savitzky-Golay. Sample i uses only positions with time in [t_i - window_s, t_i].
+
+    The old filter was a centered Savitzky-Golay of the same width, so about half
+    the window was future samples. A one-sample gap (fewer than 3 points in the
+    window) is left raw. ``start`` keeps the prefix and returns only the suffix,
+    which is valid because the filter does not read ahead.
+    """
+    t = np.asarray(robot_t, dtype=np.float64).reshape(-1)
+    p = np.asarray(p, dtype=np.float64)
+    single = p.ndim == 1
+    if single:
+        p = p.reshape(-1, 1)
+    n = len(p)
+    if n == 0 or len(t) != n:
+        raise ValueError("smooth_positions needs one time per position")
+    start = int(start)
+    if start < 0 or start > n:
+        raise ValueError("start out of range")
+    out = np.array(p, dtype=np.float64, copy=True)
+    if n == 1 or start == n:
+        return out[start:, 0] if single else out[start:]
+    left = np.searchsorted(t, t - float(window_s), side="left")
+    lengths = np.arange(n) - left + 1
+    coeff: dict[int, np.ndarray] = {}
+    for L in np.unique(lengths[start:]):
+        L = int(L)
+        if L <= _SMOOTH_POLY:
+            continue
+        coeff[L] = savgol_coeffs(L, _SMOOTH_POLY, pos=L - 1, use="dot")
+    for L, c in coeff.items():
+        sel = np.flatnonzero(lengths[start:] == L) + start
+        offsets = np.arange(L)
+        windows = p[sel[:, None] - (L - 1) + offsets[None, :]]
+        out[sel] = np.einsum("l,nld->nd", c, windows)
+    suffix = out[start:]
+    return suffix[:, 0] if single else suffix
 
 
 def interp_rows(t_query: np.ndarray, t: np.ndarray, x: np.ndarray) -> np.ndarray:

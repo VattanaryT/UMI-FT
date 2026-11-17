@@ -120,7 +120,7 @@ class UmiFTDatasetFixB(UmiFTDataset):
 
 
 class UmiFTDatasetR4(UmiFTDataset):
-    """r4: identical chunk sampling to r2; mask ΔR loss after field-frame jumps."""
+    """r4: identical chunk sampling to r2; mask ΔR when the surface frame moves and the tool does not."""
 
     def __init__(
         self,
@@ -247,7 +247,7 @@ class UmiFTDatasetR4(UmiFTDataset):
             "field_jump_deg": self._r4_jump_deg,
             "note": (
                 "Same chunks as r2 (no chunk drop). ΔR loss weight=0 from the first "
-                "field-frame jump after chunk start through the rest of the horizon."
+                "surface-frame change the tool rotation does not explain, through the rest of the horizon."
             ),
         }
         print(
