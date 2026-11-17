@@ -110,6 +110,7 @@ SOFT_CLAMP_KEYS = (
     "max_rot_rate",
     "mesh_jump_hold",
     "rd_slew",
+    "face_hold",
 )
 HARD_STOP_KEYS = (
     "normal_flip",
@@ -153,6 +154,8 @@ def r4_safety_limits(
 
 # One replan, and one step inside a replan. A larger hop keeps the previous foot.
 FOOT_CAP_M = 0.010
+# A new face whose normal has turned further than this keeps the held frame.
+FACE_HOLD_DEG = 5.0
 # Fixture +Y is down. Bench replay lifts along −Y, off the table on every face.
 FIXTURE_UP = np.array([0.0, -1.0, 0.0])
 
@@ -175,6 +178,22 @@ def _hold_if_far(x, R, prev_x, prev_R, cap: float = FOOT_CAP_M):
             np.asarray(prev_R, dtype=np.float64).reshape(3, 3).copy(),
         )
     return x, R
+
+
+def _reject_new_face(x, R, prev_x, prev_R, max_deg: float = FACE_HOLD_DEG):
+    """Keep the previous foot and frame when the normal turns more than max_deg."""
+    if prev_R is None or prev_x is None:
+        return x, R, False
+    n_new = np.asarray(R, dtype=np.float64).reshape(3, 3)[:, 2]
+    n_prev = np.asarray(prev_R, dtype=np.float64).reshape(3, 3)[:, 2]
+    cosine = float(np.clip(np.dot(n_new, n_prev), -1.0, 1.0))
+    if float(np.degrees(np.arccos(cosine))) > max_deg:
+        return (
+            np.asarray(prev_x, dtype=np.float64).reshape(3).copy(),
+            np.asarray(prev_R, dtype=np.float64).reshape(3, 3).copy(),
+            True,
+        )
+    return x, R, False
 
 
 def _project_foot(field, p, prev_x, prev_R):
@@ -206,12 +225,13 @@ def integrate_tcp_foot(
     dt: np.ndarray,
     prev_x: np.ndarray | None = None,
     prev_R: np.ndarray | None = None,
+    hold_face: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Face-held foot of the measured TCP, then tangent steps on that face.
 
     The first replan queries the TCP. Later replans call ``track_step`` with
-    the measured TCP and the previous foot. A hop over 10 mm, at the replan
-    or at a step, keeps the previous foot and frame.
+    the measured TCP and the previous foot. A hop over 10 mm, or a normal
+    more than 5° from the held face, keeps the previous foot and frame.
     """
     v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
     delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
@@ -219,20 +239,31 @@ def integrate_tcp_foot(
     h = len(delta_n)
     xs, rk = _project_foot(field, p0, prev_x, prev_R)
     xs, rk = _hold_if_far(xs, rk, prev_x, prev_R)
+    if hold_face:
+        xs, rk, held0 = _reject_new_face(xs, rk, prev_x, prev_R)
+    else:
+        held0 = False
     x_s = np.zeros((h, 3))
     frames = np.zeros((h, 3, 3))
+    face_held = np.zeros(h, dtype=bool)
+    face_held[0] = held0
     for k in range(h):
         x_s[k] = xs
         frames[k] = rk
         if k + 1 < h:
             step = rk[:, :2] @ v_par[k] * float(dt[k])
             nxt_x, nxt_R = _project_foot(field, xs + step, xs, rk)
-            xs, rk = _hold_if_far(nxt_x, nxt_R, xs, rk)
+            nxt_x, nxt_R = _hold_if_far(nxt_x, nxt_R, xs, rk)
+            if hold_face:
+                xs, rk, face_held[k + 1] = _reject_new_face(nxt_x, nxt_R, xs, rk)
+            else:
+                xs, rk = nxt_x, nxt_R
     normal = frames[:, :, 2]
     return {
         "x_s": x_s,
         "x_d": x_s + delta_n[:, None] * normal,
         "R": frames,
+        "face_held": face_held,
     }
 
 
@@ -355,23 +386,33 @@ def _clamp_rot_rate(R_d: np.ndarray, max_deg: float) -> tuple:
 
 
 def _slew_orientations(
-    R_d: np.ndarray, prev: np.ndarray | None, max_deg: float
+    R_d: np.ndarray,
+    prev: np.ndarray | None,
+    max_deg: float,
+    freeze: np.ndarray | None = None,
 ) -> tuple:
     """Walk R_d toward each target, at most max_deg from the previous command.
 
     ``prev`` is the last commanded orientation of the previous chunk. The first
     step of this chunk slews from it, so a seam is capped the same way as a step.
+    A frozen step keeps that previous orientation instead of walking toward
+    the new face.
     """
     R = np.asarray(R_d, dtype=np.float64).reshape(-1, 3, 3).copy()
     hit = np.zeros(len(R), dtype=bool)
-    if max_deg <= 0 or len(R) == 0:
+    if len(R) == 0:
         return R, hit
-    if prev is not None:
-        R[0], hit[0] = _slew_one(
-            np.asarray(prev, dtype=np.float64).reshape(3, 3), R[0], max_deg
-        )
-    for i in range(1, len(R)):
-        R[i], hit[i] = _slew_one(R[i - 1], R[i], max_deg)
+    origin = None if prev is None else np.asarray(prev, dtype=np.float64).reshape(3, 3)
+    held = np.zeros(len(R), dtype=bool) if freeze is None else np.asarray(freeze, dtype=bool)
+    for i in range(len(R)):
+        if held[i] and origin is not None:
+            R[i] = origin
+            continue
+        if origin is None or max_deg <= 0:
+            origin = R[i]
+            continue
+        R[i], hit[i] = _slew_one(origin, R[i], max_deg)
+        origin = R[i]
     return R, hit
 
 
@@ -473,6 +514,7 @@ class MoldAwareRuntime:
         self.last_clamp_tilt = None
         self.last_clamp_rot_rate = None
         self.last_rd_slew = None
+        self.last_face_hold = None
         self.last_mesh_jump_hold = None
 
     @property
@@ -729,6 +771,7 @@ class MoldAwareRuntime:
         self.last_clamp_tilt = np.zeros(H, dtype=bool)
         self.last_clamp_rot_rate = np.zeros(H, dtype=bool)
         self.last_rd_slew = np.zeros(H, dtype=bool)
+        self.last_face_hold = np.zeros(H, dtype=bool)
         self.last_mesh_jump_hold = np.zeros(H, dtype=bool)
 
         if self.run_type == "r1_world_world":
@@ -787,10 +830,15 @@ class MoldAwareRuntime:
             dt,
             prev_x=self._cmd_foot,
             prev_R=self._cmd_R,
+            hold_face=apply_safety,
         )
         R_field = dec["R"]
         x_d = dec["x_d"]
         x_s = dec["x_s"]
+        face_held = np.asarray(dec["face_held"], dtype=bool).reshape(H)
+        self.last_face_hold = face_held
+        if np.any(face_held):
+            self.last_triggers.append("face_hold")
 
         if self.run_type == "r4_world_fixb_tilt":
             # Learned ΔR in action[..., 21:27]; project rot6d → SO(3).
@@ -839,9 +887,14 @@ class MoldAwareRuntime:
             self.last_clamp_rot_rate = rate_hit
             if np.any(rate_hit):
                 self.last_triggers.append("max_rot_rate")
-        if apply_safety and self.limits.enable_rd_slew:
+        if (apply_safety and self.limits.enable_rd_slew) or np.any(face_held):
+            max_deg = (
+                float(self.limits.max_rd_slew_deg)
+                if apply_safety and self.limits.enable_rd_slew
+                else 180.0
+            )
             R_d, slew_hit = _slew_orientations(
-                R_d, self._cmd_Rd, float(self.limits.max_rd_slew_deg)
+                R_d, self._cmd_Rd, max_deg, freeze=face_held
             )
             self.last_rd_slew = slew_hit
             if np.any(slew_hit):
@@ -883,6 +936,7 @@ class MoldAwareRuntime:
             "clamp_tilt": self.last_clamp_tilt,
             "clamp_rot_rate": self.last_clamp_rot_rate,
             "rd_slew": self.last_rd_slew,
+            "face_hold": self.last_face_hold,
             "mesh_jump_hold": self.last_mesh_jump_hold,
         }
 

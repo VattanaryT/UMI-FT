@@ -2280,6 +2280,9 @@ def main():
                     slew = decoded.get("rd_slew")
                     if slew is not None and bool(slew[i]):
                         flags.append("rd_slew")
+                    face = decoded.get("face_hold")
+                    if face is not None and bool(face[i]):
+                        flags.append("face_hold")
                     mj = decoded.get("mesh_jump_hold")
                     if mj is not None and bool(mj[i]):
                         flags.append("mesh_jump_hold")
@@ -2348,6 +2351,7 @@ def main():
                         "clamp_tilt",
                         "clamp_rot_rate",
                         "rd_slew",
+                        "face_hold",
                         "mesh_jump_hold",
                     ):
                         arr = decoded.get(key)

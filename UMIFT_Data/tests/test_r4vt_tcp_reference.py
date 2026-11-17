@@ -213,6 +213,42 @@ def test_rd_slew_caps_three_degrees_across_replans():
     assert bool(runtime.last_rd_slew[0])
 
 
+def test_face_hold_keeps_frame_and_command_past_five_degrees():
+    class _Tilted(_Flat):
+        def track_step(self, p, p_prev, x_prev, R_prev):
+            hit = self.query(p)
+            tilt = np.radians(30.0)
+            cosine, sine = np.cos(tilt), np.sin(tilt)
+            turned = np.array(
+                [[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]]
+            )
+            hit["R"][:] = turned
+            return hit["x_s"], hit["R"]
+
+    runtime = MoldAwareRuntime(
+        field=_Tilted(),
+        R_off=np.eye(3),
+        run_type="r4_world_fixb_tilt",
+        limits=r4_safety_limits(),
+        dry_run=False,
+    )
+    tcp = np.array([0.0, 0.0, 0.02])
+    first = runtime.decode_chunk(
+        _action(0.0), tcp, np.eye(3), np.array([1.0 / 15.0])
+    )
+    turned = _action(0.0)
+    yaw = np.radians(30.0)
+    cosine, sine = np.cos(yaw), np.sin(yaw)
+    turned[:, 21:27] = [cosine, -sine, 0.0, sine, cosine, 0.0]
+    second = runtime.decode_chunk(
+        turned, tcp, np.eye(3), np.array([1.0 / 15.0])
+    )
+    assert np.allclose(second["R_field"][0], np.eye(3))
+    assert np.allclose(second["R_d"][0], first["R_d"][0])
+    assert bool(second["face_hold"][0])
+    assert "face_hold" in runtime.last_triggers
+
+
 def test_bench_lift_is_fixture_up():
     lifted = shift_fixture_up(np.array([[1.0, 2.0, 3.0]]), 0.08)
     assert np.allclose(lifted, [[1.0, 1.92, 3.0]])
