@@ -446,6 +446,9 @@ def replay_horizon(group, arm: str, episode: int, exec_h: int, scale, offset, ru
         head = int(indices[0])
         base = su.pose7_to_SE3(demo[head].reshape(1, 7))[0]
         if r4:
+            # This window is anchored on the recorded TCP, not on the previous
+            # chunk's unexecuted tail. The live runner keeps the foot.
+            runtime.release_command_foot()
             tool_r = _pose_R(demo[head])[0]
             decoded = runtime.decode_chunk(
                 action,
@@ -747,6 +750,7 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
     dt_exec = fixb_decode_dt(exec_h, 1, RUNNER_DT_S)
     for k, indices in enumerate(windows):
         head = int(indices[0])
+        runtime.release_command_foot()
         decoded = runtime.decode_chunk(
             actions[k],
             demo[head, :3],
@@ -777,6 +781,7 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
                 }
             )
         ensembler.push(k * int(exec_h), actions[k])
+        runtime.release_command_foot()
         action_decoded = runtime.decode_chunk(
             ensembler.pop(exec_h),
             demo[head, :3],

@@ -3,7 +3,7 @@ date: 2026-11-17
 stream: frame
 branch: frame_continuity
 commit: 7562920
-status: done
+status: superseded-by 2026-11-17-bench-foot-cap.md
 artifacts: []
 ---
 # r4vt reference pose is the TCP foot

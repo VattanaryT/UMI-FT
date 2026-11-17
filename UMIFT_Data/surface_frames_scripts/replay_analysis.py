@@ -125,6 +125,7 @@ def r4_case(group, episode: int, exec_h: int, dt_s: float, scale, offset, runtim
             rg._action_rows(group, indices, with_delta_r=True), scale, offset
         )
         head = int(indices[0])
+        runtime.release_command_foot()
         decoded = runtime.decode_chunk(
             action,
             demo[head, :3],

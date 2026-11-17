@@ -1166,6 +1166,7 @@ def main():
     # Mold-aware / Fix B: detect run type from checkpoint task name.
     mold_runtime = None
     mold_run_type = "none"
+    bench_lift_m = 0.0
     r4vt = False
     r4_jump_guard = None
     _task_name = ""
@@ -1204,6 +1205,9 @@ def main():
         env_floor = os.environ.get("UMIFT_ENABLE_DELTA_N_FLOOR")
         if env_floor is not None and env_floor.strip() != "":
             delta_n_floor = env_floor.strip().lower() in ("1", "true", "yes")
+        env_lift = os.environ.get("UMIFT_BENCH_LIFT_M")
+        if env_lift is not None and env_lift.strip() != "":
+            bench_lift_m = float(env_lift)
         r4_limits = (
             r4_safety_limits(
                 max_tcp_penetration_m=float(control_para["max_tcp_penetration_m"]),
@@ -1240,7 +1244,8 @@ def main():
                 f"tcp_penetration_m={mold_runtime.limits.max_tcp_penetration_m} "
                 f"wrench_hold_n={mold_runtime.limits.wrench_hold_n} "
                 f"abort_on_measured_mesh_distance="
-                f"{mold_runtime.limits.abort_on_measured_mesh_distance}"
+                f"{mold_runtime.limits.abort_on_measured_mesh_distance} "
+                f"bench_lift_m={bench_lift_m}"
             )
             print(
                 f"[jump-guard] step limit {MAX_STEP_MM:.2f} mm, {MAX_STEP_DEG:.2f} deg "
@@ -1769,10 +1774,19 @@ def main():
             r4_jump_guard.reset()
         if r4vt:
             if gt_replay is not None and mold_T_fixture_from_base is not None:
-                start_base = gt_replay.start_pose_base(mold_T_fixture_from_base)
+                from mold_aware_runtime import shift_fixture_up
+
+                start_fix = shift_fixture_up(gt_replay.start_pose7, bench_lift_m)
+                start_base = pose7_change_frame(
+                    start_fix, np.linalg.inv(mold_T_fixture_from_base)
+                )
                 pose_note = f"recorded episode {gt_replay.episode}"
+                if bench_lift_m:
+                    pose_note += f", lifted {bench_lift_m * 1e3:.0f} mm fixture up"
             elif gt_replay is not None:
-                start_base = gt_replay.start_pose7
+                from mold_aware_runtime import shift_fixture_up
+
+                start_base = shift_fixture_up(gt_replay.start_pose7, bench_lift_m)
                 pose_note = f"recorded episode {gt_replay.episode}, fixture frame"
             else:
                 start_base = np.asarray(
@@ -1920,6 +1934,7 @@ def main():
                         control_para["max_tcp_penetration_m"]
                     )
                     log.attrs["wrench_hold_n"] = float(control_para["wrench_hold_n"])
+                    log.attrs["bench_lift_m"] = float(bench_lift_m)
             log.attrs["log_policy_vision"] = bool(control_para["log_policy_vision"])
             if gt_replay is not None:
                 log.attrs["mode"] = "gt_replay"
@@ -2223,6 +2238,15 @@ def main():
                         dtype=np.float64,
                     )
                 decoded = mold_runtime.decode_chunk(raw_a, p0[0], R0[0], dt)
+                # Fixture +Y is down. Lift the commanded foot and the virtual
+                # target along −Y so a free-space bench stays off the table.
+                # The surface normal is −Y on the flange and −Z on the wall, so
+                # lifting along n would slide the wall section sideways.
+                if bench_lift_m:
+                    from mold_aware_runtime import shift_fixture_up
+
+                    decoded["x_s"] = shift_fixture_up(decoded["x_s"], bench_lift_m)
+                    decoded["x_d"] = shift_fixture_up(decoded["x_d"], bench_lift_m)
                 # Robot schedule_controls expects right_base SE3.
                 R_base, p_base = se3_batch_fixture_to_base(
                     decoded["R_d"], decoded["x_d"], mold_T_fixture_from_base
@@ -2846,6 +2870,7 @@ def main():
                     control_para["max_tcp_penetration_m"]
                 )
                 journal["wrench_hold_n"] = float(control_para["wrench_hold_n"])
+                journal["bench_lift_m"] = float(bench_lift_m)
         if cam_info is not None:
             journal["wrist_rate"] = cam_info.get("wrist_rate")
             journal["center_rate"] = cam_info.get("center_rate")

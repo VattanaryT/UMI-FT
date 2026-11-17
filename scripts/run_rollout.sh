@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Start the layup runner for one arm. The checkpoint is passed in UMIFT_CKPT_PATH.
-# Usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--bench]
+# Usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--bench] [--bench-lift M]
 set -euo pipefail
 
 usage() {
-  echo "usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--bench]"
+  echo "usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--bench] [--bench-lift M]"
   echo "  r4vt   UMIFT_CKPT_PATH=/oct_v35_h4s_odom_r4vt/checkpoints/epoch=0185-train_loss=0.011.ckpt"
   echo "  r1rel  UMIFT_CKPT_PATH=/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt"
   echo "  --replay-episode N   play that episode's labels through the runner (no policy call)"
   echo "  --bench              first free-space replay: clamp delta_n at -5 mm"
+  echo "  --bench-lift M       shift foot, virtual target, and start pose M metres"
+  echo "                       along fixture up (−Y, away from the table)"
   echo "  r4vt reads UMIFT_R4VT_ZARR (default: r4vt_frame_continuity_causal) and the"
   echo "    2026-11-16 orange extrinsics. UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE=1."
   echo "  r4vt, policy and replay: jump guard holds a commanded step over 248.70 mm or 75.96 deg"
@@ -27,6 +29,7 @@ arm="${1:-}"
 shift || true
 replay_episode=""
 bench=0
+bench_lift=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --replay-episode)
@@ -37,6 +40,11 @@ while [[ $# -gt 0 ]]; do
     --bench)
       bench=1
       shift
+      ;;
+    --bench-lift)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--bench-lift needs a distance in metres"
+      bench_lift="$2"
+      shift 2
       ;;
     *)
       usage
@@ -72,6 +80,12 @@ export UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE="${UMIFT_ABORT_ON_MEASURED_MESH_DIS
 # Leave it off for a later contact replay.
 if [[ "$bench" -eq 1 ]]; then
   export UMIFT_ENABLE_DELTA_N_FLOOR=1
+fi
+# Fixture +Y is down. This raises the replay off the table.
+if [[ -n "$bench_lift" ]]; then
+  export UMIFT_BENCH_LIFT_M="$bench_lift"
+else
+  unset UMIFT_BENCH_LIFT_M
 fi
 if [[ ! -f "$UMIFT_WORKCELL_EXTRINSICS" ]]; then
   die "orange extrinsics not found: $UMIFT_WORKCELL_EXTRINSICS"

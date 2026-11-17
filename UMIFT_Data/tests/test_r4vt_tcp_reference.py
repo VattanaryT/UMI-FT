@@ -11,7 +11,12 @@ sys.path.insert(0, str(SCRIPTS))
 
 from fixb_field import FixBMoldField  # noqa: E402
 from fixb_labels import pose7_to_Rp  # noqa: E402
-from mold_aware_runtime import MoldAwareRuntime, r4_safety_limits  # noqa: E402
+from mold_aware_runtime import (  # noqa: E402
+    FOOT_CAP_M,
+    MoldAwareRuntime,
+    r4_safety_limits,
+    shift_fixture_up,
+)
 
 CAUSAL = Path(
     "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/"
@@ -27,7 +32,7 @@ FEW_DEG = 5.0
 
 
 class _Flat:
-    """z = 0, outward normal +z."""
+    """z = 0, outward normal +z. track_step snaps to the closest point."""
 
     def query(self, p):
         p = np.asarray(p, dtype=np.float64).reshape(-1, 3)
@@ -35,6 +40,10 @@ class _Flat:
         foot[:, 2] = 0.0
         frames = np.broadcast_to(np.eye(3), (len(p), 3, 3)).copy()
         return {"x_s": foot, "R": frames, "sd": p[:, 2].copy()}
+
+    def track_step(self, p, p_prev, x_prev, R_prev):
+        hit = self.query(p)
+        return hit["x_s"], hit["R"]
 
 
 def _runtime(limits=None):
@@ -115,6 +124,8 @@ def test_episode0_nominal_tracks_tcp_foot():
     checked = 0
     press = 0
     for rgb_id in range(0, len(rgb_t), 6):
+        # Each window is a first replan. The cross-replan cap is tested below.
+        runtime.reset()
         indices, _times = sparse_action_indices_from_rgb_timestamps(
             robot_t, rgb_t, rgb_id, 6, 1
         )
@@ -148,6 +159,43 @@ def test_episode0_nominal_tracks_tcp_foot():
     assert press > 10
 
 
+def test_foot_cannot_ratchet_more_than_10mm_per_replan_without_contact():
+    """A hovering TCP and a fast tangent command cannot walk the foot."""
+    runtime = _runtime()
+    hover = np.array([0.0, 0.0, 0.03])
+    action = _action(0.0, steps=4)
+    action[:, 0] = 1.0
+    first = runtime.decode_chunk(
+        action, hover, np.eye(3), np.full(4, 1.0 / 15.0), apply_safety=False
+    )
+    steps = np.linalg.norm(np.diff(first["x_s"], axis=0), axis=1)
+    assert np.all(steps <= FOOT_CAP_M + 1e-9)
+    assert np.allclose(first["x_s"], 0.0)
+
+    jumped = np.array([0.08, 0.0, 0.03])
+    second = runtime.decode_chunk(
+        _action(0.0), jumped, np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+    )
+    hop = np.linalg.norm(second["x_s"][0] - first["x_s"][-1])
+    assert hop <= FOOT_CAP_M + 1e-9
+
+    near = np.array([0.005, 0.0, 0.03])
+    third = runtime.decode_chunk(
+        _action(0.0), near, np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+    )
+    assert np.linalg.norm(third["x_s"][0] - second["x_s"][0]) <= FOOT_CAP_M + 1e-9
+    assert np.allclose(third["x_s"][0], [0.005, 0.0, 0.0])
+
+
+def test_bench_lift_is_fixture_up():
+    lifted = shift_fixture_up(np.array([[1.0, 2.0, 3.0]]), 0.08)
+    assert np.allclose(lifted, [[1.0, 1.92, 3.0]])
+    pose = np.array([0.1, -0.2, 0.3, 1.0, 0.0, 0.0, 0.0])
+    lifted_pose = shift_fixture_up(pose, 0.08)
+    assert np.allclose(lifted_pose[:3], [0.1, -0.28, 0.3])
+    assert np.allclose(lifted_pose[3:], pose[3:])
+
+
 def test_runner_keeps_standard_bc_stiffness_path():
     """Stiffness still comes from VT − nominal in the runner. No second builder."""
     runner = (
@@ -161,3 +209,5 @@ def test_runner_keeps_standard_bc_stiffness_path():
     assert "outputs_ts_targets[id] = ts_targets_virtual" in runner
     assert "UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE" in runner
     assert "UMIFT_ENABLE_DELTA_N_FLOOR" in runner
+    assert "UMIFT_BENCH_LIFT_M" in runner
+    assert "shift_fixture_up" in runner

@@ -144,26 +144,74 @@ def r4_safety_limits(
     )
 
 
+# One replan, and one step inside a replan. A larger hop keeps the previous foot.
+FOOT_CAP_M = 0.010
+# Fixture +Y is down. Bench replay lifts along −Y, off the table on every face.
+FIXTURE_UP = np.array([0.0, -1.0, 0.0])
+
+
+def shift_fixture_up(points: np.ndarray, lift_m: float) -> np.ndarray:
+    """Move positions by ``lift_m`` along fixture up (−Y). Pose7 uses [:, :3]."""
+    out = np.array(points, dtype=np.float64, copy=True)
+    if float(lift_m) == 0.0:
+        return out
+    out[..., 1] = out[..., 1] - float(lift_m)
+    return out
+
+
+def _hold_if_far(x, R, prev_x, prev_R, cap: float = FOOT_CAP_M):
+    if prev_x is None:
+        return x, R
+    if float(np.linalg.norm(x - np.asarray(prev_x, dtype=np.float64).reshape(3))) > cap:
+        return (
+            np.asarray(prev_x, dtype=np.float64).reshape(3).copy(),
+            np.asarray(prev_R, dtype=np.float64).reshape(3, 3).copy(),
+        )
+    return x, R
+
+
+def _project_foot(field, p, prev_x, prev_R):
+    """First replan queries the TCP. Later calls hold the previous face."""
+    p = np.asarray(p, dtype=np.float64).reshape(3)
+    if prev_x is None or prev_R is None:
+        cur = field.query(p.reshape(1, 3))
+        return (
+            np.asarray(cur["x_s"], dtype=np.float64).reshape(3).copy(),
+            np.asarray(cur["R"], dtype=np.float64).reshape(3, 3).copy(),
+        )
+    x, R = field.track_step(
+        p.reshape(1, 3),
+        np.asarray(prev_x, dtype=np.float64).reshape(1, 3),
+        np.asarray(prev_x, dtype=np.float64).reshape(1, 3),
+        np.asarray(prev_R, dtype=np.float64).reshape(1, 3, 3),
+    )
+    return (
+        np.asarray(x, dtype=np.float64).reshape(3).copy(),
+        np.asarray(R, dtype=np.float64).reshape(3, 3).copy(),
+    )
+
+
 def integrate_tcp_foot(
     field,
     p0: np.ndarray,
     v_par: np.ndarray,
     delta_n: np.ndarray,
     dt: np.ndarray,
+    prev_x: np.ndarray | None = None,
+    prev_R: np.ndarray | None = None,
 ) -> Dict[str, np.ndarray]:
-    """Foot of the measured TCP, then tangent steps re-projected onto the mesh.
+    """Face-held foot of the measured TCP, then tangent steps on that face.
 
-    Each replan starts at ``field.query(TCP)``. Later steps closest-point the
-    point ``foot + (v_t1, v_t2)·dt``. ``track_step`` holds the previous face and
-    can walk the foot onto a face the tool is not touching.
+    The first replan queries the TCP. Later replans call ``track_step`` with
+    the measured TCP and the previous foot. A hop over 10 mm, at the replan
+    or at a step, keeps the previous foot and frame.
     """
     v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
     delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
     dt = np.asarray(dt, dtype=np.float64).reshape(-1)
     h = len(delta_n)
-    cur = field.query(np.asarray(p0, dtype=np.float64).reshape(1, 3))
-    xs = np.asarray(cur["x_s"], dtype=np.float64).reshape(3).copy()
-    rk = np.asarray(cur["R"], dtype=np.float64).reshape(3, 3).copy()
+    xs, rk = _project_foot(field, p0, prev_x, prev_R)
+    xs, rk = _hold_if_far(xs, rk, prev_x, prev_R)
     x_s = np.zeros((h, 3))
     frames = np.zeros((h, 3, 3))
     for k in range(h):
@@ -171,9 +219,8 @@ def integrate_tcp_foot(
         frames[k] = rk
         if k + 1 < h:
             step = rk[:, :2] @ v_par[k] * float(dt[k])
-            nxt = field.query((xs + step).reshape(1, 3))
-            xs = np.asarray(nxt["x_s"], dtype=np.float64).reshape(3).copy()
-            rk = np.asarray(nxt["R"], dtype=np.float64).reshape(3, 3).copy()
+            nxt_x, nxt_R = _project_foot(field, xs + step, xs, rk)
+            xs, rk = _hold_if_far(nxt_x, nxt_R, xs, rk)
     normal = frames[:, :, 2]
     return {
         "x_s": x_s,
@@ -334,6 +381,9 @@ class MoldAwareRuntime:
     _raw_p: Optional[np.ndarray] = None
     _raw_s: Optional[np.ndarray] = None
     _wrench_over: bool = False
+    # Last commanded foot. The next replan holds this face and this point.
+    _cmd_foot: Optional[np.ndarray] = None
+    _cmd_R: Optional[np.ndarray] = None
     last_triggers: list = field(default_factory=list)
     # Per-step bool masks from the latest decode_chunk (length H).
     last_clamp_speed: Optional[np.ndarray] = None
@@ -379,7 +429,14 @@ class MoldAwareRuntime:
         self._raw_p = None
         self._raw_s = None
         self._wrench_over = False
+        self._cmd_foot = None
+        self._cmd_R = None
         self.last_triggers = []
+
+    def release_command_foot(self) -> None:
+        """Next decode queries the TCP. Offline windows do this; the live runner does not."""
+        self._cmd_foot = None
+        self._cmd_R = None
         self.last_clamp_speed = None
         self.last_clamp_step = None
         self.last_clamp_dn = None
@@ -689,9 +746,16 @@ class MoldAwareRuntime:
         self.last_clamp_speed = clamp_speed
 
         dt = np.asarray(dt, dtype=np.float64).reshape(H)
-        # Re-project from this replan's measured TCP. integrate_fixb's track_step
-        # holds the previous face and can leave the contact.
-        dec = integrate_tcp_foot(self.field, p0, v_par, delta_n, dt)
+        # First replan queries the TCP. Later replans hold the previous face.
+        dec = integrate_tcp_foot(
+            self.field,
+            p0,
+            v_par,
+            delta_n,
+            dt,
+            prev_x=self._cmd_foot,
+            prev_R=self._cmd_R,
+        )
         R_field = dec["R"]
         x_d = dec["x_d"]
         x_s = dec["x_s"]
@@ -758,6 +822,9 @@ class MoldAwareRuntime:
             dist = np.linalg.norm(x_d - x_s, axis=1)
             if np.any(dist > self.limits.max_distance_from_mesh_m):
                 self.last_triggers.append("max_distance_from_mesh")
+
+        self._cmd_foot = np.asarray(x_s[-1], dtype=np.float64).copy()
+        self._cmd_R = np.asarray(R_field[-1], dtype=np.float64).reshape(3, 3).copy()
 
         return {
             "x_d": x_d,
