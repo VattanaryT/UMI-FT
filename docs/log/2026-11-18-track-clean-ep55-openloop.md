@@ -2,7 +2,7 @@
 date: 2026-11-18
 stream: frame
 branch: smooth_frame
-commit: uncommitted
+commit: 859afc5
 status: done
 artifacts:
   - /mnt/data/umidata/ft/training_outputs/oct_v35_h4s_r4vt_track_clean/oct-v35-h4s-r4vt-track-clean_e100_bs64_valtopk_43351238/checkpoints/epoch=0055-val_loss=0.030.ckpt
