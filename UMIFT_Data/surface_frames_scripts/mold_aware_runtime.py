@@ -258,11 +258,15 @@ def integrate_tcp_foot(
                 xs, rk, face_held[k + 1] = _reject_new_face(nxt_x, nxt_R, xs, rk)
             else:
                 xs, rk = nxt_x, nxt_R
-    normal = frames[:, :, 2]
+    if getattr(field, "orientation_z_inward", False):
+        n_out = -frames[:, :, 2]
+    else:
+        n_out = frames[:, :, 2]
     return {
         "x_s": x_s,
-        "x_d": x_s + delta_n[:, None] * normal,
+        "x_d": x_s + delta_n[:, None] * n_out,
         "R": frames,
+        "n_out": n_out,
         "face_held": face_held,
     }
 
@@ -473,8 +477,17 @@ class MoldAwareRuntime:
         limits: Optional[SafetyLimits] = None,
     ) -> "MoldAwareRuntime":
         meta = json.loads(Path(meta_path).read_text())
+        field_path = Path(field_path)
+        mold = FixBMoldField(field_path)
+        # r1rel keeps the closest-face field. r4vt uses the smooth sidecar when it exists.
+        if run_type == "r4_world_fixb_tilt":
+            side = field_path.with_name("fixb_smooth_frames.npz")
+            if side.exists():
+                from fixb_smooth_field import SmoothFrameField
+
+                mold = SmoothFrameField(field_path, side)
         return cls(
-            field=FixBMoldField(Path(field_path)),
+            field=mold,
             R_off=np.asarray(meta["R_off"], dtype=np.float64),
             run_type=run_type,
             dry_run=dry_run,
@@ -565,7 +578,7 @@ class MoldAwareRuntime:
             R = np.asarray(q["R"], dtype=np.float64)
             sd = np.asarray(q["sd"], dtype=np.float64).reshape(-1)
             curv = np.asarray(q["curv"], dtype=np.float64)
-        n = R[..., 2]
+        n = self._outward_normal(R)
         self.note_tcp_penetration(sd)
         self.note_measured_mesh_distance(p_meas, x)
         if self._prev_n is not None and self.limits.stop_on_normal_flip:
@@ -821,7 +834,8 @@ class MoldAwareRuntime:
         self.last_clamp_speed = clamp_speed
 
         dt = np.asarray(dt, dtype=np.float64).reshape(H)
-        # First replan queries the TCP. Later replans hold the previous face.
+        # The 5° face hold freezes a smooth fillet, and the labels do not use it.
+        # The 10 mm foot cap still applies inside integrate_tcp_foot.
         dec = integrate_tcp_foot(
             self.field,
             p0,
@@ -830,11 +844,12 @@ class MoldAwareRuntime:
             dt,
             prev_x=self._cmd_foot,
             prev_R=self._cmd_R,
-            hold_face=apply_safety,
+            hold_face=apply_safety and not getattr(self.field, "orientation_z_inward", False),
         )
         R_field = dec["R"]
         x_d = dec["x_d"]
         x_s = dec["x_s"]
+        n_out = dec["n_out"]
         face_held = np.asarray(dec["face_held"], dtype=bool).reshape(H)
         self.last_face_hold = face_held
         if np.any(face_held):
@@ -877,7 +892,7 @@ class MoldAwareRuntime:
 
         if apply_safety and self.limits.enable_tilt_clamp:
             R_d, tilt_hit = _clamp_tilt_to_normal(
-                R_d, R_field[:, :, 2], self.limits.max_tilt_from_normal_deg
+                R_d, n_out, self.limits.max_tilt_from_normal_deg
             )
             self.last_clamp_tilt = tilt_hit
             if np.any(tilt_hit):
@@ -924,7 +939,8 @@ class MoldAwareRuntime:
             "R_d": R_d,
             "x_s": x_s,
             "R_field": R_field,
-            "sd": np.sum((x_d - x_s) * R_field[:, :, 2], axis=1),
+            "n_out": n_out,
+            "sd": np.sum((x_d - x_s) * n_out, axis=1),
             "stiffness": stiff,
             "eoat": eoat,
             "raw": raw,
@@ -939,6 +955,13 @@ class MoldAwareRuntime:
             "face_hold": self.last_face_hold,
             "mesh_jump_hold": self.last_mesh_jump_hold,
         }
+
+    def _outward_normal(self, rotation: np.ndarray) -> np.ndarray:
+        """Column 2 is outward, except on the smooth field where it points into the mold."""
+        n = np.asarray(rotation, dtype=np.float64)[..., 2]
+        if getattr(self.field, "orientation_z_inward", False):
+            return -n
+        return n
 
     def note_commanded_rd(self, rotation: np.ndarray) -> None:
         """Last R_d that was actually scheduled, in the fixture frame."""
@@ -955,7 +978,10 @@ class MoldAwareRuntime:
         """
         x_s = np.asarray(decoded["x_s"], dtype=np.float64)
         r_d = decoded["R_d"]
-        n = np.asarray(decoded["R_field"][..., 2], dtype=np.float64)
+        if "n_out" in decoded:
+            n = np.asarray(decoded["n_out"], dtype=np.float64)
+        else:
+            n = np.asarray(decoded["R_field"][..., 2], dtype=np.float64)
         delta_n = np.asarray(decoded["delta_n"], dtype=np.float64).reshape(-1)
         target = Rp_to_SE3(r_d, x_s)
         vt = Rp_to_SE3(r_d, x_s + delta_n[:, None] * n)

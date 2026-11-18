@@ -32,6 +32,73 @@ from view_oct import decimate_mesh, mesh_payload, rounded, shade_spans, stride_i
 PATH_CAP = 700
 SERIES_CAP = 1200
 COLORS = ("#e74c3c", "#2ecc71", "#f4d03f", "#3498db", "#e67e22")
+EXPORT_ROOT = Path("/mnt/data/umidata/ft/open_loop_exports")
+LABEL_COLOR = "#5dade2"
+PRED_COLOR = "#ff9f1a"
+
+
+def exports_for_checkpoint(ckpt: Path) -> list[Path]:
+    """Export directories whose settings.json names this checkpoint."""
+    want = ckpt.expanduser()
+    try:
+        want_key = str(want.resolve())
+    except OSError:
+        want_key = str(want)
+    found = []
+    if not EXPORT_ROOT.is_dir():
+        return found
+    for settings_path in sorted(EXPORT_ROOT.glob("*/settings.json")):
+        data = json.loads(settings_path.read_text())
+        got = data.get("ckpt")
+        if not got:
+            continue
+        try:
+            got_key = str(Path(got).expanduser().resolve())
+        except OSError:
+            got_key = str(got)
+        if got_key == want_key:
+            found.append(settings_path.parent)
+    return found
+
+
+def prediction_source(blob):
+    """(pos, R, n_valid) for the chunk the toggle draws.
+
+    raw_pos is the full decoded chunk. Older exports stored that full chunk in
+    pred_pos instead, and the 6-step files only have chunk_pos.
+    """
+    if "raw_pos" in blob.files:
+        pos = np.asarray(blob["raw_pos"], dtype=np.float64)
+        rot = _matching_rot(blob, pos, ("raw_R", "pred_R"))
+        return pos, rot, _clipped_count(blob, pos, "n_valid")
+    if "pred_pos" in blob.files:
+        pos = np.asarray(blob["pred_pos"], dtype=np.float64)
+        if pos.ndim == 3 and pos.shape[1] > 1:
+            rot = _matching_rot(blob, pos, ("pred_R",))
+            return pos, rot, _clipped_count(blob, pos, "n_valid")
+    if "chunk_pos" in blob.files:
+        pos = np.asarray(blob["chunk_pos"], dtype=np.float64)
+        rot = _matching_rot(blob, pos, ("chunk_R",))
+        return pos, rot, _clipped_count(blob, pos, "chunk_n")
+    return None, None, None
+
+
+def _clipped_count(blob, pos: np.ndarray, key: str) -> np.ndarray:
+    if key in blob.files:
+        count = np.asarray(blob[key])
+    else:
+        count = np.full(len(pos), pos.shape[1])
+    return np.minimum(count, pos.shape[1])
+
+
+def _matching_rot(blob, pos: np.ndarray, keys: tuple[str, ...]):
+    for key in keys:
+        if key not in blob.files:
+            continue
+        rot = np.asarray(blob[key], dtype=np.float64)
+        if rot.shape[:2] == pos.shape[:2]:
+            return rot
+    return None
 
 
 def mask_spans(times: np.ndarray, mask: np.ndarray) -> list:
@@ -261,8 +328,71 @@ def load_export(path: Path) -> dict:
     return {"dir": path, "settings": settings, "report": report, "episodes": episodes, "label": label}
 
 
+def _replan_indices(rgb, exec_h: int) -> list:
+    rgb = np.asarray(rgb, dtype=np.int64)
+    chosen = []
+    cursor = int(rgb[0]) if len(rgb) else 0
+    for i, value in enumerate(rgb):
+        value = int(value)
+        if value < cursor:
+            continue
+        chosen.append(i)
+        cursor = value + int(exec_h)
+    return chosen
+
+
+def _chunk_lines(pos, n_valid, rgb, horizon: int, full: bool):
+    """One broken polyline of the replanned chunks. full uses every valid step."""
+    pts = []
+    cuts = []
+    for index in _replan_indices(rgb, horizon):
+        n = int(n_valid[index])
+        if not full:
+            n = min(n, int(horizon))
+        if n <= 0:
+            continue
+        pts.append(np.asarray(pos[index, :n], dtype=np.float64))
+        cuts.extend([False] * (n - 1) + [True])
+    if not pts:
+        return [], []
+    if cuts:
+        cuts[-1] = False
+    return rounded(np.concatenate(pts, axis=0), 4), cuts
+
+
 def query_step0(blob, key: str) -> np.ndarray:
     return np.asarray(blob[key])[:, 0]
+
+
+def query_anchor(blob) -> np.ndarray:
+    """Robot sample of each query. That sample's mold_x_s_0 is the label foot."""
+    return ol.query_anchor_index(blob["query_rgb_idx"], blob["robot_time_s"], blob["rgb_time_s"])
+
+
+_DATASETS: dict = {}
+
+
+def mold_normal(dataset: str, episode: int):
+    if dataset not in _DATASETS:
+        import zarr
+
+        _DATASETS[dataset] = zarr.open(dataset, "r")
+    group = _DATASETS[dataset]["data"][f"episode_{episode}"]
+    if "mold_normal_0" not in group:
+        return None
+    return np.asarray(group["mold_normal_0"], dtype=np.float64)
+
+
+def query_region_names(blob, episode: int, dataset: str | None) -> list[str] | None:
+    """Crown / fillet / wall from mold_normal_0 at the query's label foot."""
+    if not dataset or "query_rgb_idx" not in getattr(blob, "files", ()):
+        return None
+    normal = mold_normal(dataset, episode)
+    if normal is None or len(normal) == 0:
+        return None
+    idx = np.minimum(query_anchor(blob), len(normal) - 1)
+    codes = ol.region_code(normal[idx])
+    return [ol.REGION_NAMES[int(code)] for code in codes]
 
 
 def episode_payload(exports: list, episode: int, mesh_t0_ok: bool = True, frames: dict | None = None) -> dict:
@@ -343,8 +473,28 @@ def episode_payload(exports: list, episode: int, mesh_t0_ok: bool = True, frames
                 "error": ol.episode_error_table(
                     *flatten_for_table(blob)
                 ),
+                "exec_horizon": int(exp["settings"].get("execution_horizon") or 6),
+                "horizon_error": _horizon_error(blob, exp),
+                "ckpt": exp["settings"].get("ckpt", ""),
+                "epoch": exp["settings"].get("checkpoint_epoch"),
             }
         )
+        names = query_region_names(blob, episode, exp["settings"].get("dataset"))
+        if names is not None:
+            anchor = np.minimum(query_anchor(blob), len(np.asarray(blob["tcp_xyz"])) - 1)
+            runs[-1]["region"] = names
+            runs[-1]["q_t_all"] = rounded(q_t, 3)
+            runs[-1]["q_xyz"] = rounded(np.asarray(blob["tcp_xyz"], dtype=np.float64)[anchor], 4)
+        pos, _rot, n_valid = prediction_source(blob)
+        if pos is not None and "query_rgb_idx" in blob.files:
+            horizon = runs[-1]["exec_horizon"]
+            rgb = np.asarray(blob["query_rgb_idx"])
+            runs[-1]["pred_exec"], runs[-1]["pred_exec_break"] = _chunk_lines(
+                pos, n_valid, rgb, horizon, False
+            )
+            runs[-1]["pred_full"], runs[-1]["pred_full_break"] = _chunk_lines(
+                pos, n_valid, rgb, horizon, True
+            )
     # Full per-query chunks stay out of this summary. The cursor endpoint loads one.
     payload = {
         "episode": episode,
@@ -406,6 +556,22 @@ def frames_only_payload(frames: dict, episode: int) -> dict:
     return payload
 
 
+def _horizon_error(blob, exp) -> dict:
+    horizon = int(exp["settings"].get("execution_horizon") or 6)
+    pred_pos = np.asarray(blob["raw_pos"]) if "raw_pos" in blob.files else None
+    label_pos = None
+    if pred_pos is not None:
+        label_pos = ol.indexed_positions(blob["tcp_xyz"], blob["action_robot_idx"])
+    return ol.chunk_horizon_errors(
+        blob["pred_action"],
+        blob["label_action"],
+        pred_pos,
+        label_pos,
+        blob["n_valid"],
+        horizon,
+    )
+
+
 def flatten_for_table(blob):
     pred = np.asarray(blob["pred_action"])
     label = np.asarray(blob["label_action"])
@@ -421,7 +587,7 @@ def flatten_for_table(blob):
     )
 
 
-def cursor_payload(exports: list, episode: int, query: int, frames: dict | None = None) -> dict:
+def cursor_payload(exports: list, episode: int, query: int, frames: dict | None = None, span: str = "exec") -> dict:
     out = []
     frame = None
     for exp in exports:
@@ -434,25 +600,41 @@ def cursor_payload(exports: list, episode: int, query: int, frames: dict | None 
             if len(frames[episode]["R_old"]) == len(robot_t):
                 t_abs = float(np.asarray(blob["query_time_s"])[query])
                 frame = frame_at(frames[episode], robot_t, t_abs)
-        if "chunk_pos" in blob.files:
-            n_chunk = int(blob["chunk_n"][query])
-            future = np.asarray(blob["chunk_pos"][query, :n_chunk])
-            press = np.asarray(blob["chunk_pos"][query, 0])
-            rot = np.asarray(blob["chunk_R"][query, 0])
-        else:
-            n_valid = int(blob["n_valid"][query])
-            future = np.asarray(blob["pred_pos"][query, :n_valid])
-            press = np.asarray(blob["pred_pos"][query, 0])
-            rot = np.asarray(blob["pred_R"][query, 0])
-        out.append(
-            {
-                "label": exp["label"],
-                "future": rounded(future, 4),
-                "press": rounded(press, 4),
-                "R": rounded(rot, 4),
-                "t": round(float(blob["query_time_s"][query]) - t0, 3),
-            }
-        )
+        horizon = int(exp["settings"].get("execution_horizon") or 6)
+        pos, rot, n_valid = prediction_source(blob)
+        if pos is None:
+            continue
+        n = int(n_valid[query])
+        if span != "full":
+            n = min(n, horizon)
+        n = int(np.clip(n, 0, pos.shape[1]))
+        if n == 0:
+            continue
+        future = np.asarray(pos[query, :n])
+        future_R = np.asarray(rot[query, :n]) if rot is not None else None
+        label_xyz = None
+        label_R = None
+        if "action_robot_idx" in blob.files:
+            idx = np.asarray(blob["action_robot_idx"][query, :n], dtype=np.int64)
+            known = idx >= 0
+            if "tcp_xyz" in blob.files and np.any(known):
+                label_xyz = np.asarray(blob["tcp_xyz"], dtype=np.float64)[idx[known]]
+            if "tcp_R" in blob.files and np.any(known):
+                label_R = np.asarray(blob["tcp_R"], dtype=np.float64)[idx[known]]
+        item = {
+            "label": exp["label"],
+            "future": rounded(future, 4),
+            "press": rounded(future[0], 4),
+            "R": rounded(future_R[0] if future_R is not None else np.eye(3), 4),
+            "t": round(float(blob["query_time_s"][query]) - t0, 3),
+        }
+        if future_R is not None:
+            item["future_R"] = rounded(future_R, 4)
+        if label_xyz is not None:
+            item["label_xyz"] = rounded(label_xyz, 4)
+        if label_R is not None:
+            item["label_R"] = rounded(label_R, 4)
+        out.append(item)
     if frame is None and frames and episode in frames and not out:
         pack = frames[episode]
         if "robot_time_s" in pack:
@@ -491,9 +673,18 @@ td, th { border:1px solid #333; padding:3px 8px; }
   <span>checkpoint</span><select id="ckpt"></select>
   <span id="toggles"></span>
   <span id="frame_toggles"></span>
+  <button id="spanExec" class="on">6 steps</button>
+  <button id="spanFull">full chunk</button>
+  <span id="spanNote" style="color:#e67e22"></span>
+  <span>region</span>
+  <button id="regAll" class="on">all</button>
+  <button id="regCrown">crown</button>
+  <button id="regFillet">fillet</button>
+  <button id="regWall">wall</button>
   <span>time</span><input id="time" type="range" min="0" max="0" value="0">
   <span id="readout"></span>
 </div>
+<div class="bar" id="ckptpath" style="color:#9ad;font-size:12px;padding-top:0"></div>
 <div id="view3d"></div>
 <div id="plots"></div>
 <table id="summary"></table>
@@ -511,6 +702,9 @@ let data = null;
 let fi = 0;
 let shown = {};
 let shownFrame = {old: true, new: true};
+let span = "exec";
+let regionFilter = "all";
+const REGION_COLOR = {crown: "#2ecc71", fillet: "#f4d03f", wall: "#e74c3c"};
 
 function nearest(times, t) {
   if (!times || !times.length) return 0;
@@ -523,7 +717,7 @@ function nearest(times, t) {
   if (lo > 0 && Math.abs(times[lo - 1] - t) < Math.abs(times[lo] - t)) lo--;
   return lo;
 }
-function span(values) {
+function valueSpan(values) {
   let lo = Infinity, hi = -Infinity;
   for (let i = 0; i < values.length; i++) {
     const v = values[i];
@@ -538,7 +732,7 @@ function sceneBoxFrom(extra) {
   add(data.path);
   (extra || []).forEach(add);
   const pad = 0.05;
-  function rng(a) { const s = span(a); return [s[0] - pad, s[1] + pad]; }
+  function rng(a) { const s = valueSpan(a); return [s[0] - pad, s[1] + pad]; }
   return {x: rng(xs), y: rng(ys), z: rng(zs)};
 }
 function axisLock(title, range) { return {title, range, autorange: false}; }
@@ -633,13 +827,143 @@ function runStyle(i, n) {
   const hue = [25, 140, 200, 280, 0, 170, 320, 50][i % 8];
   return {path: "hsl(" + hue + ",85%,52%)", chunk: "hsl(" + hue + ",95%,64%)", press: "#ffe14a"};
 }
-function scatter(pts, name, color, width, cut) {
-  const x = [], y = [], z = [];
+function scatter(pts, name, color, width, cut, times) {
+  const x = [], y = [], z = [], cd = [];
   for (let i = 0; i < pts.length; i++) {
     x.push(pts[i][0]); y.push(pts[i][1]); z.push(pts[i][2]);
-    if (cut && cut[i]) { x.push(null); y.push(null); z.push(null); }
+    if (times) cd.push(times[i]);
+    if (cut && cut[i]) {
+      x.push(null); y.push(null); z.push(null);
+      if (times) cd.push(null);
+    }
   }
-  return {type: "scatter3d", x, y, z, mode: "lines", name, line: {color, width: width || 4}};
+  const out = {type: "scatter3d", x, y, z, mode: "lines", name, line: {color, width: width || 4}};
+  if (times) out.customdata = cd;
+  return out;
+}
+function axisSegs(origins, Rs, col, scale) {
+  const x = [], y = [], z = [];
+  for (let i = 0; i < origins.length; i++) {
+    const p = origins[i], R = Rs[i];
+    if (!p || !R) continue;
+    x.push(p[0], p[0] + scale * R[0][col], null);
+    y.push(p[1], p[1] + scale * R[1][col], null);
+    z.push(p[2], p[2] + scale * R[2][col], null);
+  }
+  return {x, y, z};
+}
+function axisTrace(seg, name, color, legend) {
+  return {
+    type: "scatter3d", x: seg.x, y: seg.y, z: seg.z, mode: "lines",
+    name, showlegend: !!legend, legendgroup: name,
+    line: {color, width: 4}
+  };
+}
+function pathTriads(d) {
+  const origins = [], Rs = [];
+  for (let i = 0; i < d.path.length; i += 20) {
+    origins.push(d.path[i]);
+    Rs.push(d.tool_R[i]);
+  }
+  return [
+    axisTrace(axisSegs(origins, Rs, 0, 0.014), "label axes", "#5dade2", true),
+    axisTrace(axisSegs(origins, Rs, 2, 0.014), "label axes", "#d6eaf8", false)
+  ];
+}
+function chunkTriads(item) {
+  const every = item.future.length > 12 ? 4 : 1;
+  const out = [];
+  if (item.future_R) {
+    const o = [], r = [];
+    for (let k = 0; k < item.future.length; k += every) {
+      o.push(item.future[k]);
+      r.push(item.future_R[k]);
+    }
+    out.push(axisTrace(axisSegs(o, r, 0, 0.022), "predicted axes", "#ff9f1a", true));
+    out.push(axisTrace(axisSegs(o, r, 2, 0.022), "predicted axes", "#ffe14a", false));
+  }
+  if (item.label_xyz && item.label_R) {
+    const o = [], r = [];
+    for (let k = 0; k < item.label_xyz.length; k += every) {
+      o.push(item.label_xyz[k]);
+      r.push(item.label_R[k]);
+    }
+    out.push(axisTrace(axisSegs(o, r, 0, 0.022), "label axes", "#5dade2", false));
+    out.push(axisTrace(axisSegs(o, r, 2, 0.022), "label axes", "#d6eaf8", false));
+  }
+  return out;
+}
+const FADE = [1, 0.72, 0.42, 0.18];
+function fadedPrediction(pts, cut) {
+  const groups = FADE.map(() => ({x: [], y: [], z: []}));
+  let i = 0;
+  while (i < pts.length) {
+    let j = i;
+    while (j < pts.length && !(cut && cut[j])) j++;
+    const end = Math.min(pts.length, j + 1);
+    const n = end - i;
+    for (let k = 0; k < n; k++) {
+      const b = Math.min(FADE.length - 1, Math.floor(k * FADE.length / n));
+      groups[b].x.push(pts[i + k][0]);
+      groups[b].y.push(pts[i + k][1]);
+      groups[b].z.push(pts[i + k][2]);
+    }
+    groups.forEach(g => { g.x.push(null); g.y.push(null); g.z.push(null); });
+    i = end;
+  }
+  return groups.map((g, b) => ({
+    type: "scatter3d", x: g.x, y: g.y, z: g.z, mode: "lines",
+    name: "prediction", showlegend: b === 0, legendgroup: "prediction",
+    line: {color: "rgba(255,159,26," + FADE[b] + ")", width: 5}
+  }));
+}
+function filteredQueries(run) {
+  const region = (run && run.region) || [];
+  const times = (run && run.q_t_all) || [];
+  const xyz = (run && run.q_xyz) || [];
+  const out = [];
+  for (let i = 0; i < region.length; i++) {
+    if (regionFilter === "all" || region[i] === regionFilter) {
+      out.push({i: i, t: times[i], p: xyz[i], region: region[i]});
+    }
+  }
+  return out;
+}
+function regionMarkers(run) {
+  if (!run || !run.q_xyz || !run.region) return [];
+  const groups = {crown: [], fillet: [], wall: []};
+  run.region.forEach((name, i) => {
+    if (regionFilter !== "all" && name !== regionFilter) return;
+    if (groups[name] && run.q_xyz[i]) groups[name].push(run.q_xyz[i]);
+  });
+  return Object.keys(groups).filter(name => groups[name].length).map(name => ({
+    type: "scatter3d",
+    x: groups[name].map(p => p[0]),
+    y: groups[name].map(p => p[1]),
+    z: groups[name].map(p => p[2]),
+    mode: "markers",
+    name: name,
+    marker: {size: regionFilter === name ? 6 : 3, color: REGION_COLOR[name]}
+  }));
+}
+function selectedRun() {
+  if (!data || !data.runs || !data.runs.length) return null;
+  const name = document.getElementById("ckpt").value;
+  return data.runs.find(r => r.label === name) || data.runs[0];
+}
+function showCheckpoint(run) {
+  const el = document.getElementById("ckptpath");
+  const note = document.getElementById("spanNote");
+  if (!run) {
+    if (el) el.textContent = "";
+    if (note) note.textContent = "";
+    return;
+  }
+  const epoch = run.epoch === null || run.epoch === undefined ? "?" : run.epoch;
+  el.textContent = (run.ckpt || "") + "    epoch " + epoch;
+  const full = run.pred_full || [];
+  const exec = run.pred_exec || [];
+  note.textContent = full.length && full.length === exec.length ? "stored chunk is 6 steps" : "";
 }
 function paintTable(run) {
   const dims = Object.keys(run.error.mae);
@@ -653,6 +977,24 @@ function paintTable(run) {
     });
     html += "</tr>";
   });
+  const h = run.horizon_error;
+  if (h) {
+    const modes = ["all", "near_identity", "return_yaw"];
+    html += "<tr><th>steps</th><th>dim</th>" + modes.map(m => "<th>" + m + "</th>").join("") + "</tr>";
+    ["exec", "full"].forEach(which => {
+      ["position_mm", "delta_n", "delta_R_deg"].forEach(dim => {
+        const row = h[which][dim];
+        if (!row) return;
+        const name = which === "exec" ? ("first " + h.horizon) : "full chunk";
+        html += "<tr><td>" + name + "</td><td>" + dim + "</td>";
+        modes.forEach(m => {
+          const v = row[m];
+          html += "<td>" + (v === null || v === undefined ? "—" : Number(v).toExponential(3)) + "</td>";
+        });
+        html += "</tr>";
+      });
+    });
+  }
   document.getElementById("summary").innerHTML = html;
 }
 async function paintFrameSeries(t) {
@@ -733,18 +1075,42 @@ async function jumpTo(ep, tRel) {
   await paintCursor();
 }
 async function paintCursor() {
-  const t = data.path_t[fi];
-  const qTimes = data.runs[0] ? data.runs[0].q_t : data.path_t;
-  const jLocal = nearest(qTimes, t);
-  let j = jLocal;
-  if (data.path_i) j = data.path_i[Math.min(fi, data.path_i.length - 1)];
-  else if (data.runs[0] && data.runs[0].q_i) j = data.runs[0].q_i[jLocal];
+  const picked0 = selectedRun();
+  const slider = document.getElementById("time");
+  let t, j;
+  if (regionFilter !== "all" && picked0 && picked0.region) {
+    const hits = filteredQueries(picked0);
+    slider.max = Math.max(0, hits.length - 1);
+    fi = Math.max(0, Math.min(fi, Math.max(0, hits.length - 1)));
+    if (!hits.length) {
+      document.getElementById("readout").textContent = "no " + regionFilter + " queries";
+      return;
+    }
+    t = hits[fi].t;
+    j = hits[fi].i;
+  } else {
+    slider.max = Math.max(0, data.path_t.length - 1);
+    fi = Math.max(0, Math.min(fi, data.path_t.length - 1));
+    t = data.path_t[fi];
+    const qTimes = data.runs[0] ? data.runs[0].q_t : data.path_t;
+    const jLocal = nearest(qTimes, t);
+    j = jLocal;
+    if (data.path_i) j = data.path_i[Math.min(fi, data.path_i.length - 1)];
+    else if (data.runs[0] && data.runs[0].q_i) j = data.runs[0].q_i[jLocal];
+  }
   const cam = liveCamera();
-  const cursor = await (await fetch("/api/cursor?ep=" + data.episode + "&q=" + j)).json();
-  const traces = [scatter(data.path, "demo TCP", "#3ec1ff", 5, data.path_break)];
+  const cursor = await (await fetch("/api/cursor?ep=" + data.episode + "&q=" + j + "&span=" + span)).json();
+  const labelPath = scatter(data.path, "label", "#5dade2", 5, data.path_break, data.path_t);
+  labelPath.showlegend = true;
+  labelPath.legendgroup = "label";
+  const traces = [labelPath];
   const p = data.path[nearest(data.path_t, t)];
-  const demoR = data.tool_R[nearest(data.path_t, t)];
-  traces.push(axesAt(p, demoR, "#ffffff", "demo axes"));
+  traces.push({
+    type: "scatter3d", x: [p[0]], y: [p[1]], z: [p[2]], mode: "markers",
+    name: "time", showlegend: false, marker: {size: 7, color: "#ffffff"}
+  });
+  regionMarkers(picked0).forEach(tr => traces.push(tr));
+  if (data.tool_R) pathTriads(data).forEach(tr => traces.push(tr));
   if (data.frames && cursor.frame && shownFrame.old) {
     traces.push(axesAt(cursor.frame.x_old, cursor.frame.R_old, "rgba(255,255,255,0.28)", "old frame", 3));
   }
@@ -770,21 +1136,20 @@ async function paintCursor() {
       marker: {size: 3.5, color: "#e74c3c", symbol: "diamond"}
     });
   }
-  const visible = data.runs.filter(run => shown[run.label] !== false);
-  data.runs.forEach(run => {
-    if (shown[run.label] === false) return;
-    const style = runStyle(visible.indexOf(run), visible.length);
-    traces.push(scatter(run.path, run.label, style.path, 5, run.path_break));
-    const item = (cursor.runs || []).find(r => r.label === run.label);
-    if (!item) return;
-    traces.push(scatter(item.future, run.label + " chunk", style.chunk, 9));
-    traces.push(axesAt(item.future[0], item.R, style.chunk, run.label + " axes"));
-    traces.push({
-      type: "scatter3d", x: [item.press[0]], y: [item.press[1]], z: [item.press[2]],
-      mode: "markers", name: run.label + " press",
-      marker: {size: 9, color: style.press, symbol: "diamond"}
-    });
-  });
+  const picked = selectedRun();
+  showCheckpoint(picked);
+  if (picked && shown[picked.label] !== false) {
+    const pred = span === "full" && picked.pred_full ? picked.pred_full : (picked.pred_exec || picked.path);
+    const predCut = span === "full" && picked.pred_full ? picked.pred_full_break : (picked.pred_exec ? picked.pred_exec_break : picked.path_break);
+    fadedPrediction(pred, predCut).forEach(tr => traces.push(tr));
+    const item = (cursor.runs || []).find(r => r.label === picked.label);
+    if (item) {
+      const chunk = scatter(item.future, "this chunk", "#ffe14a", 8);
+      chunk.showlegend = true;
+      traces.push(chunk);
+      chunkTriads(item).forEach(tr => traces.push(tr));
+    }
+  }
   traces.unshift({
     type: "mesh3d", x: mesh.x, y: mesh.y, z: mesh.z, i: mesh.i, j: mesh.j, k: mesh.k,
     color: "#9aabb6", opacity: 0.45, name: "mold", hoverinfo: "skip", showlegend: false
@@ -797,6 +1162,7 @@ async function paintCursor() {
     document.getElementById("summary").innerHTML = "";
     document.getElementById("readout").textContent = t.toFixed(2) + " s";
     document.getElementById("time").value = fi;
+    bindPicks();
     return;
   }
   const run = data.runs[Math.max(0, data.runs.findIndex(r => r.label === document.getElementById("ckpt").value))];
@@ -866,12 +1232,22 @@ async function paintCursor() {
   }
   await Plotly.react("plots", plots, layout, {responsive: true});
   paintTable(run);
-  document.getElementById("readout").textContent = t.toFixed(2) + " s";
+  let readout = t.toFixed(2) + " s";
+  if (regionFilter !== "all" && picked0 && picked0.region) {
+    const n = filteredQueries(picked0).length;
+    readout = regionFilter + " " + (fi + 1) + "/" + n + " · " + readout;
+  }
+  document.getElementById("readout").textContent = readout;
   document.getElementById("time").value = fi;
+  bindPicks();
 }
 async function show() {
   const episode = document.getElementById("ep").value;
   data = await (await fetch("/api/episode?ep=" + episode)).json();
+  const horizon = data.runs[0] ? data.runs[0].exec_horizon : 6;
+  document.getElementById("spanExec").textContent = horizon + " steps";
+  document.getElementById("spanExec").classList.toggle("on", span === "exec");
+  document.getElementById("spanFull").classList.toggle("on", span === "full");
   document.getElementById("split").textContent = data.split;
   document.getElementById("time").max = Math.max(0, data.path_t.length - 1);
   fi = 0;
@@ -911,6 +1287,37 @@ async function show() {
 document.getElementById("time").oninput = () => { fi = +document.getElementById("time").value; paintCursor(); };
 document.getElementById("ep").onchange = () => show();
 document.getElementById("ckpt").onchange = () => paintCursor();
+function setSpan(next) {
+  span = next;
+  document.getElementById("spanExec").classList.toggle("on", span === "exec");
+  document.getElementById("spanFull").classList.toggle("on", span === "full");
+  if (data) paintCursor();
+}
+document.getElementById("spanExec").onclick = () => setSpan("exec");
+document.getElementById("spanFull").onclick = () => setSpan("full");
+function setRegion(name) {
+  regionFilter = name;
+  document.getElementById("regAll").classList.toggle("on", name === "all");
+  document.getElementById("regCrown").classList.toggle("on", name === "crown");
+  document.getElementById("regFillet").classList.toggle("on", name === "fillet");
+  document.getElementById("regWall").classList.toggle("on", name === "wall");
+  fi = 0;
+  if (data) paintCursor();
+}
+document.getElementById("regAll").onclick = () => setRegion("all");
+document.getElementById("regCrown").onclick = () => setRegion("crown");
+document.getElementById("regFillet").onclick = () => setRegion("fillet");
+document.getElementById("regWall").onclick = () => setRegion("wall");
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+  const tag = ev.target && ev.target.tagName;
+  if (tag === "INPUT" || tag === "SELECT") return;
+  if (!data) return;
+  const slider = document.getElementById("time");
+  fi = Math.max(0, Math.min(+slider.max, fi + (ev.key === "ArrowRight" ? 1 : -1)));
+  slider.value = String(fi);
+  paintCursor();
+});
 (async function init() {
   const meta = await (await fetch("/api/meta")).json();
   mesh = meta.mesh;
@@ -923,6 +1330,26 @@ document.getElementById("ckpt").onchange = () => paintCursor();
   if (meta.switches || meta.nearcap) buildEvents(meta);
   show();
 })();
+function bindPicks() {
+  const plots = document.getElementById("plots");
+  const view = document.getElementById("view3d");
+  if (plots._pick || typeof plots.on !== "function" || typeof view.on !== "function") return;
+  plots._pick = true;
+  plots.on("plotly_click", (ev) => {
+    const t = ev.points && ev.points[0] && ev.points[0].x;
+    if (typeof t !== "number" || !data || !data.path_t) return;
+    fi = nearest(data.path_t, t);
+    document.getElementById("time").value = fi;
+    paintCursor();
+  });
+  view.on("plotly_click", (ev) => {
+    const cd = ev.points && ev.points[0] && ev.points[0].customdata;
+    if (typeof cd !== "number" || !data || !data.path_t) return;
+    fi = nearest(data.path_t, cd);
+    document.getElementById("time").value = fi;
+    paintCursor();
+  });
+}
 </script>
 </body></html>
 """
@@ -986,7 +1413,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(payload).encode(), "application/json")
             return
         if path == "/api/cursor":
-            body = json.dumps(cursor_payload(self.exports, episode, int(args.get("q", "0")), frames=self.frames)).encode()
+            body = json.dumps(cursor_payload(
+                self.exports, episode, int(args.get("q", "0")), frames=self.frames, span=args.get("span", "exec")
+            )).encode()
             self._send(200, body, "application/json")
             return
         self._send(404, b"not found", "text/plain")
@@ -994,16 +1423,39 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--export", type=Path, action="append", required=True)
+    parser.add_argument("--export", type=Path, action="append", default=None)
+    parser.add_argument("--ckpt", type=Path, action="append", default=None,
+                        help="Checkpoint path. Loads every export whose settings.json names it.")
     parser.add_argument("--mesh", type=Path, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--frames_npz", type=Path, default=None)
     args = parser.parse_args()
+    export_paths = list(args.export or [])
+    for ckpt in args.ckpt or []:
+        matched = exports_for_checkpoint(ckpt)
+        if not matched:
+            raise SystemExit(f"no open-loop export for {ckpt}")
+        export_paths.extend(matched)
+    # Keep the first copy when --export and --ckpt name the same directory.
+    seen = set()
+    unique = []
+    for path in export_paths:
+        key = str(path.resolve())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(path)
+    if not unique:
+        raise SystemExit("pass --export or --ckpt")
     field = np.load(args.mesh)
     vertices, faces = decimate_mesh(field["vertices"], field["faces"], field["is_apron"])
     Handler.mesh = mesh_payload(vertices, faces)
-    Handler.exports = [load_export(path) for path in args.export]
+    Handler.exports = [load_export(path) for path in unique]
+    labels = [exp["label"] for exp in Handler.exports]
+    if len(set(labels)) != len(labels):
+        for exp in Handler.exports:
+            exp["label"] = f"{exp['label']} [{exp['dir'].name}]"
     Handler.frames = load_frames_npz(args.frames_npz) if args.frames_npz else None
     if Handler.frames is not None:
         print(f"[view_openloop] frame overlay on episodes {frame_episode_ids(Handler.frames)}", flush=True)

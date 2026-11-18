@@ -249,6 +249,71 @@ def test_face_hold_keeps_frame_and_command_past_five_degrees():
     assert "face_hold" in runtime.last_triggers
 
 
+def test_open_loop_query_lands_on_the_label_foot():
+    """A carried foot must not move query 0. Each raw window re-queries the TCP."""
+    zarr = pytest.importorskip("zarr")
+    smooth = Path(
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/"
+        "r4vt_smooth_frame/acp_replay_buffer.zarr"
+    )
+    meta = Path(
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/shared/fixb_meta.json"
+    )
+    if not smooth.exists() or not FIELD.exists() or not meta.exists():
+        pytest.skip("smooth r4vt zarr or mold field is not on this machine")
+    from export_openloop import decode_raw_motion
+
+    group = zarr.open(str(smooth), "r")["data"]["episode_0"]
+    _tool_r, tcp = pose7_to_Rp(np.asarray(group["ts_pose_fb_0"], dtype=np.float64))
+    foot = np.asarray(group["mold_x_s_0"], dtype=np.float64)
+    robot_t = np.asarray(group["robot_time_stamps_0"], dtype=np.float64).reshape(-1)
+    rgb_t = np.asarray(group["rgb_time_stamps_0"], dtype=np.float64).reshape(-1)
+    # Two windows whose label feet are the fresh TCP query, and far apart.
+    chosen = []
+    runtime = MoldAwareRuntime.from_assets(
+        "r4_world_fixb_tilt",
+        field_path=FIELD,
+        meta_path=meta,
+        dry_run=False,
+        limits=r4_safety_limits(),
+    )
+    for rgb_id in range(0, len(rgb_t), 40):
+        q = int(np.clip(np.searchsorted(robot_t, rgb_t[rgb_id]), 0, len(robot_t) - 1))
+        runtime.release_command_foot()
+        decoded = runtime.decode_chunk(
+            _action(0.0), tcp[q], np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+        )
+        if np.linalg.norm(decoded["x_s"][0] - foot[q]) > 1e-3:
+            continue
+        if chosen and np.linalg.norm(foot[q] - foot[chosen[0]]) < 0.05:
+            continue
+        chosen.append(q)
+        if len(chosen) == 2:
+            break
+    assert len(chosen) == 2
+
+    runtime.decode_chunk(
+        _action(0.0),
+        tcp[chosen[0]] + np.array([0.25, 0.0, 0.0]),
+        np.eye(3),
+        np.array([1.0 / 15.0]),
+        apply_safety=False,
+    )
+    assert np.linalg.norm(runtime._cmd_foot - foot[chosen[0]]) > 0.05
+    preds = np.zeros((2, 1, 27), dtype=np.float64)
+    preds[:, :, 21:27] = EYE6
+    pos, _rot = decode_raw_motion(
+        "r4vt",
+        runtime,
+        preds,
+        tcp[chosen],
+        np.broadcast_to(np.eye(3), (2, 3, 3)).copy(),
+        np.zeros((2, 1)),
+    )
+    err = np.linalg.norm(pos[:, 0] - foot[chosen], axis=1)
+    assert np.all(err < 1e-3), err
+
+
 def test_bench_lift_is_fixture_up():
     lifted = shift_fixture_up(np.array([[1.0, 2.0, 3.0]]), 0.08)
     assert np.allclose(lifted, [[1.0, 1.92, 3.0]])

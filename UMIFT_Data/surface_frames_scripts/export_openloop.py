@@ -33,6 +33,8 @@ EXPORT_ROOT = Path("/mnt/data/umidata/ft/open_loop_exports")
 R4VT_ZARR = DATA_ROOT / "r4vt_world_fixb_tilt" / "acp_replay_buffer.zarr"
 R1REL_ZARR = DATA_ROOT / "r1rel_world" / "acp_replay_buffer.zarr"
 FIELD_NPZ = DATA_ROOT / "shared" / "fixb_field.npz"
+# odom_corr/shared has the field and the smooth sidecar, not fixb_meta.json.
+FIELD_META = DATA_ROOT.parent / "stringer_v3.5_fixb" / "shared" / "fixb_meta.json"
 LONG_DT = DATA_ROOT / "shared" / "long_dt_gt_100ms.npz"
 R4VT_NORMALIZER = (
     SCRIPTS
@@ -238,7 +240,7 @@ def _append_break(parts_break, n_new: int, gap: bool) -> None:
         parts_break.extend([False] * (n_new - 1))
 
 
-def stitch_r4_path(runtime, preds, rgb, p0, R0, qtimes) -> dict:
+def stitch_r4_path(runtime, preds, rgb, p0, R0, qtimes, exec_h: int = EXEC_H) -> dict:
     """Runner loop: push the raw chunk, pop H=6, decode with fixb_decode_dt.
 
     Same call as umift_env_runner for r4vt. dry_run is false. apply_safety
@@ -250,15 +252,16 @@ def stitch_r4_path(runtime, preds, rgb, p0, R0, qtimes) -> dict:
     ens = FixBActionEnsembler(decay_m=DECAY_M)
     k = 0
     pos, rot, times, breaks = [], [], [], []
-    chunk_pos = np.zeros((len(preds), EXEC_H, 3), dtype=np.float64)
-    chunk_R = np.broadcast_to(np.eye(3), (len(preds), EXEC_H, 3, 3)).copy()
+    h = int(exec_h)
+    chunk_pos = np.zeros((len(preds), h, 3), dtype=np.float64)
+    chunk_R = np.broadcast_to(np.eye(3), (len(preds), h, 3, 3)).copy()
     chunk_n = np.zeros(len(preds), dtype=np.int64)
-    for index, gap in replan_rows(rgb):
+    for index, gap in replan_rows(rgb, h):
         if gap:
             ens = FixBActionEnsembler(decay_m=DECAY_M)
             k = 0
-        ens.push(k * EXEC_H, preds[index])
-        blended = ens.pop(EXEC_H)
+        ens.push(k * h, preds[index])
+        blended = ens.pop(h)
         dt = fixb_decode_dt(blended.shape[0], 1, RUNNER_DT_S)
         decoded = runtime.decode_chunk(blended, p0[index], R0[index], dt)
         xyz = np.asarray(decoded["x_d"], dtype=np.float64)
@@ -274,8 +277,8 @@ def stitch_r4_path(runtime, preds, rgb, p0, R0, qtimes) -> dict:
         k += 1
     # Fill non-replan queries with the most recent executed chunk.
     carry_n = 0
-    carry_pos = np.zeros((EXEC_H, 3))
-    carry_R = np.repeat(np.eye(3)[None, :, :], EXEC_H, axis=0)
+    carry_pos = np.zeros((h, 3))
+    carry_R = np.repeat(np.eye(3)[None, :, :], h, axis=0)
     for i in range(len(preds)):
         if chunk_n[i] > 0:
             carry_n = int(chunk_n[i])
@@ -296,7 +299,7 @@ def stitch_r4_path(runtime, preds, rgb, p0, R0, qtimes) -> dict:
     }
 
 
-def stitch_r1_path(preds, p0, R0, rgb, qtimes) -> dict:
+def stitch_r1_path(preds, p0, R0, rgb, qtimes, exec_h: int = EXEC_H) -> dict:
     """r1rel runner: action21_postprocess, then the pose ensembler at H=6."""
     import PyriteUtility.spatial_math.spatial_utilities as su
     from PyriteConfig.tasks.umift.umift_type_conversions import action21_postprocess
@@ -308,10 +311,11 @@ def stitch_r1_path(preds, p0, R0, rgb, qtimes) -> dict:
     ens = make_pose_ensembler(DECAY_M)
     k = 0
     pos, rot, times, breaks = [], [], [], []
-    chunk_pos = np.zeros((len(preds), EXEC_H, 3), dtype=np.float64)
-    chunk_R = np.broadcast_to(np.eye(3), (len(preds), EXEC_H, 3, 3)).copy()
+    h = int(exec_h)
+    chunk_pos = np.zeros((len(preds), h, 3), dtype=np.float64)
+    chunk_R = np.broadcast_to(np.eye(3), (len(preds), h, 3, 3)).copy()
     chunk_n = np.zeros(len(preds), dtype=np.int64)
-    for index, gap in replan_rows(rgb):
+    for index, gap in replan_rows(rgb, h):
         if gap:
             ens = make_pose_ensembler(DECAY_M)
             k = 0
@@ -326,7 +330,7 @@ def stitch_r1_path(preds, p0, R0, rgb, qtimes) -> dict:
             "stiffness": np.asarray(stiff[0], dtype=np.float64).reshape(-1),
             "eoat": None,
         }
-        blended = blend_pose_chunk(ens, k * EXEC_H, fields, EXEC_H)
+        blended = blend_pose_chunk(ens, k * h, fields, h)
         pose = np.asarray(blended["pose7"], dtype=np.float64)
         se3 = su.pose7_to_SE3(pose)
         xyz = pose[:, :3]
@@ -341,8 +345,8 @@ def stitch_r1_path(preds, p0, R0, rgb, qtimes) -> dict:
         chunk_n[index] = len(xyz)
         k += 1
     carry_n = 0
-    carry_pos = np.zeros((EXEC_H, 3))
-    carry_R = np.repeat(np.eye(3)[None, :, :], EXEC_H, axis=0)
+    carry_pos = np.zeros((h, 3))
+    carry_R = np.repeat(np.eye(3)[None, :, :], h, axis=0)
     for i in range(len(preds)):
         if chunk_n[i] > 0:
             carry_n = int(chunk_n[i])
@@ -363,7 +367,52 @@ def stitch_r1_path(preds, p0, R0, rgb, qtimes) -> dict:
     }
 
 
-def export_episode(policy, dataset, stock, device, runtime, episode, split, model_key, tcp, long_idx):
+def decode_raw_motion(role, runtime, preds, anchor_p, anchor_R, times):
+    """Decoded xyz and tool rotation of each raw chunk. Not the ensembled pop.
+
+    Each r4vt window is a fresh TCP query. The stitched path above keeps the
+    commanded foot, the way the live runner does inside one episode.
+    """
+    from scipy.spatial.transform import Rotation
+
+    preds = np.asarray(preds, dtype=np.float64)
+    q, _h, _d = preds.shape
+    pos = np.full((q, _h, 3), np.nan, dtype=np.float64)
+    rot = np.broadcast_to(np.eye(3), (q, _h, 3, 3)).copy()
+    if role == "r4vt":
+        for i in range(q):
+            runtime.release_command_foot()
+            dec = runtime.decode_chunk(
+                preds[i],
+                anchor_p[i],
+                anchor_R[i],
+                ol.integration_dt(times[i]),
+                apply_safety=False,
+            )
+            pos[i] = np.asarray(dec["x_d"], dtype=np.float64)
+            rot[i] = np.asarray(dec["R_d"], dtype=np.float64)
+        return pos, rot
+    import PyriteUtility.spatial_math.spatial_utilities as su
+    from PyriteConfig.tasks.umift.umift_type_conversions import action21_postprocess
+
+    for i in range(q):
+        base = np.eye(4, dtype=np.float64)
+        base[:3, :3] = anchor_R[i]
+        base[:3, 3] = anchor_p[i]
+        command, _vt, _stiff, _eoat = action21_postprocess(preds[i], [base], [0])
+        pose = su.SE3_to_pose7(command[0])
+        pos[i] = pose[:, :3]
+        rot[i] = Rotation.from_quat(pose[:, [4, 5, 6, 3]]).as_matrix()
+    return pos, rot
+
+
+def decode_raw_positions(role, runtime, preds, anchor_p, anchor_R, times) -> np.ndarray:
+    """Decoded xyz of each raw chunk. Not the ensembled pop. (Q, H, 3)."""
+    pos, _rot = decode_raw_motion(role, runtime, preds, anchor_p, anchor_R, times)
+    return pos
+
+
+def export_episode(policy, dataset, stock, device, runtime, episode, split, model_key, tcp, long_idx, exec_h: int = EXEC_H):
     from diffusion_policy.common.sampler_umift import sparse_action_indices_from_rgb_timestamps
 
     horizon = int(dataset.shape_meta["sample"]["action"]["sparse"]["horizon"])
@@ -442,10 +491,15 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
     rgb = np.asarray(rgb_ids, dtype=np.int64)
     anchor_p = np.stack(anchors_p)
     anchor_R = np.stack(anchors_R)
+    times = np.stack(times_rows)
     if model_key == "r4vt":
-        stitched = stitch_r4_path(runtime, preds, rgb, anchor_p, anchor_R, qtime)
+        # The runner resets at episode start. A shared runtime must not carry
+        # the previous episode's foot into this stitch.
+        runtime.reset()
+        stitched = stitch_r4_path(runtime, preds, rgb, anchor_p, anchor_R, qtime, exec_h)
     else:
-        stitched = stitch_r1_path(preds, anchor_p, anchor_R, rgb, qtime)
+        stitched = stitch_r1_path(preds, anchor_p, anchor_R, rgb, qtime, exec_h)
+    raw_pos, raw_R = decode_raw_motion(model_key, runtime, stacked_p, anchor_p, anchor_R, times)
     return {
         "split": split,
         "query_rgb_idx": rgb,
@@ -463,7 +517,9 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
         "chunk_pos": stitched["chunk_pos"],
         "chunk_R": stitched["chunk_R"],
         "chunk_n": stitched["chunk_n"],
-        "action_time_s": np.stack(times_rows),
+        "raw_pos": raw_pos,
+        "raw_R": raw_R,
+        "action_time_s": times,
         "action_robot_idx": np.stack(idx_rows),
         "force_n": np.stack(force_rows),
         "bad_span": np.stack(bad_rows),
@@ -527,9 +583,22 @@ def main(argv=None) -> int:
     parser.add_argument("--val-loss", type=float, required=True)
     parser.add_argument("--dataset", type=Path, default=None)
     parser.add_argument("--normalizer", type=Path, default=None)
+    parser.add_argument(
+        "--field",
+        type=Path,
+        default=None,
+        help="Mold field npz. Default is shared/fixb_field.npz, which loads the smooth sidecar when it sits beside the field.",
+    )
     parser.add_argument("--out", type=Path, default=None)
     parser.add_argument("--checkpoint-epoch", type=int, default=None)
     parser.add_argument("--episodes", type=int, nargs="*", default=None)
+    parser.add_argument(
+        "--all-train",
+        action="store_true",
+        help="Export every training episode plus the first --held-out validation episodes.",
+    )
+    parser.add_argument("--held-out", type=int, default=3)
+    parser.add_argument("--exec-horizon", type=int, default=EXEC_H)
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
 
@@ -542,7 +611,8 @@ def main(argv=None) -> int:
     else:
         dataset_path = args.dataset or R1REL_ZARR
         normalizer = args.normalizer or R1REL_NORMALIZER
-    for path in (dataset_path, normalizer, FIELD_NPZ, LONG_DT):
+    field_npz = (args.field or FIELD_NPZ).resolve()
+    for path in (dataset_path, normalizer, field_npz, LONG_DT):
         if not path.exists():
             raise SystemExit(f"missing {path}")
 
@@ -556,7 +626,8 @@ def main(argv=None) -> int:
         decode = (
             "FixBActionEnsembler pop 6; "
             "fixb_decode_dt(down_sample_steps=1, raw_time_step_s=1/15); "
-            "MoldAwareRuntime.decode_chunk dry_run=False r4_safety_limits"
+            "MoldAwareRuntime.from_assets decode_chunk dry_run=False r4_safety_limits; "
+            "smooth sidecar when fixb_smooth_frames.npz is beside the field"
         )
     else:
         decode = "action21_postprocess then blend_pose_chunk H=6 decay_m=0.01"
@@ -566,7 +637,7 @@ def main(argv=None) -> int:
         "ckpt_sha256": digest,
         "checkpoint_epoch": epoch,
         "val_loss": float(args.val_loss),
-        "execution_horizon": EXEC_H,
+        "execution_horizon": int(args.exec_horizon),
         "dry_run": False,
         "decode": decode,
         "mae": "label space on the raw predicted chunk, not the blended pose",
@@ -574,7 +645,7 @@ def main(argv=None) -> int:
         "dataset": str(dataset_path),
         "normalizer": str(normalizer),
         "normalizer_sha256": sha256_file(normalizer),
-        "field": str(FIELD_NPZ),
+        "field": str(field_npz),
         "long_dt": str(LONG_DT),
         "contact_n": ol.CONTACT_N,
     }
@@ -588,24 +659,35 @@ def main(argv=None) -> int:
     point_dataset(cfg, dataset_path, normalizer, out)
     print(f"building dataset {dataset_path}", flush=True)
     train_ds, val_ds = build_datasets(cfg)
-    if args.episodes:
+    if args.all_train:
+        train_ids = sorted({int(epi) for epi, _rgb in train_ds.sampler.indices})
+        val_ids = sorted({int(epi) for epi, _rgb in val_ds.sampler.indices})
+        held = val_ids[: max(0, int(args.held_out))]
+        chosen = [(ep, "train") for ep in train_ids] + [(ep, "val") for ep in held]
+    elif args.episodes:
         chosen = [(int(ep), None) for ep in args.episodes]
     else:
+        # One training episode and one validation episode. That is why an
+        # export with no --episodes flag only contains episodes 0 and 9.
         chosen = [(lowest_episode(train_ds), "train"), (lowest_episode(val_ds), "val")]
 
     from fixb_field import FixBMoldField
     from mold_aware_runtime import MoldAwareRuntime, r4_safety_limits
 
-    field = FixBMoldField(FIELD_NPZ)
     runtime = None
     if args.role == "r4vt":
-        runtime = MoldAwareRuntime(
-            field=field,
-            R_off=np.eye(3),
-            run_type="r4_world_fixb_tilt",
+        # Sidecar loads only for this run type. r1rel stays on the closest-face field.
+        runtime = MoldAwareRuntime.from_assets(
+            "r4_world_fixb_tilt",
+            field_path=field_npz,
+            meta_path=FIELD_META,
             dry_run=False,
             limits=r4_safety_limits(0.020, 90.0),
         )
+        field = runtime.field
+    else:
+        field = FixBMoldField(field_npz)
+    print(f"field {type(field).__name__} {field_npz}", flush=True)
     long_sets = long_dt_sets(LONG_DT)
     report_eps = []
     for episode, hinted in chosen:
@@ -632,16 +714,26 @@ def main(argv=None) -> int:
             args.role,
             tcp,
             long_sets.get(episode, set()),
+            args.exec_horizon,
         )
         flat = flat_valid(blob)
         table = ol.episode_error_table(
             flat["pred"], flat["label"], flat["force_n"], flat["bad_span"], flat["long_dt"], flat["valid"]
+        )
+        horizon_error = ol.chunk_horizon_errors(
+            blob["pred_action"],
+            blob["label_action"],
+            blob["raw_pos"],
+            ol.indexed_positions(blob["tcp_xyz"], blob["action_robot_idx"]),
+            blob["n_valid"],
+            args.exec_horizon,
         )
         row = {
             "episode": episode,
             "split": split,
             "n_queries": int(len(blob["query_rgb_idx"])),
             "error": table,
+            "horizon_error": horizon_error,
         }
         if args.role == "r4vt":
             row["tangential_vt_offset_m"] = vt_offset_for_episode(episode)
