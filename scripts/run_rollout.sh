@@ -55,7 +55,7 @@ done
 
 case "$arm" in
   r4vt)
-    export UMIFT_CKPT_PATH="/oct_v35_h4s_odom_r4vt/checkpoints/epoch=0185-train_loss=0.011.ckpt"
+    export UMIFT_CKPT_PATH="/oct_v35_h4s_r4vt_frame_continuity_causal/oct-v35-h4s-r4vt-causal_e100_bs64_valtopk_43308311/checkpoints/epoch=0030-val_loss=0.032.ckpt"
     ;;
   r1rel)
     export UMIFT_CKPT_PATH="/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt"
