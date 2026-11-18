@@ -380,6 +380,8 @@ def decode_raw_motion(role, runtime, preds, anchor_p, anchor_R, times):
     pos = np.full((q, _h, 3), np.nan, dtype=np.float64)
     rot = np.broadcast_to(np.eye(3), (q, _h, 3, 3)).copy()
     if role == "r4vt":
+        foot = np.full((q, _h, 3), np.nan, dtype=np.float64)
+        normal = np.full((q, _h, 3), np.nan, dtype=np.float64)
         for i in range(q):
             runtime.release_command_foot()
             dec = runtime.decode_chunk(
@@ -391,7 +393,9 @@ def decode_raw_motion(role, runtime, preds, anchor_p, anchor_R, times):
             )
             pos[i] = np.asarray(dec["x_d"], dtype=np.float64)
             rot[i] = np.asarray(dec["R_d"], dtype=np.float64)
-        return pos, rot
+            foot[i] = np.asarray(dec["x_s"], dtype=np.float64)
+            normal[i] = np.asarray(dec["n_out"], dtype=np.float64)
+        return pos, rot, foot, normal
     import PyriteUtility.spatial_math.spatial_utilities as su
     from PyriteConfig.tasks.umift.umift_type_conversions import action21_postprocess
 
@@ -403,16 +407,16 @@ def decode_raw_motion(role, runtime, preds, anchor_p, anchor_R, times):
         pose = su.SE3_to_pose7(command[0])
         pos[i] = pose[:, :3]
         rot[i] = Rotation.from_quat(pose[:, [4, 5, 6, 3]]).as_matrix()
-    return pos, rot
+    return pos, rot, None, None
 
 
 def decode_raw_positions(role, runtime, preds, anchor_p, anchor_R, times) -> np.ndarray:
     """Decoded xyz of each raw chunk. Not the ensembled pop. (Q, H, 3)."""
-    pos, _rot = decode_raw_motion(role, runtime, preds, anchor_p, anchor_R, times)
+    pos, _rot, _foot, _normal = decode_raw_motion(role, runtime, preds, anchor_p, anchor_R, times)
     return pos
 
 
-def export_episode(policy, dataset, stock, device, runtime, episode, split, model_key, tcp, long_idx, exec_h: int = EXEC_H):
+def export_episode(policy, dataset, stock, device, runtime, episode, split, model_key, tcp, long_idx, exec_h: int = EXEC_H, query_stride: int = 1):
     from diffusion_policy.common.sampler_umift import sparse_action_indices_from_rgb_timestamps
 
     horizon = int(dataset.shape_meta["sample"]["action"]["sparse"]["horizon"])
@@ -422,6 +426,10 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
         for i, (epi, rgb) in enumerate(dataset.sampler.indices)
         if int(epi) == int(episode)
     ]
+    queries = sorted(queries, key=lambda item: item[1])
+    query_stride = max(1, int(query_stride))
+    if query_stride > 1:
+        queries = queries[::query_stride]
     if not queries:
         raise SystemExit(f"episode {episode} has no {split} queries")
 
@@ -499,8 +507,8 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
         stitched = stitch_r4_path(runtime, preds, rgb, anchor_p, anchor_R, qtime, exec_h)
     else:
         stitched = stitch_r1_path(preds, anchor_p, anchor_R, rgb, qtime, exec_h)
-    raw_pos, raw_R = decode_raw_motion(model_key, runtime, stacked_p, anchor_p, anchor_R, times)
-    return {
+    raw_pos, raw_R, raw_foot, raw_n = decode_raw_motion(model_key, runtime, stacked_p, anchor_p, anchor_R, times)
+    out = {
         "split": split,
         "query_rgb_idx": rgb,
         "query_time_s": qtime,
@@ -532,6 +540,10 @@ def export_episode(policy, dataset, stock, device, runtime, episode, split, mode
         "force_series": np.linalg.norm(tcp["wrench"][:, :3], axis=1),
         "bad_robot": tcp["bad"],
     }
+    if raw_foot is not None:
+        out["raw_foot"] = raw_foot
+        out["raw_n"] = raw_n
+    return out
 
 
 def flat_valid(blob) -> dict:
@@ -599,6 +611,12 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--held-out", type=int, default=3)
     parser.add_argument("--exec-horizon", type=int, default=EXEC_H)
+    parser.add_argument(
+        "--query-stride",
+        type=int,
+        default=1,
+        help="Keep every Nth query in time order. 4 runs about a quarter of the queries.",
+    )
     parser.add_argument("--device", default="cuda")
     args = parser.parse_args(argv)
 
@@ -638,6 +656,7 @@ def main(argv=None) -> int:
         "checkpoint_epoch": epoch,
         "val_loss": float(args.val_loss),
         "execution_horizon": int(args.exec_horizon),
+        "query_stride": max(1, int(args.query_stride)),
         "dry_run": False,
         "decode": decode,
         "mae": "label space on the raw predicted chunk, not the blended pose",
@@ -715,6 +734,7 @@ def main(argv=None) -> int:
             tcp,
             long_sets.get(episode, set()),
             args.exec_horizon,
+            args.query_stride,
         )
         flat = flat_valid(blob)
         table = ol.episode_error_table(

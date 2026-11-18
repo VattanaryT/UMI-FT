@@ -302,7 +302,7 @@ def test_open_loop_query_lands_on_the_label_foot():
     assert np.linalg.norm(runtime._cmd_foot - foot[chosen[0]]) > 0.05
     preds = np.zeros((2, 1, 27), dtype=np.float64)
     preds[:, :, 21:27] = EYE6
-    pos, _rot = decode_raw_motion(
+    pos, _rot, _foot, _normal = decode_raw_motion(
         "r4vt",
         runtime,
         preds,

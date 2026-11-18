@@ -118,10 +118,16 @@ def mask_spans(times: np.ndarray, mask: np.ndarray) -> list:
 
 
 def checkpoint_label(settings: dict, fallback: str) -> str:
-    """r4vt ep185 (val 0.079) from the export settings."""
+    """r4vt ep185 (val 0.079) from the export settings.
+
+    r1rel predicts the tool pose. r4vt predicts foot velocity, δn, and ΔR,
+    and the 3D point drawn for it is the virtual target.
+    """
     role = settings.get("role") or fallback
     epoch = settings.get("checkpoint_epoch")
     text = str(role) if epoch is None else f"{role} ep{int(epoch)}"
+    if role == "r1rel":
+        text = f"{text} tool pose"
     val = settings.get("val_loss")
     if val is None:
         return text
@@ -372,15 +378,233 @@ def query_anchor(blob) -> np.ndarray:
 _DATASETS: dict = {}
 
 
-def mold_normal(dataset: str, episode: int):
+def _dataset_group(dataset: str, episode: int):
     if dataset not in _DATASETS:
         import zarr
 
         _DATASETS[dataset] = zarr.open(dataset, "r")
-    group = _DATASETS[dataset]["data"][f"episode_{episode}"]
+    return _DATASETS[dataset]["data"][f"episode_{episode}"]
+
+
+def mold_normal(dataset: str, episode: int):
+    group = _dataset_group(dataset, episode)
     if "mold_normal_0" not in group:
         return None
     return np.asarray(group["mold_normal_0"], dtype=np.float64)
+
+
+def mold_foot_normal(dataset: str, episode: int):
+    """Label foot and the normal δn was measured along. mold_normal_0 is that axis."""
+    group = _dataset_group(dataset, episode)
+    if "mold_x_s_0" not in group or "mold_normal_0" not in group:
+        return None
+    foot = np.asarray(group["mold_x_s_0"], dtype=np.float64).reshape(-1, 3)
+    normal = np.asarray(group["mold_normal_0"], dtype=np.float64).reshape(-1, 3)
+    if len(foot) == 0 or len(foot) != len(normal):
+        return None
+    return foot, normal
+
+
+def label_virtual_target(foot, normal, delta_n) -> np.ndarray:
+    """Foot plus δn along the stored normal. This is the same point as decoded x_d."""
+    delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
+    return np.asarray(foot, dtype=np.float64) + delta_n[:, None] * np.asarray(normal, dtype=np.float64)
+
+
+def query_label_vt(blob, dataset: str | None, episode: int, query: int | None = None, n: int | None = None):
+    """Label virtual target. One step-0 point per query, or the first n steps of one query."""
+    if not dataset or "label_action" not in getattr(blob, "files", ()) or "action_robot_idx" not in blob.files:
+        return None
+    label = np.asarray(blob["label_action"], dtype=np.float64)
+    if label.shape[-1] < 3:
+        return None
+    pair = mold_foot_normal(dataset, episode)
+    if pair is None:
+        return None
+    foot, normal = pair
+    idx = np.asarray(blob["action_robot_idx"], dtype=np.int64)
+    dn = label[..., 2]
+    if query is None:
+        idx = idx[:, 0]
+        dn = dn[:, 0]
+    else:
+        n = int(idx.shape[1] if n is None else n)
+        idx = idx[query, :n]
+        dn = dn[query, :n]
+    known = (idx >= 0) & (idx < len(foot))
+    out = np.full((len(idx), 3), np.nan, dtype=np.float64)
+    if np.any(known):
+        out[known] = label_virtual_target(foot[idx[known]], normal[idx[known]], dn[known])
+    return out
+
+
+def _points_or_null(xyz) -> list:
+    rows = []
+    for row in np.asarray(xyz, dtype=np.float64).reshape(-1, 3):
+        if np.all(np.isfinite(row)):
+            rows.append([round(float(v), 4) for v in row])
+        else:
+            rows.append(None)
+    return rows
+
+
+def _dn_list(values) -> list:
+    out = []
+    for value in np.asarray(values, dtype=np.float64).reshape(-1):
+        out.append(None if not np.isfinite(value) else round(float(value), 4))
+    return out
+
+
+def table_keep(times, settings: dict) -> np.ndarray:
+    """Queries for the comparison tables.
+
+    An export that already kept every 4th query is used as stored. A full
+    export is reduced to every 4th query in time order.
+    """
+    order = np.argsort(np.asarray(times, dtype=np.float64), kind="mergesort")
+    stored = int(settings.get("query_stride") or 1)
+    step = 1 if stored >= 4 else 4
+    return order[::step]
+
+
+def prediction_feet(blob, export_dir: Path, episode: int):
+    if "raw_foot" in getattr(blob, "files", ()) and "raw_n" in blob.files:
+        return (
+            np.asarray(blob["raw_foot"], dtype=np.float64),
+            np.asarray(blob["raw_n"], dtype=np.float64),
+        )
+    side = export_dir.parent / f"{export_dir.name}_feet" / f"episode_{episode}.npz"
+    if side.is_file():
+        extra = np.load(side)
+        if "raw_foot" in extra.files and "raw_n" in extra.files:
+            return (
+                np.asarray(extra["raw_foot"], dtype=np.float64),
+                np.asarray(extra["raw_n"], dtype=np.float64),
+            )
+    return None, None
+
+
+def _label_feet(blob, dataset: str | None, episode: int, query: int | None = None, n: int | None = None):
+    if not dataset or "action_robot_idx" not in getattr(blob, "files", ()):
+        return None, None, None
+    label = np.asarray(blob["label_action"], dtype=np.float64)
+    if label.shape[-1] < 3:
+        return None, None, None
+    pair = mold_foot_normal(dataset, episode)
+    if pair is None:
+        return None, None, None
+    foot, normal = pair
+    idx = np.asarray(blob["action_robot_idx"], dtype=np.int64)
+    dn = label[..., 2]
+    if query is None:
+        idx, dn = idx[:, 0], dn[:, 0]
+    else:
+        n = int(idx.shape[1] if n is None else n)
+        idx, dn = idx[query, :n], dn[query, :n]
+    known = (idx >= 0) & (idx < len(foot))
+    out_f = np.full((len(idx), 3), np.nan, dtype=np.float64)
+    out_n = np.full((len(idx), 3), np.nan, dtype=np.float64)
+    if np.any(known):
+        out_f[known] = foot[idx[known]]
+        out_n[known] = normal[idx[known]]
+    return out_f, out_n, dn
+
+
+def foot_path_breaks(rgb, bad) -> np.ndarray:
+    """True where the segment to the next query should not be drawn.
+
+    A break is a bad_span_0 sample on either query, or a gap larger than the
+    usual spacing between stored queries.
+    """
+    rgb = np.asarray(rgb, dtype=np.int64).reshape(-1)
+    bad = np.asarray(bad, dtype=bool).reshape(-1)
+    cut = np.zeros(len(rgb), dtype=bool)
+    if len(rgb) < 2:
+        return cut
+    step = np.diff(rgb)
+    positive = step[step > 0]
+    typical = int(np.median(positive)) if positive.size else 1
+    cut[:-1] = (step > typical) | bad[:-1] | bad[1:]
+    return cut
+
+
+def _attach_feet(run: dict, blob, exp: dict, episode: int) -> None:
+    if exp["settings"].get("role") != "r4vt":
+        return
+    dataset = exp["settings"].get("dataset")
+    pred_foot, pred_n = prediction_feet(blob, exp["dir"], episode)
+    if pred_foot is not None:
+        run["pred_foot"] = _points_or_null(pred_foot[:, 0])
+        run["pred_n"] = _points_or_null(pred_n[:, 0])
+        run["pred_dn"] = _dn_list(np.asarray(blob["pred_action"])[:, 0, 2])
+    label_foot, label_n, label_dn = _label_feet(blob, dataset, episode)
+    if label_foot is not None:
+        run["label_foot"] = _points_or_null(label_foot)
+        run["label_n"] = _points_or_null(label_n)
+        run["label_dn"] = _dn_list(label_dn)
+    if "query_rgb_idx" in blob.files and "bad_span" in blob.files:
+        run["foot_break"] = [bool(v) for v in foot_path_breaks(blob["query_rgb_idx"], np.asarray(blob["bad_span"])[:, 0])]
+
+
+def _attach_chunk_feet(item: dict, blob, exp: dict, episode: int, query: int, n: int) -> None:
+    if exp["settings"].get("role") != "r4vt":
+        return
+    pred_foot, pred_n = prediction_feet(blob, exp["dir"], episode)
+    if pred_foot is not None:
+        item["pred_foot"] = _points_or_null(pred_foot[query, :n])
+        item["pred_n"] = _points_or_null(pred_n[query, :n])
+        item["pred_dn"] = _dn_list(np.asarray(blob["pred_action"][query, :n, 2]))
+    label_foot, label_n, label_dn = _label_feet(blob, exp["settings"].get("dataset"), episode, query, n)
+    if label_foot is not None:
+        item["label_foot"] = _points_or_null(label_foot)
+        item["label_n"] = _points_or_null(label_n)
+        item["label_dn"] = _dn_list(label_dn)
+
+
+def _yaw_about_normal(action) -> np.ndarray:
+    from mold_aware_runtime import rot6d_rows_to_R
+
+    rotation = rot6d_rows_to_R(np.asarray(action, dtype=np.float64)[..., 21:27])
+    return np.degrees(np.arctan2(rotation[..., 1, 0], rotation[..., 0, 0]))
+
+
+def _attach_region_yaw(run: dict, blob, exp: dict, episode: int) -> None:
+    """Region δn/ΔR and the yaw-gap fraction, on the stride-4 query set."""
+    if exp["settings"].get("role") != "r4vt" or "pred_action" not in blob.files:
+        return
+    dataset = exp["settings"].get("dataset")
+    if not dataset:
+        return
+    pred = np.asarray(blob["pred_action"], dtype=np.float64)
+    if pred.shape[-1] < 27:
+        return
+    keep = table_keep(blob["query_time_s"], exp["settings"])
+    normal = mold_normal(dataset, episode)
+    if normal is None:
+        return
+    anchor = np.minimum(query_anchor(blob)[keep], len(normal) - 1)
+    region = ol.region_code(normal[anchor])
+    label = np.asarray(blob["label_action"], dtype=np.float64)[keep]
+    kept_pred = pred[keep]
+    n_valid = np.asarray(blob["n_valid"])[keep]
+    horizon = int(exp["settings"].get("execution_horizon") or 6)
+    run["region_error"] = ol.region_action_errors(kept_pred, label, n_valid, region, horizon)
+    run["table_queries"] = int(len(keep))
+    yaw = _yaw_about_normal(kept_pred[:, 0])
+    gap = (np.abs(yaw) >= 45.0) & (np.abs(yaw) <= 135.0)
+    by_region = {}
+    for code, name in enumerate(ol.REGION_NAMES):
+        mask = region == code
+        by_region[name] = {
+            "n": int(mask.sum()),
+            "gap": int(np.sum(gap & mask)),
+        }
+    run["yaw_gap"] = {
+        "n": int(len(yaw)),
+        "gap": int(gap.sum()),
+        "frac": float(gap.mean()) if len(yaw) else None,
+        "by_region": by_region,
+    }
 
 
 def query_region_names(blob, episode: int, dataset: str | None) -> list[str] | None:
@@ -477,8 +701,11 @@ def episode_payload(exports: list, episode: int, mesh_t0_ok: bool = True, frames
                 "horizon_error": _horizon_error(blob, exp),
                 "ckpt": exp["settings"].get("ckpt", ""),
                 "epoch": exp["settings"].get("checkpoint_epoch"),
+                "query_stride": int(exp["settings"].get("query_stride") or 1),
             }
         )
+        _attach_feet(runs[-1], blob, exp, episode)
+        _attach_region_yaw(runs[-1], blob, exp, episode)
         names = query_region_names(blob, episode, exp["settings"].get("dataset"))
         if names is not None:
             anchor = np.minimum(query_anchor(blob), len(np.asarray(blob["tcp_xyz"])) - 1)
@@ -634,6 +861,7 @@ def cursor_payload(exports: list, episode: int, query: int, frames: dict | None 
             item["label_xyz"] = rounded(label_xyz, 4)
         if label_R is not None:
             item["label_R"] = rounded(label_R, 4)
+        _attach_chunk_feet(item, blob, exp, episode, query, n)
         out.append(item)
     if frame is None and frames and episode in frames and not out:
         pack = frames[episode]
@@ -681,6 +909,9 @@ td, th { border:1px solid #333; padding:3px 8px; }
   <button id="regCrown">crown</button>
   <button id="regFillet">fillet</button>
   <button id="regWall">wall</button>
+  <button id="geomFoot" class="on">foot + δn</button>
+  <button id="geomPoint">virtual target</button>
+  <button id="onlySel" class="on">only selected</button>
   <span>time</span><input id="time" type="range" min="0" max="0" value="0">
   <span id="readout"></span>
 </div>
@@ -704,6 +935,9 @@ let shown = {};
 let shownFrame = {old: true, new: true};
 let span = "exec";
 let regionFilter = "all";
+let geomMode = "foot";
+let selectedLabel = "";
+let onlySelected = true;
 const REGION_COLOR = {crown: "#2ecc71", fillet: "#f4d03f", wall: "#e74c3c"};
 
 function nearest(times, t) {
@@ -827,6 +1061,36 @@ function runStyle(i, n) {
   const hue = [25, 140, 200, 280, 0, 170, 320, 50][i % 8];
   return {path: "hsl(" + hue + ",85%,52%)", chunk: "hsl(" + hue + ",95%,64%)", press: "#ffe14a"};
 }
+function dnSegments(feet, normals, dn, name, color, width) {
+  const x = [], y = [], z = [];
+  const n = Math.min(feet ? feet.length : 0, normals ? normals.length : 0, dn ? dn.length : 0);
+  for (let i = 0; i < n; i++) {
+    const f = feet[i], v = normals[i], d = dn[i];
+    if (!f || !v || d === null || d === undefined) continue;
+    x.push(f[0], f[0] + d * v[0], null);
+    y.push(f[1], f[1] + d * v[1], null);
+    z.push(f[2], f[2] + d * v[2], null);
+  }
+  return {
+    type: "scatter3d", x, y, z, mode: "lines", name,
+    showlegend: true, legendgroup: name,
+    line: {color, width: width || 3}
+  };
+}
+function scatterNullable(pts, name, color, width, cut) {
+  const x = [], y = [], z = [];
+  for (let i = 0; i < pts.length; i++) {
+    const p = pts[i];
+    if (!p) { x.push(null); y.push(null); z.push(null); continue; }
+    x.push(p[0]); y.push(p[1]); z.push(p[2]);
+    if (cut && cut[i]) { x.push(null); y.push(null); z.push(null); }
+  }
+  return {
+    type: "scatter3d", x, y, z, mode: "lines", name,
+    showlegend: true, legendgroup: name,
+    line: {color, width: width || 4}
+  };
+}
 function scatter(pts, name, color, width, cut, times) {
   const x = [], y = [], z = [], cd = [];
   for (let i = 0; i < pts.length; i++) {
@@ -866,8 +1130,8 @@ function pathTriads(d) {
     Rs.push(d.tool_R[i]);
   }
   return [
-    axisTrace(axisSegs(origins, Rs, 0, 0.014), "label axes", "#5dade2", true),
-    axisTrace(axisSegs(origins, Rs, 2, 0.014), "label axes", "#d6eaf8", false)
+    axisTrace(axisSegs(origins, Rs, 0, 0.014), "label axes", "#4aa3ff", true),
+    axisTrace(axisSegs(origins, Rs, 2, 0.014), "label axes", "#3ddc97", false)
   ];
 }
 function chunkTriads(item) {
@@ -879,8 +1143,8 @@ function chunkTriads(item) {
       o.push(item.future[k]);
       r.push(item.future_R[k]);
     }
-    out.push(axisTrace(axisSegs(o, r, 0, 0.022), "predicted axes", "#ff9f1a", true));
-    out.push(axisTrace(axisSegs(o, r, 2, 0.022), "predicted axes", "#ffe14a", false));
+    out.push(axisTrace(axisSegs(o, r, 0, 0.022), "predicted axes", "#ff4d6a", true));
+    out.push(axisTrace(axisSegs(o, r, 2, 0.022), "predicted axes", "#ffd23f", false));
   }
   if (item.label_xyz && item.label_R) {
     const o = [], r = [];
@@ -888,8 +1152,8 @@ function chunkTriads(item) {
       o.push(item.label_xyz[k]);
       r.push(item.label_R[k]);
     }
-    out.push(axisTrace(axisSegs(o, r, 0, 0.022), "label axes", "#5dade2", false));
-    out.push(axisTrace(axisSegs(o, r, 2, 0.022), "label axes", "#d6eaf8", false));
+    out.push(axisTrace(axisSegs(o, r, 0, 0.022), "label axes", "#4aa3ff", false));
+    out.push(axisTrace(axisSegs(o, r, 2, 0.022), "label axes", "#3ddc97", false));
   }
   return out;
 }
@@ -914,7 +1178,7 @@ function fadedPrediction(pts, cut) {
   return groups.map((g, b) => ({
     type: "scatter3d", x: g.x, y: g.y, z: g.z, mode: "lines",
     name: "prediction", showlegend: b === 0, legendgroup: "prediction",
-    line: {color: "rgba(255,159,26," + FADE[b] + ")", width: 5}
+    line: {color: "rgba(255,77,106," + FADE[b] + ")", width: 5}
   }));
 }
 function filteredQueries(run) {
@@ -948,8 +1212,17 @@ function regionMarkers(run) {
 }
 function selectedRun() {
   if (!data || !data.runs || !data.runs.length) return null;
-  const name = document.getElementById("ckpt").value;
+  const name = selectedLabel || document.getElementById("ckpt").value;
   return data.runs.find(r => r.label === name) || data.runs[0];
+}
+function visibleRuns() {
+  if (!data || !data.runs) return [];
+  const picked = selectedRun();
+  if (onlySelected) {
+    if (!picked || shown[picked.label] === false) return [];
+    return [picked];
+  }
+  return data.runs.filter(r => shown[r.label] !== false);
 }
 function showCheckpoint(run) {
   const el = document.getElementById("ckptpath");
@@ -960,7 +1233,9 @@ function showCheckpoint(run) {
     return;
   }
   const epoch = run.epoch === null || run.epoch === undefined ? "?" : run.epoch;
-  el.textContent = (run.ckpt || "") + "    epoch " + epoch;
+  const kind = run.role === "r1rel" ? "    tool pose" : "";
+  const stride = run.query_stride > 1 ? "    every " + run.query_stride + "th query" : "";
+  el.textContent = (run.ckpt || "") + "    epoch " + epoch + kind + stride;
   const full = run.pred_full || [];
   const exec = run.pred_exec || [];
   note.textContent = full.length && full.length === exec.length ? "stored chunk is 6 steps" : "";
@@ -977,6 +1252,25 @@ function paintTable(run) {
     });
     html += "</tr>";
   });
+  const regions = run.region_error;
+  if (regions) {
+    html += "<tr><th colspan='5'>stride-4 queries " + (run.table_queries || "") + "</th></tr>";
+    html += "<tr><th>steps</th><th>region</th><th>n</th><th>δn mm</th><th>ΔR deg</th></tr>";
+    ["exec", "full"].forEach(which => {
+      ["crown", "fillet", "wall"].forEach(name => {
+        const cell = regions[which][name];
+        const nameSpan = which === "exec" ? "first 6" : "full chunk";
+        const dn = cell.delta_n_mm === null || cell.delta_n_mm === undefined ? "—" : Number(cell.delta_n_mm).toFixed(1);
+        const dR = cell.delta_R_deg === null || cell.delta_R_deg === undefined ? "—" : Number(cell.delta_R_deg).toFixed(1);
+        html += "<tr><td>" + nameSpan + "</td><td>" + name + "</td><td>" + cell.n + "</td><td>" + dn + "</td><td>" + dR + "</td></tr>";
+      });
+    });
+  }
+  if (run.yaw_gap) {
+    const g = run.yaw_gap;
+    const pct = g.frac === null ? "—" : (100 * g.frac).toFixed(1) + "%";
+    html += "<tr><td>yaw gap</td><td colspan='4'>" + g.gap + "/" + g.n + " (" + pct + ") |yaw| 45–135°</td></tr>";
+  }
   const h = run.horizon_error;
   if (h) {
     const modes = ["all", "near_identity", "return_yaw"];
@@ -1100,17 +1394,46 @@ async function paintCursor() {
   }
   const cam = liveCamera();
   const cursor = await (await fetch("/api/cursor?ep=" + data.episode + "&q=" + j + "&span=" + span)).json();
-  const labelPath = scatter(data.path, "label", "#5dade2", 5, data.path_break, data.path_t);
-  labelPath.showlegend = true;
-  labelPath.legendgroup = "label";
-  const traces = [labelPath];
-  const p = data.path[nearest(data.path_t, t)];
+  const picked = selectedRun();
+  showCheckpoint(picked);
+  const item = (cursor.runs || []).find(r => picked && r.label === picked.label);
+  const drawn = visibleRuns();
+  const footMode = geomMode === "foot" && drawn.some(r => r.label_foot && r.pred_foot);
+  const traces = [];
+  if (footMode) {
+    drawn.forEach(run => {
+      if (!run.label_foot || !run.pred_foot) return;
+      const selected = picked && run.label === picked.label;
+      const cut = run.foot_break;
+      traces.push(scatterNullable(run.label_foot, selected ? "label foot" : run.label + " label", selected ? "#4aa3ff" : "#8eb4d6", selected ? 4 : 2, cut));
+      traces.push(scatterNullable(run.pred_foot, selected ? "pred foot" : run.label + " pred", selected ? "#ff4d6a" : "#e67e22", selected ? 4 : 2, cut));
+      if (!selected) return;
+      traces.push(dnSegments(run.label_foot, run.label_n, run.label_dn, "label δn", "#3ddc97", 3));
+      traces.push(dnSegments(run.pred_foot, run.pred_n, run.pred_dn, "pred δn", "#ffd23f", 3));
+    });
+    if (item && item.label_foot && picked && drawn.some(r => r.label === picked.label)) {
+      const lab = dnSegments(item.label_foot, item.label_n, item.label_dn, "label δn", "#d5ffe9", 6);
+      lab.showlegend = false;
+      traces.push(lab);
+      const pred = dnSegments(item.pred_foot, item.pred_n, item.pred_dn, "pred δn", "#fff3bf", 6);
+      pred.showlegend = false;
+      traces.push(pred);
+    }
+  } else {
+    const labelPath = scatter(data.path, "label", "#4aa3ff", 5, data.path_break, data.path_t);
+    labelPath.showlegend = true;
+    labelPath.legendgroup = "label";
+    traces.push(labelPath);
+  }
+  const p = footMode && item && item.label_foot && item.label_foot[0]
+    ? item.label_foot[0]
+    : data.path[nearest(data.path_t, t)];
   traces.push({
     type: "scatter3d", x: [p[0]], y: [p[1]], z: [p[2]], mode: "markers",
     name: "time", showlegend: false, marker: {size: 7, color: "#ffffff"}
   });
   regionMarkers(picked0).forEach(tr => traces.push(tr));
-  if (data.tool_R) pathTriads(data).forEach(tr => traces.push(tr));
+  if (!footMode && data.tool_R) pathTriads(data).forEach(tr => traces.push(tr));
   if (data.frames && cursor.frame && shownFrame.old) {
     traces.push(axesAt(cursor.frame.x_old, cursor.frame.R_old, "rgba(255,255,255,0.28)", "old frame", 3));
   }
@@ -1136,13 +1459,10 @@ async function paintCursor() {
       marker: {size: 3.5, color: "#e74c3c", symbol: "diamond"}
     });
   }
-  const picked = selectedRun();
-  showCheckpoint(picked);
-  if (picked && shown[picked.label] !== false) {
+  if (!footMode && picked && shown[picked.label] !== false) {
     const pred = span === "full" && picked.pred_full ? picked.pred_full : (picked.pred_exec || picked.path);
     const predCut = span === "full" && picked.pred_full ? picked.pred_full_break : (picked.pred_exec ? picked.pred_exec_break : picked.path_break);
     fadedPrediction(pred, predCut).forEach(tr => traces.push(tr));
-    const item = (cursor.runs || []).find(r => r.label === picked.label);
     if (item) {
       const chunk = scatter(item.future, "this chunk", "#ffe14a", 8);
       chunk.showlegend = true;
@@ -1252,7 +1572,10 @@ async function show() {
   document.getElementById("time").max = Math.max(0, data.path_t.length - 1);
   fi = 0;
   const ckpt = document.getElementById("ckpt");
+  const keep = selectedLabel || ckpt.value;
   ckpt.innerHTML = data.runs.map(r => "<option>" + r.label + "</option>").join("");
+  if (data.runs.some(r => r.label === keep)) ckpt.value = keep;
+  selectedLabel = ckpt.value;
   const toggles = document.getElementById("toggles");
   toggles.innerHTML = "";
   data.runs.forEach(run => {
@@ -1286,7 +1609,10 @@ async function show() {
 }
 document.getElementById("time").oninput = () => { fi = +document.getElementById("time").value; paintCursor(); };
 document.getElementById("ep").onchange = () => show();
-document.getElementById("ckpt").onchange = () => paintCursor();
+document.getElementById("ckpt").onchange = () => {
+  selectedLabel = document.getElementById("ckpt").value;
+  paintCursor();
+};
 function setSpan(next) {
   span = next;
   document.getElementById("spanExec").classList.toggle("on", span === "exec");
@@ -1295,6 +1621,20 @@ function setSpan(next) {
 }
 document.getElementById("spanExec").onclick = () => setSpan("exec");
 document.getElementById("spanFull").onclick = () => setSpan("full");
+function setGeom(next) {
+  geomMode = next;
+  document.getElementById("geomFoot").classList.toggle("on", geomMode === "foot");
+  document.getElementById("geomPoint").classList.toggle("on", geomMode === "point");
+  if (data) paintCursor();
+}
+document.getElementById("geomFoot").onclick = () => setGeom("foot");
+document.getElementById("geomPoint").onclick = () => setGeom("point");
+function setOnly(next) {
+  onlySelected = next;
+  document.getElementById("onlySel").classList.toggle("on", onlySelected);
+  if (data) paintCursor();
+}
+document.getElementById("onlySel").onclick = () => setOnly(!onlySelected);
 function setRegion(name) {
   regionFilter = name;
   document.getElementById("regAll").classList.toggle("on", name === "all");

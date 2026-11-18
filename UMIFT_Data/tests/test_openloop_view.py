@@ -370,6 +370,32 @@ def test_region_errors_follow_the_query_label_foot():
     assert table["exec"]["crown"]["n"] == 4
 
 
+def test_label_virtual_target_is_the_foot_plus_delta_n():
+    from view_openloop import checkpoint_label, label_virtual_target, PAGE
+
+    foot = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    normal = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0]])
+    got = label_virtual_target(foot, normal, np.array([0.02, -0.01]))
+    assert np.allclose(got[0], [0.0, -0.02, 0.0])
+    assert np.allclose(got[1], [1.0, 0.0, -0.01])
+    marked = checkpoint_label({"role": "r1rel", "checkpoint_epoch": 195, "val_loss": 0.152}, "r1rel")
+    assert "tool pose" in marked
+    assert "tool pose" not in checkpoint_label({"role": "r4vt", "checkpoint_epoch": 55, "val_loss": 0.030}, "r4vt")
+    assert 'id="geomFoot"' in PAGE
+    assert 'id="onlySel"' in PAGE
+    assert "dnSegments" in PAGE
+    from view_openloop import foot_path_breaks
+    gap = foot_path_breaks([0, 2, 4, 20], [False, False, False, False])
+    assert list(gap) == [False, False, True, False]
+    flagged = foot_path_breaks([0, 2, 4], [False, True, False])
+    assert list(flagged) == [True, True, False]
+    from view_openloop import table_keep
+    order = table_keep(np.array([0.3, 0.0, 0.2, 0.1]), {"query_stride": 1})
+    assert list(order) == [1]
+    kept = table_keep(np.array([0.0, 0.1, 0.2, 0.3]), {"query_stride": 4})
+    assert list(kept) == [0, 1, 2, 3]
+
+
 def test_openloop_page_has_region_filter():
     from view_openloop import PAGE
 
