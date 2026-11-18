@@ -2,7 +2,7 @@
 date: 2026-11-18
 stream: frame
 branch: frame_continuity
-commit: uncommitted
+commit: 31f0081
 status: done
 artifacts:
   - /home/boeing/data/control_log/checkpoints_e30_rollout0_1794958462
