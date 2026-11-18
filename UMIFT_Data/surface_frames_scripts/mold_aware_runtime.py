@@ -156,6 +156,8 @@ def r4_safety_limits(
 FOOT_CAP_M = 0.010
 # A new face whose normal has turned further than this keeps the held frame.
 FACE_HOLD_DEG = 5.0
+# Virtual-target offset grows from the measured TCP to the command over this long.
+VT_RAMP_S = 1.0
 # Fixture +Y is down. Bench replay lifts along −Y, off the table on every face.
 FIXTURE_UP = np.array([0.0, -1.0, 0.0])
 
@@ -178,6 +180,31 @@ def _hold_if_far(x, R, prev_x, prev_R, cap: float = FOOT_CAP_M):
             np.asarray(prev_R, dtype=np.float64).reshape(3, 3).copy(),
         )
     return x, R
+
+
+def _step_toward_cap(x, R, origin, cap: float = FOOT_CAP_M):
+    """Move ``x`` toward ``origin`` until it is within ``cap``. Keep ``R``."""
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    point = np.asarray(x, dtype=np.float64).reshape(3)
+    delta = point - origin
+    dist = float(np.linalg.norm(delta))
+    if dist <= cap or dist < 1e-12:
+        return point, R
+    return origin + delta * (cap / dist), R
+
+
+def _hold_long_steps(pos: np.ndarray, prev, max_step: float):
+    """Copy the last safe position when a step is longer than ``max_step``."""
+    out = np.asarray(pos, dtype=np.float64).reshape(-1, 3).copy()
+    hit = np.zeros(len(out), dtype=bool)
+    origin = None if prev is None else np.asarray(prev, dtype=np.float64).reshape(3).copy()
+    for i in range(len(out)):
+        if origin is not None and float(np.linalg.norm(out[i] - origin)) > max_step:
+            out[i] = origin
+            hit[i] = True
+        else:
+            origin = out[i].copy()
+    return out, hit
 
 
 def _reject_new_face(x, R, prev_x, prev_R, max_deg: float = FACE_HOLD_DEG):
@@ -226,19 +253,25 @@ def integrate_tcp_foot(
     prev_x: np.ndarray | None = None,
     prev_R: np.ndarray | None = None,
     hold_face: bool = False,
+    cap_origin: np.ndarray | None = None,
 ) -> Dict[str, np.ndarray]:
     """Face-held foot of the measured TCP, then tangent steps on that face.
 
     The first replan queries the TCP. Later replans call ``track_step`` with
     the measured TCP and the previous foot. A hop over 10 mm, or a normal
     more than 5° from the held face, keeps the previous foot and frame.
+    ``cap_origin`` is the measured TCP on that first replan, so the first
+    foot also stays within 10 mm of the tool.
     """
     v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
     delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
     dt = np.asarray(dt, dtype=np.float64).reshape(-1)
     h = len(delta_n)
     xs, rk = _project_foot(field, p0, prev_x, prev_R)
-    xs, rk = _hold_if_far(xs, rk, prev_x, prev_R)
+    if prev_x is None and cap_origin is not None:
+        xs, rk = _step_toward_cap(xs, rk, cap_origin, FOOT_CAP_M)
+    else:
+        xs, rk = _hold_if_far(xs, rk, prev_x, prev_R)
     if hold_face:
         xs, rk, held0 = _reject_new_face(xs, rk, prev_x, prev_R)
     else:
@@ -453,6 +486,8 @@ class MoldAwareRuntime:
     _cmd_foot: Optional[np.ndarray] = None
     _cmd_R: Optional[np.ndarray] = None
     _cmd_Rd: Optional[np.ndarray] = None
+    _cmd_vt: Optional[np.ndarray] = None
+    _vt_elapsed_s: float = 0.0
     last_triggers: list = field(default_factory=list)
     # Per-step bool masks from the latest decode_chunk (length H).
     last_clamp_speed: Optional[np.ndarray] = None
@@ -501,6 +536,8 @@ class MoldAwareRuntime:
         self._cmd_foot = None
         self._cmd_R = None
         self._cmd_Rd = None
+        self._cmd_vt = None
+        self._vt_elapsed_s = 0.0
         self.last_triggers = []
 
     def release_command_foot(self) -> None:
@@ -508,6 +545,8 @@ class MoldAwareRuntime:
         self._cmd_foot = None
         self._cmd_R = None
         self._cmd_Rd = None
+        self._cmd_vt = None
+        self._vt_elapsed_s = 0.0
         self.last_clamp_speed = None
         self.last_clamp_step = None
         self.last_clamp_dn = None
@@ -750,6 +789,55 @@ class MoldAwareRuntime:
         self.last_triggers.append("wrench_hold")
         return "hold"
 
+    def _limit_commanded_vt(
+        self,
+        x_s: np.ndarray,
+        normal: np.ndarray,
+        delta_n: np.ndarray,
+        dt: np.ndarray,
+        p0: np.ndarray,
+    ):
+        """Ramp the virtual target in, then hold a step longer than 25 mm.
+
+        For the first ``VT_RAMP_S`` seconds the offset is scaled by elapsed time
+        and the VT may move at most that fraction of ``max_step_m`` from the
+        previous command (the measured TCP, on the first call). After the ramp,
+        a longer step keeps the last safe VT.
+        """
+        x_s = np.asarray(x_s, dtype=np.float64)
+        normal = np.asarray(normal, dtype=np.float64)
+        normal = normal / np.clip(np.linalg.norm(normal, axis=-1, keepdims=True), 1e-9, None)
+        delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1).copy()
+        dt = np.asarray(dt, dtype=np.float64).reshape(-1)
+        steps = len(delta_n)
+        x_d = np.zeros((steps, 3), dtype=np.float64)
+        hit = np.zeros(steps, dtype=bool)
+        if self._cmd_vt is None:
+            prev = np.asarray(p0, dtype=np.float64).reshape(3).copy()
+        else:
+            prev = np.asarray(self._cmd_vt, dtype=np.float64).reshape(3).copy()
+        full = float(self.limits.max_step_m)
+        for i in range(steps):
+            self._vt_elapsed_s += float(dt[i])
+            scale = 1.0 if VT_RAMP_S <= 0 else min(1.0, self._vt_elapsed_s / VT_RAMP_S)
+            desired = x_s[i] + float(delta_n[i]) * scale * normal[i]
+            delta = desired - prev
+            dist = float(np.linalg.norm(delta))
+            allow = full * scale
+            if scale >= 1.0 and dist > full:
+                vt = prev.copy()
+                hit[i] = True
+            elif dist > allow and dist > 1e-12:
+                vt = prev + delta * (allow / dist)
+                hit[i] = True
+            else:
+                vt = desired
+            delta_n[i] = float(np.dot(vt - x_s[i], normal[i]))
+            x_d[i] = x_s[i] + delta_n[i] * normal[i]
+            prev = x_d[i].copy()
+        self._cmd_vt = prev.copy()
+        return x_d, delta_n, hit
+
     def decode_chunk(
         self,
         raw_action: np.ndarray,
@@ -778,12 +866,14 @@ class MoldAwareRuntime:
             pos = raw_action[:, 0:3].astype(np.float64)
             R = rot6d_rows_to_R(raw_action[:, 3:9])
             q = self.field.query(pos)
-            if apply_safety and H > 1:
-                steps = np.linalg.norm(np.diff(pos, axis=0), axis=1)
-                step_hit = steps > self.limits.max_step_m
-                self.last_clamp_step[1:] = step_hit
+            if apply_safety:
+                seed = p0 if self._cmd_vt is None else self._cmd_vt
+                pos, step_hit = _hold_long_steps(pos, seed, self.limits.max_step_m)
+                self.last_clamp_step = step_hit
                 if np.any(step_hit):
                     self.last_triggers.append("max_step")
+                if len(pos):
+                    self._cmd_vt = np.asarray(pos[-1], dtype=np.float64).copy()
             return {
                 "x_d": pos,
                 "R_d": R,
@@ -821,7 +911,9 @@ class MoldAwareRuntime:
         self.last_clamp_speed = clamp_speed
 
         dt = np.asarray(dt, dtype=np.float64).reshape(H)
-        # First replan queries the TCP. Later replans hold the previous face.
+        # First replan queries the TCP and caps that foot at 10 mm from it.
+        # Later replans hold the previous face.
+        cap_origin = p0 if apply_safety and self._cmd_foot is None else None
         dec = integrate_tcp_foot(
             self.field,
             p0,
@@ -831,6 +923,7 @@ class MoldAwareRuntime:
             prev_x=self._cmd_foot,
             prev_R=self._cmd_R,
             hold_face=apply_safety,
+            cap_origin=cap_origin,
         )
         R_field = dec["R"]
         x_d = dec["x_d"]
@@ -893,17 +986,26 @@ class MoldAwareRuntime:
                 if apply_safety and self.limits.enable_rd_slew
                 else 180.0
             )
+            # No previous command yet: slew the first step from the measured tool.
+            slew_prev = self._cmd_Rd
+            if (
+                slew_prev is None
+                and apply_safety
+                and self.limits.enable_rd_slew
+            ):
+                slew_prev = np.asarray(R0, dtype=np.float64).reshape(3, 3)
             R_d, slew_hit = _slew_orientations(
-                R_d, self._cmd_Rd, max_deg, freeze=face_held
+                R_d, slew_prev, max_deg, freeze=face_held
             )
             self.last_rd_slew = slew_hit
             if np.any(slew_hit):
                 self.last_triggers.append("rd_slew")
 
-        if apply_safety and H > 1:
-            steps = np.linalg.norm(np.diff(x_d, axis=0), axis=1)
-            step_hit = steps > self.limits.max_step_m
-            self.last_clamp_step[1:] = step_hit
+        if apply_safety:
+            x_d, delta_n, step_hit = self._limit_commanded_vt(
+                x_s, R_field[:, :, 2], delta_n, dt, p0
+            )
+            self.last_clamp_step = step_hit
             if np.any(step_hit):
                 self.last_triggers.append("max_step")
         if (
