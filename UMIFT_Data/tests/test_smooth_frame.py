@@ -89,7 +89,11 @@ def test_positive_delta_n_stays_outside_when_z_points_in():
     decoded = runtime.decode_chunk(
         action, np.array([0.0, 0.0, 0.02]), np.eye(3), np.array([1.0 / 15.0]), apply_safety=True
     )
-    assert decoded["x_d"][0, 2] == pytest.approx(0.015)
+    # The first second ramps the virtual target, so this is not the full 15 mm.
+    # Positive δn still lies along the outward normal, not the inward frame z.
+    offset = decoded["x_d"][0] - decoded["x_s"][0]
+    assert offset[2] > 0.0
+    assert np.dot(offset, decoded["n_out"][0]) > 0.0
     assert decoded["n_out"][0, 2] == pytest.approx(1.0)
     assert decoded["R_field"][0, 2, 2] == pytest.approx(-1.0)
     assert not bool(decoded["face_hold"][0])

@@ -13,6 +13,7 @@ from fixb_field import FixBMoldField  # noqa: E402
 from fixb_labels import pose7_to_Rp  # noqa: E402
 from mold_aware_runtime import (  # noqa: E402
     FOOT_CAP_M,
+    VT_RAMP_S,
     MoldAwareRuntime,
     r4_safety_limits,
     shift_fixture_up,
@@ -88,14 +89,16 @@ def test_nominal_is_foot_and_vt_carries_delta_n():
 
 def test_bench_floor_limits_the_virtual_target_to_5mm():
     runtime = _runtime(r4_safety_limits(enable_delta_n_floor=True))
-    tcp = np.array([0.0, 0.0, 0.01])
+    tcp = np.array([0.0, 0.0, 0.0])
+    steps = 20
     decoded = runtime.decode_chunk(
-        _action(-0.15), tcp, np.eye(3), np.array([1.0 / 15.0])
+        _action(-0.15, steps=steps), tcp, np.eye(3), np.full(steps, 1.0 / 15.0)
     )
+    assert np.all(decoded["delta_n"] >= -0.005 - 1e-9)
+    assert decoded["delta_n"][-1] == pytest.approx(-0.005, abs=1e-6)
     nominal, virtual = runtime.decoded_to_action_mats(decoded)
-    offset = np.linalg.norm(virtual[0, :3, 3] - nominal[0, :3, 3])
+    offset = np.linalg.norm(virtual[-1, :3, 3] - nominal[-1, :3, 3])
     assert offset <= 0.005 + 1e-9
-    assert np.allclose(decoded["delta_n"], -0.005)
 
 
 def test_episode0_nominal_tracks_tcp_foot():
@@ -312,6 +315,116 @@ def test_open_loop_query_lands_on_the_label_foot():
     )
     err = np.linalg.norm(pos[:, 0] - foot[chosen], axis=1)
     assert np.all(err < 1e-3), err
+
+
+def _geodesic_deg(a, b) -> float:
+    from scipy.spatial.transform import Rotation
+
+    rel = np.asarray(a, dtype=np.float64).reshape(3, 3).T @ np.asarray(b).reshape(3, 3)
+    return float(np.degrees(np.linalg.norm(Rotation.from_matrix(rel).as_rotvec())))
+
+
+def test_first_orientation_slews_from_the_measured_tool():
+    runtime = _runtime()
+    tcp = np.array([0.0, 0.0, 0.0])
+    action = _action(0.0)
+    angle = np.radians(90.0)
+    cosine, sine = np.cos(angle), np.sin(angle)
+    action[:, 21:27] = [cosine, -sine, 0.0, sine, cosine, 0.0]
+    decoded = runtime.decode_chunk(action, tcp, np.eye(3), np.array([1.0 / 15.0]))
+    assert _geodesic_deg(np.eye(3), decoded["R_d"][0]) <= 3.0 + 1e-6
+    assert bool(decoded["rd_slew"][0])
+
+
+def test_first_foot_stays_within_10mm_of_the_tcp():
+    runtime = _runtime()
+    tcp = np.array([0.0, 0.0, 0.03])
+    decoded = runtime.decode_chunk(
+        _action(0.0), tcp, np.eye(3), np.array([1.0 / 15.0])
+    )
+    assert np.linalg.norm(decoded["x_s"][0] - tcp) <= FOOT_CAP_M + 1e-9
+    assert decoded["x_s"][0, 2] == pytest.approx(0.02)
+
+
+def test_vt_ramps_in_and_a_later_25mm_step_holds():
+    runtime = _runtime()
+    tcp = np.array([0.0, 0.0, 0.0])
+    dt = np.array([1.0 / 15.0])
+    first = runtime.decode_chunk(_action(-0.05), tcp, np.eye(3), dt)
+    allow = r4_safety_limits().max_step_m * float(dt[0]) / VT_RAMP_S
+    moved = float(np.linalg.norm(first["x_d"][0] - tcp))
+    assert moved == pytest.approx(allow, abs=1e-6)
+    runtime._vt_elapsed_s = VT_RAMP_S
+    second = runtime.decode_chunk(_action(-0.05), tcp, np.eye(3), dt)
+    assert np.allclose(second["x_d"][0], first["x_d"][0], atol=1e-8)
+    assert bool(second["clamp_step"][0])
+
+
+E30_LOG = Path("/home/boeing/data/control_log/checkpoints_e30_rollout0_1794958462")
+ORANGE = Path(
+    "/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/PyriteConfig/tasks/umift/"
+    "layup_workcell_extrinsics_20261116_orange.yaml"
+)
+
+
+def test_e30_rollout_first_command_is_rate_limited():
+    """The logged epoch-30 command was 117° and ~69 mm. The first step is now capped."""
+    zarr = pytest.importorskip("zarr")
+    if not E30_LOG.is_dir() or not FIELD.is_file() or not ORANGE.is_file():
+        pytest.skip("e30 rollout log, mold field, or orange extrinsics is missing")
+    from PyriteConfig.tasks.umift.workcell_frames import load_workcell_extrinsics
+    from PyriteEnvSuites.env_runners.dataset_start_pose import pose7_change_frame
+    from fixb_labels import so3_to_rot6d_rows
+
+    log = zarr.open(str(E30_LOG), "r")
+    fixture_from_base = load_workcell_extrinsics(str(ORANGE)).T_fixture_from_right_base
+    tcp_pose = pose7_change_frame(
+        np.asarray(log["horizon_0/obs_inference/ts_pose_fb_0"], dtype=np.float64),
+        fixture_from_base,
+    )
+    nominal = pose7_change_frame(
+        np.asarray(log["horizon_0/action/ts_nominal_targets_0"][0], dtype=np.float64),
+        fixture_from_base,
+    )
+    virtual = pose7_change_frame(
+        np.asarray(log["horizon_0/action/ts_virtual_targets_0"][0], dtype=np.float64),
+        fixture_from_base,
+    )
+    tool, tcp = pose7_to_Rp(tcp_pose.reshape(1, 7))
+    commanded, nominal_xyz = pose7_to_Rp(nominal.reshape(1, 7))
+    _virtual_r, virtual_xyz = pose7_to_Rp(virtual.reshape(1, 7))
+    tool, tcp = tool[0], tcp[0]
+    commanded = commanded[0]
+    nominal_xyz, virtual_xyz = nominal_xyz[0], virtual_xyz[0]
+    field = FixBMoldField(FIELD)
+    frame = np.asarray(field.query(tcp.reshape(1, 3))["R"][0], dtype=np.float64)
+    delta_R = frame.T @ commanded
+    delta_n = float(np.dot(virtual_xyz - nominal_xyz, frame[:, 2]))
+    raw_deg = _geodesic_deg(tool, frame @ delta_R)
+    raw_mm = float(np.linalg.norm(virtual_xyz - tcp) * 1e3)
+    assert raw_deg > 90.0
+    assert raw_mm > 50.0
+
+    action = _action(delta_n)
+    action[:, 21:27] = so3_to_rot6d_rows(delta_R.reshape(1, 3, 3))[0]
+    runtime = MoldAwareRuntime(
+        field=field,
+        R_off=np.eye(3),
+        run_type="r4_world_fixb_tilt",
+        limits=r4_safety_limits(),
+        dry_run=False,
+    )
+    decoded = runtime.decode_chunk(action, tcp, tool, np.array([1.0 / 15.0]))
+    limited_deg = _geodesic_deg(tool, decoded["R_d"][0])
+    limited_mm = float(np.linalg.norm(decoded["x_d"][0] - tcp) * 1e3)
+    allow_mm = r4_safety_limits().max_step_m * (1.0 / 15.0) / VT_RAMP_S * 1e3
+    print(
+        f"e30 first command: orientation {raw_deg:.1f} -> {limited_deg:.2f} deg, "
+        f"VT {raw_mm:.1f} -> {limited_mm:.2f} mm"
+    )
+    assert limited_deg <= 3.0 + 1e-6
+    assert limited_mm <= allow_mm + 0.05
+    assert bool(decoded["rd_slew"][0])
 
 
 def test_bench_lift_is_fixture_up():

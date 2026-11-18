@@ -1,5 +1,7 @@
+import hashlib
 import json
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -967,6 +969,18 @@ def log_horizon(
         "timestamps_s",
         data=timestamps[:exe] + action_start_time_s,
     )
+    for src, name in (
+        ("_mold_cmd_v", "v_par"),
+        ("_mold_cmd_dn", "delta_n"),
+        ("_mold_cmd_foot", "foot"),
+    ):
+        if src in obs_raw and obs_raw[src] is not None:
+            action_log.create_dataset(name, data=np.asarray(obs_raw[src])[:exe])
+    for key in ("wrench_left_0", "wrench_0"):
+        if key in obs_raw:
+            wrench = np.asarray(obs_raw[key][-1], dtype=np.float64).reshape(-1)
+            action_log.create_dataset("wrench", data=wrench[:6])
+            break
 
     obs_policy_group = horizon_log.create_group("obs_policy")
     obs_sampled = controller.sample_sparse_obs(obs_task["obs"])
@@ -999,6 +1013,51 @@ def log_horizon(
         )
         if log_policy_vision:
             log_raw_vision_to_obs_inference(obs_inference, obs_raw, robot_id)
+
+
+def print_loaded_action_normalizer(policy) -> None:
+    """Print the action normalizer stored in the checkpoint, and compare a pickle."""
+    params = policy.sparse_normalizer.params_dict["action"]
+    scale = params["scale"].detach().float().cpu().numpy().reshape(-1)
+    offset = params["offset"].detach().float().cpu().numpy().reshape(-1)
+    blob = np.concatenate([scale, offset]).astype(np.float64).tobytes()
+    digest = hashlib.sha256(blob).hexdigest()
+    print(
+        f"[normalizer] ckpt action dim {scale.size} "
+        f"scale[:3]={np.array2string(scale[:3], precision=4)} "
+        f"offset[:3]={np.array2string(offset[:3], precision=4)} "
+        f"scale_offset_sha {digest[:16]}"
+    )
+    expect = os.environ.get("UMIFT_ACTION_NORMALIZER", "").strip()
+    if not expect:
+        return
+    path = Path(expect)
+    expect_sha = os.environ.get("UMIFT_ACTION_NORMALIZER_SHA", "").strip()
+    file_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as handle:
+        saved = pickle.load(handle)
+    src = saved.params_dict["action"]
+    file_scale = src["scale"].detach().float().cpu().numpy().reshape(-1)
+    file_offset = src["offset"].detach().float().cpu().numpy().reshape(-1)
+    if file_scale.size == 21 and scale.size == 27:
+        # r4 pin: the pickle is the 21 shared dims. ΔR stays identity.
+        match = (
+            np.allclose(file_scale, scale[:21])
+            and np.allclose(file_offset, offset[:21])
+            and np.allclose(scale[21:], 1.0)
+            and np.allclose(offset[21:], 0.0)
+        )
+    else:
+        match = (
+            file_scale.shape == scale.shape
+            and np.allclose(file_scale, scale)
+            and np.allclose(file_offset, offset)
+        )
+    sha_ok = (not expect_sha) or file_sha == expect_sha
+    print(
+        f"[normalizer] file {path.name} sha {file_sha} "
+        f"sha_ok={sha_ok} matches_ckpt={match}"
+    )
 
 
 def main():
@@ -1084,6 +1143,8 @@ def main():
         "record_rollout_cameras": True,
         "orbbec_v4l_device": DEFAULT_ORBBEC_V4L,
     }
+    if os.environ.get("UMIFT_MAX_DURATION_S", "").strip():
+        control_para["max_duration_s"] = float(os.environ["UMIFT_MAX_DURATION_S"])
     pipeline_para = {
         # Layup: D405 rgb (manip_server) + depth (pyrealsense2) + UR5e wrist FT.
         "use_layup_env": True,
@@ -1160,8 +1221,10 @@ def main():
         checkpoint_folder_path + pipeline_para["ckpt_path"]
     )
     print("Loading policy: ", ckpt_full_path)
+    print(f"[rollout] max_duration_s={control_para['max_duration_s']}")
     device = torch.device(control_para["device"])
     policy, shape_meta = load_policy(str(ckpt_full_path), device)
+    print_loaded_action_normalizer(policy)
 
     # Mold-aware / Fix B: detect run type from checkpoint task name.
     mold_runtime = None
@@ -1234,10 +1297,31 @@ def main():
             f"[mold] enabled run_type={mold_run_type} dry_run={mold_runtime.dry_run} "
             f"field={control_para['mold_aware_field_npz']}"
         )
+        _side = Path(control_para["mold_aware_field_npz"]).with_name(
+            "fixb_smooth_frames.npz"
+        )
+        _field = mold_runtime.field
+        print(
+            f"[mold] field_class={type(_field).__name__} "
+            f"orientation_z_inward={bool(getattr(_field, 'orientation_z_inward', False))} "
+            f"sidecar={_side} exists={_side.is_file()}"
+        )
         if r4vt:
             from jump_guard import MAX_CONSECUTIVE_HOLDS, MAX_STEP_DEG, MAX_STEP_MM, TargetJumpGuard
 
             r4_jump_guard = TargetJumpGuard()
+            from mold_aware_runtime import FOOT_CAP_M, VT_RAMP_S
+
+            print(
+                f"[mold] first-step limits: rd_slew="
+                f"{mold_runtime.limits.enable_rd_slew} "
+                f"{mold_runtime.limits.max_rd_slew_deg:.0f} deg/step from measured TCP, "
+                f"foot_cap={FOOT_CAP_M * 1000:.0f} mm from measured TCP, "
+                f"face_hold="
+                f"{'off' if getattr(_field, 'orientation_z_inward', False) else 'on'}, "
+                f"vt_ramp={VT_RAMP_S:.0f} s, "
+                f"max_step_hold={mold_runtime.limits.max_step_m * 1000:.0f} mm"
+            )
             print(
                 f"[mold] r4vt action blend, "
                 f"dn_floor={mold_runtime.limits.enable_delta_n_floor} "
@@ -2386,6 +2470,9 @@ def main():
                 action_sparse_vt_mats = [vt]
                 action_stiffnesses = [decoded["stiffness"]]
                 action_eoat = [decoded["eoat"]]
+                obs_raw["_mold_cmd_v"] = np.asarray(decoded["v_par"], dtype=np.float64)
+                obs_raw["_mold_cmd_dn"] = np.asarray(decoded["delta_n"], dtype=np.float64)
+                obs_raw["_mold_cmd_foot"] = np.asarray(decoded["x_s"], dtype=np.float64)
                 # stash for control log
                 obs_raw["_mold_decode_x_d"] = decoded["x_d"]
                 obs_raw["_mold_decode_x_s"] = decoded["x_s"]

@@ -50,9 +50,17 @@ R1REL_ZARR = DATA / "r1rel_world" / "acp_replay_buffer.zarr"
 FIELD_NPZ = DATA / "shared" / "fixb_field.npz"
 LONG_DT = DATA / "shared" / "long_dt_gt_100ms.npz"
 ASSETS = Path(__file__).resolve().parent / "assets"
-R4VT_NORMALIZER = ASSETS / "oct_v35_h4s_r4vt_action_normalizer_minmax_exbad.pkl"
+R4VT_NORMALIZER = Path(
+    os.environ.get(
+        "UMIFT_R4VT_NORMALIZER",
+        str(ASSETS / "oct_v35_h4s_r4vt_action_normalizer_minmax_exbad.pkl"),
+    )
+)
 R1REL_NORMALIZER = ASSETS / "oct_v35_h4s_r1rel_odom_action_pose_normalizer_2c20fba56851.pkl"
-R4VT_SHA = "ac13d3fd7b647541d093688896ff43f1edb3a025397b6037da01dfffb6707bee"
+R4VT_SHA = os.environ.get(
+    "UMIFT_R4VT_NORMALIZER_SHA",
+    "ac13d3fd7b647541d093688896ff43f1edb3a025397b6037da01dfffb6707bee",
+)
 R1REL_SHA = "2c20fba56851f59ec7d1a652d4e08a979ec9f7a8ea46368737df984475a0cf05"
 EXPORT_ROOT = Path("/mnt/data/umidata/ft/replay_exports")
 
@@ -282,9 +290,28 @@ def r1rel_chunk_errors(episode: int = 0, rgb_id: int = 100) -> dict:
 def _mold_field():
     global _FIELD
     if _FIELD is None:
-        from fixb_field import FixBMoldField
+        use_smooth = os.environ.get("UMIFT_R4VT_SMOOTH", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        side = FIELD_NPZ.with_name("fixb_smooth_frames.npz")
+        if use_smooth:
+            from fixb_smooth_field import SmoothFrameField
 
-        _FIELD = FixBMoldField(FIELD_NPZ)
+            if not side.is_file():
+                raise SystemExit(f"smooth sidecar missing: {side}")
+            _FIELD = SmoothFrameField(FIELD_NPZ, side)
+            print(f"[replay] SmoothFrameField sidecar {side}", flush=True)
+        else:
+            from fixb_field import FixBMoldField
+
+            _FIELD = FixBMoldField(FIELD_NPZ)
+            print(f"[replay] FixBMoldField {FIELD_NPZ}", flush=True)
+        print(
+            f"[replay] normalizer {R4VT_NORMALIZER} sha {R4VT_SHA}",
+            flush=True,
+        )
     return _FIELD
 
 
@@ -984,24 +1011,28 @@ def _format_action_blend(report: dict) -> str:
     return "\n".join(lines)
 
 
-def write_runner_replay(out: Path, episodes, horizon: int) -> None:
+def write_runner_replay(out: Path, episodes, horizon: int, arm: str = "both") -> None:
     """r4vt action blend and r1rel pose blend, the runner's H-step path."""
     out = Path(out)
     if out.exists():
         raise SystemExit(f"refusing to overwrite {out}")
-    r4 = out / "r4vt"
-    r1 = out / "r1rel"
-    r4.mkdir(parents=True)
-    r1.mkdir(parents=True)
+    if arm in ("both", "r4vt"):
+        r4 = out / "r4vt"
+        r4.mkdir(parents=True)
+    if arm in ("both", "r1rel"):
+        r1 = out / "r1rel"
+        r1.mkdir(parents=True)
     for episode in episodes:
-        report = action_blend_episode(int(episode), int(horizon))
-        path = r4 / f"episode_{int(episode)}_h{int(horizon)}.json"
-        path.write_text(json.dumps(report, indent=2) + "\n")
-        print(_format_action_blend(report), flush=True)
-        report = replay_episode("r1rel", int(episode), exec_horizons=(int(horizon),))
-        path = r1 / f"episode_{int(episode)}.json"
-        path.write_text(json.dumps(report, indent=2) + "\n")
-        print(format_report(report), flush=True)
+        if arm in ("both", "r4vt"):
+            report = action_blend_episode(int(episode), int(horizon))
+            path = r4 / f"episode_{int(episode)}_h{int(horizon)}.json"
+            path.write_text(json.dumps(report, indent=2) + "\n")
+            print(_format_action_blend(report), flush=True)
+        if arm in ("both", "r1rel"):
+            report = replay_episode("r1rel", int(episode), exec_horizons=(int(horizon),))
+            path = r1 / f"episode_{int(episode)}.json"
+            path.write_text(json.dumps(report, indent=2) + "\n")
+            print(format_report(report), flush=True)
     print(f"wrote {out}")
 
 
@@ -1011,11 +1042,12 @@ def main(argv=None) -> None:
     parser.add_argument("--episodes", type=int, nargs="+", default=[0, 9])
     parser.add_argument("--horizon", type=int, default=6)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--arm", choices=("both", "r4vt", "r1rel"), default="both")
     args = parser.parse_args(argv)
     if args.mode == "runner":
         if args.out is None:
             raise SystemExit("runner mode needs --out")
-        write_runner_replay(args.out, args.episodes, args.horizon)
+        write_runner_replay(args.out, args.episodes, args.horizon, args.arm)
         return
     write_exports(tuple(args.episodes))
 

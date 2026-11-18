@@ -17,8 +17,11 @@ import numpy as np
 import zarr
 from scipy.spatial.transform import Rotation
 
-# Local copies of the Fix B sets. Checkpoints trained on Hyak store the
-# container path ``/data/acp_replay_buffer.zarr``, which is not on this PC.
+# Local copies of the Fix B sets. Checkpoints trained on Hyak store a
+# container path such as ``/data/<name>/acp_replay_buffer.zarr``, which is
+# not on this PC. r4vt task names are shared across the causal and smooth
+# zarrs, so those are found by the dataset name under this root.
+_LOCAL_MOLD_ROOT = Path("/mnt/data/umidata/ft/mold_aware_datasets")
 _LOCAL_DATASET_BY_TASK = {
     "OCT-V35-FIXB-R1-WORLD-WORLD": (
         "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/"
@@ -68,6 +71,32 @@ _LOCAL_DATASET_BY_TASK = {
 }
 
 
+def _cfg_dataset_name(cfg_dataset_path: str) -> str:
+    """Directory name of a Hyak ``/data/<name>/acp_replay_buffer.zarr`` path."""
+    path = Path(str(cfg_dataset_path or "").strip())
+    if path.name == "acp_replay_buffer.zarr":
+        return path.parent.name
+    return path.name
+
+
+def _local_named_zarr(dataset_name: str) -> Optional[Path]:
+    """The one local mold zarr whose parent directory is ``dataset_name``."""
+    name = str(dataset_name or "").strip()
+    if name in ("", ".", "data", "acp_replay_buffer.zarr"):
+        return None
+    root = _LOCAL_MOLD_ROOT
+    if not root.is_dir():
+        return None
+    matches = [
+        path
+        for path in sorted(root.glob(f"**/{name}/acp_replay_buffer.zarr"))
+        if path.is_dir()
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
 def resolve_dataset_zarr(cfg_dataset_path: str, task_name: str) -> Optional[Path]:
     """Return a zarr that exists on this machine, or None."""
     raw = str(cfg_dataset_path or "").strip()
@@ -75,6 +104,9 @@ def resolve_dataset_zarr(cfg_dataset_path: str, task_name: str) -> Optional[Path
         path = Path(raw)
         if path.is_dir():
             return path
+        named = _local_named_zarr(_cfg_dataset_name(raw))
+        if named is not None:
+            return named
     fallback = _LOCAL_DATASET_BY_TASK.get(str(task_name or "").strip())
     if fallback and Path(fallback).is_dir():
         return Path(fallback)
