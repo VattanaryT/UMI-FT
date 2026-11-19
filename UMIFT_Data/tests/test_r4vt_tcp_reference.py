@@ -163,10 +163,32 @@ def test_episode0_nominal_tracks_tcp_foot():
     assert press > 10
 
 
-def test_fast_20mm_tcp_step_is_limited_by_the_label_gate():
-    """A later chunk walks toward the TCP at 6 mm per step. It does not hop 20 mm."""
+def test_v_par_leads_along_the_mesh_and_stops_at_the_tcp_gate():
+    """A fast slide keeps going past 6 mm and stops at the 20 mm lead."""
     from fixb_tcp_track import GATE_M
+    from mold_aware_runtime import LEAD_M
 
+    runtime = _runtime()
+    steps = 8
+    action = _action(0.0, steps=steps)
+    action[:, 0] = 0.5
+    tcp = np.zeros(3)
+    decoded = runtime.decode_chunk(
+        action, tcp, np.eye(3), np.full(steps, 1.0 / 15.0), apply_safety=False
+    )
+    gap = np.linalg.norm(decoded["x_s"] - tcp, axis=1)
+    moved = np.linalg.norm(np.diff(decoded["x_s"], axis=0), axis=1)
+    assert decoded["x_s"][0, 0] == pytest.approx(0.0)
+    assert decoded["x_s"][1, 0] == pytest.approx(GATE_M, abs=1e-4)
+    assert decoded["x_s"][2, 0] == pytest.approx(2 * GATE_M, abs=1e-4)
+    assert np.all(decoded["x_s"][:, 1] == pytest.approx(0.0, abs=1e-8))
+    assert np.all(moved <= GATE_M + 1e-4)
+    assert gap.max() == pytest.approx(LEAD_M, abs=1e-4)
+    assert gap[-1] == pytest.approx(LEAD_M, abs=1e-4)
+
+
+def test_fast_20mm_tcp_step_is_limited_by_the_label_gate():
+    """A 20 mm lead is allowed. The foot does not hop to that TCP."""
     runtime = _runtime()
     runtime.decode_chunk(
         _action(0.0), np.zeros(3), np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
@@ -179,28 +201,106 @@ def test_fast_20mm_tcp_step_is_limited_by_the_label_gate():
         np.full(steps, 1.0 / 15.0),
         apply_safety=False,
     )
-    moved = np.linalg.norm(np.diff(np.vstack([np.zeros(3), decoded["x_s"]]), axis=0), axis=1)
-    assert np.all(moved <= GATE_M + 1e-6)
-    assert moved[0] == pytest.approx(GATE_M, abs=1e-6)
+    assert np.allclose(decoded["x_s"], 0.0, atol=1e-6)
     assert not np.allclose(decoded["x_s"][0], [0.020, 0.0, 0.0])
 
 
-def test_ray_recovery_is_not_the_closest_point():
-    """After more than N rejected steps the foot takes the press-axis hit."""
+def _frame_at_angle(angle_deg: float) -> np.ndarray:
+    angle = np.deg2rad(angle_deg)
+    outward = np.array([0.0, -np.cos(angle), np.sin(angle)])
+    z_col = -outward
+    t1 = np.array([1.0, 0.0, 0.0])
+    t2 = np.cross(z_col, t1)
+    return np.column_stack([t1, t2, z_col])
+
+
+def test_uphill_v_par_takes_the_chord_that_clears_the_fillet(monkeypatch):
+    """A 2 mm piece stays on the wall. The 8 mm chord lands on the fillet."""
+    from mold_aware_runtime import integrate_tcp_foot
+
+    class _Fillet:
+        def query(self, p):
+            points = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+            frames = np.stack([
+                _frame_at_angle(60.0 if point[0] < 0.008 else 30.0) for point in points
+            ])
+            return {"x_s": points.copy(), "R": frames, "sd": np.zeros(len(points))}
+
+    v = np.array([[0.02, 0.0], [0.02, 0.0]])
+    dt = np.full(2, 1.0 / 15.0)
+    held = integrate_tcp_foot(_Fillet(), np.zeros(3), v, np.zeros(2), dt)
+    assert held["x_s"][1, 0] == pytest.approx(0.02 / 15.0, abs=1e-6)
+    monkeypatch.setenv("UMIFT_FOOT_CLIMB", "1")
+    decoded = integrate_tcp_foot(_Fillet(), np.zeros(3), v, np.zeros(2), dt)
+    assert decoded["x_s"][0, 0] == pytest.approx(0.0)
+    # The short step lands first. The chord is 8 mm from there.
+    assert decoded["x_s"][1, 0] == pytest.approx(0.02 / 15.0 + 0.008, abs=1e-6)
+
+
+def test_climb_does_not_hop_to_the_other_sheet(monkeypatch):
+    """A chord whose normal has flipped is refused. The short step stands."""
+    from mold_aware_runtime import integrate_tcp_foot
+
+    monkeypatch.setenv("UMIFT_FOOT_CLIMB", "1")
+
+    class _Flip:
+        def query(self, p):
+            points = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+            frames = np.stack([
+                _frame_at_angle(60.0 if point[0] < 0.008 else 170.0) for point in points
+            ])
+            return {"x_s": points.copy(), "R": frames, "sd": np.zeros(len(points))}
+
+    decoded = integrate_tcp_foot(
+        _Flip(),
+        np.zeros(3),
+        np.array([[0.02, 0.0], [0.02, 0.0]]),
+        np.zeros(2),
+        np.full(2, 1.0 / 15.0),
+    )
+    assert decoded["x_s"][1, 0] == pytest.approx(0.02 / 15.0, abs=1e-6)
+
+
+def test_geodesic_walk_follows_the_folded_surface(monkeypatch):
+    """A step off the first triangle continues on the next one, not through space."""
+    from fixb_field import orthonormal_frames
+    from mold_aware_runtime import integrate_tcp_foot
+
+    monkeypatch.setenv("UMIFT_FOOT_WALK", "geodesic")
+
+    class _Fold:
+        def __init__(self):
+            self.vertices = np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0]]
+            )
+            self.faces = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+            flat = orthonormal_frames(np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+            wall = orthonormal_frames(np.array([0.0, 0.0, 1.0]), np.array([-1.0, 0.0, 0.0]))
+            self.frames = np.stack([flat, flat, flat, wall])
+
+        def query(self, p):
+            points = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+            frame = orthonormal_frames(np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+            frames = np.broadcast_to(frame, (len(points), 3, 3)).copy()
+            return {"x_s": points.copy(), "R": frames, "sd": np.zeros(len(points))}
+
+    decoded = integrate_tcp_foot(
+        _Fold(),
+        np.array([0.5, 0.2, 0.0]),
+        np.array([[12.0, 0.0], [12.0, 0.0]]),
+        np.zeros(2),
+        np.full(2, 1.0 / 15.0),
+    )
+    assert decoded["x_s"][0] == pytest.approx([0.5, 0.2, 0.0], abs=1e-6)
+    assert decoded["x_s"][1] == pytest.approx([1.0, 0.2, 0.3], abs=1e-5)
+
+
+def test_a_far_tcp_is_approached_one_gate_at_a_time():
+    """A TCP 80 mm away is walked toward. The foot does not jump to it."""
+    from fixb_tcp_track import GATE_M
     from mold_aware_runtime import HOP_HOLD_LIMIT
 
-    class _Ray(_Flat):
-        def ray_hit(self, origin, direction):
-            del origin, direction
-            return np.array([0.05, 0.0, 0.0])
-
-    runtime = MoldAwareRuntime(
-        field=_Ray(),
-        R_off=np.eye(3),
-        run_type="r4_world_fixb_tilt",
-        limits=r4_safety_limits(),
-        dry_run=False,
-    )
+    runtime = _runtime()
     runtime.decode_chunk(
         _action(0.0), np.zeros(3), np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
     )
@@ -212,10 +312,10 @@ def test_ray_recovery_is_not_the_closest_point():
         np.full(steps, 1.0 / 15.0),
         apply_safety=False,
     )
-    assert int(np.sum(decoded["hop_hold"])) == HOP_HOLD_LIMIT
-    assert bool(decoded["foot_reanchor"][-1])
-    assert np.allclose(decoded["x_s"][-1], [0.05, 0.0, 0.0])
-    assert not np.allclose(decoded["x_s"][-1], [0.08, 0.0, 0.0])
+    moved = np.linalg.norm(np.diff(np.vstack([np.zeros(3), decoded["x_s"]]), axis=0), axis=1)
+    assert np.all(moved <= GATE_M + 1e-6)
+    assert decoded["x_s"][-1, 0] == pytest.approx(GATE_M * steps, abs=1e-6)
+    assert not np.any(decoded["foot_reanchor"])
 
 
 def test_rd_slew_caps_three_degrees_across_replans():
@@ -407,6 +507,41 @@ def test_orientation_past_25_degrees_holds_the_previous():
     assert not bool(near[0])
 
 
+def test_replay_holds_orientation_before_the_flange_check():
+    """A 40° command that crosses the plane is held to the label first.
+
+    The flange check then sees the held tool and does not abort. Without the
+    label, the same command still trips.
+    """
+    from fixb_labels import so3_to_rot6d_rows
+
+    limits = r4_safety_limits()
+    limits.enable_rd_slew = False
+    runtime = _runtime(limits)
+    angle = np.radians(40.0)
+    cosine, sine = np.cos(angle), np.sin(angle)
+    tipped = np.array([[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]])
+    corners = d405_housing_corners_in_tcp()
+    y_held = float((corners @ np.array([0.0, 1.0, 0.0])).max())
+    y_tipped = float((corners @ tipped.T @ np.array([0.0, 1.0, 0.0])).max())
+    assert y_tipped > y_held + 1e-4
+    runtime.set_table_plane(np.array([0.0, 1.0, 0.0]), (y_held + y_tipped) / 2.0)
+    action = _action(0.0)
+    action[:, 21:27] = so3_to_rot6d_rows(tipped.reshape(1, 3, 3))
+    tcp = np.zeros(3)
+    held = runtime.decode_chunk(
+        action, tcp, np.eye(3), np.array([1.0 / 15.0]), label_R=np.eye(3).reshape(1, 3, 3)
+    )
+    assert "camera_table" not in runtime.last_triggers
+    assert bool(held["ori_hold"][0])
+    assert np.allclose(held["R_d"][0], np.eye(3), atol=1e-8)
+
+    tripped = _runtime(limits)
+    tripped.set_table_plane(np.array([0.0, 1.0, 0.0]), (y_held + y_tipped) / 2.0)
+    tripped.decode_chunk(action, tcp, np.eye(3), np.array([1.0 / 15.0]))
+    assert "camera_table" in tripped.last_triggers
+
+
 def test_wrist_camera_through_the_table_holds():
     limits = r4_safety_limits()
     limits.table_y_m = 0.0
@@ -440,6 +575,19 @@ def test_tcp_far_from_the_mesh_flags():
         _action(0.0), np.array([0.0, 0.0, 0.25]), np.eye(3), np.array([1.0 / 15.0])
     )
     assert "mesh_far" in runtime.last_triggers
+
+
+def test_old_far_pose_in_the_window_does_not_abort():
+    """The approach can be >100 mm off. Only the newest measured TCP counts."""
+    limits = r4_safety_limits(abort_on_measured_mesh_distance=True)
+    runtime = _runtime(limits)
+    p = np.array([[0.0, 0.0, 0.15], [0.0, 0.0, 0.031]])
+    x = np.zeros_like(p)
+    runtime.note_measured_mesh_distance(p, x)
+    assert "max_distance_from_mesh" not in runtime.last_hard_triggers
+    still_far = _runtime(limits)
+    still_far.note_measured_mesh_distance(p[::-1], x[::-1])
+    assert still_far.last_hard_triggers == ["max_distance_from_mesh"]
 
 
 def test_capped_foot_is_projected_back_onto_the_mesh():

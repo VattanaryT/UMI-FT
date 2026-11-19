@@ -8,6 +8,7 @@ training/eval scripts. Training stringer assets default to
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -170,6 +171,9 @@ FACE_HOLD_DEG = 5.0
 RD_SLEW_AFTER_RAMP_DEG = 8.0
 # Virtual-target offset grows from the measured TCP to the command over this long.
 VT_RAMP_S = 1.0
+# One chunk of travel on this layup. A same-sheet v_par slide may lead the TCP
+# by this much. Only the extra is walked back, at most one 6 mm step.
+LEAD_M = 0.020
 # Fixture +Y is down. Bench replay lifts along −Y, off the table on every face.
 FIXTURE_UP = np.array([0.0, -1.0, 0.0])
 # How far a D405 housing corner must stay above the flange table.
@@ -488,6 +492,380 @@ def press_ray_hit(field, origin: np.ndarray, direction: np.ndarray):
     return hits[int(np.argmin(dist))]
 
 
+def _slide_on_mesh(query, x, R, v_par, dt):
+    """Add ``v_par * dt`` in the tangent plane and project each piece onto the mesh.
+
+    A piece that hops to another sheet is dropped. The foot stays where the
+    last accepted piece landed.
+    """
+    from fixb_tcp_track import MAX_FOOT_STEP_M, WALK_STEP_M
+
+    step = np.asarray(R, dtype=np.float64).reshape(3, 3)[:, :2] @ np.asarray(v_par, dtype=np.float64).reshape(2)
+    step = step * float(dt)
+    x = np.asarray(x, dtype=np.float64).reshape(3).copy()
+    R = np.asarray(R, dtype=np.float64).reshape(3, 3).copy()
+    length = float(np.linalg.norm(step))
+    if length < 1e-6 or not np.isfinite(length):
+        return x, R
+    # One step is still 6 mm. A longer command is clipped, then walked in pieces.
+    if length > MAX_FOOT_STEP_M:
+        step = step * (MAX_FOOT_STEP_M / length)
+        length = MAX_FOOT_STEP_M
+    pieces = max(1, int(np.ceil(length / WALK_STEP_M)))
+    delta = step / pieces
+    outward = -R[:, 2]
+    for _ in range(pieces):
+        landed_x, landed_R = query((x + delta).reshape(1, 3))
+        landed_x = np.asarray(landed_x, dtype=np.float64).reshape(3)
+        landed_R = np.asarray(landed_R, dtype=np.float64).reshape(3, 3)
+        landed_n = -landed_R[:, 2]
+        if float(np.linalg.norm(landed_x - x)) > WALK_STEP_M + 0.002:
+            break
+        if float(np.dot(landed_n, outward)) < np.cos(np.deg2rad(25.0)):
+            break
+        x, R, outward = landed_x, landed_R, landed_n
+    return x, R
+
+
+def _same_sheet(frame, previous) -> bool:
+    """True when column 2 has not turned far enough to be the other sheet."""
+    new = np.asarray(frame, dtype=np.float64).reshape(3, 3)[:, 2]
+    old = np.asarray(previous, dtype=np.float64).reshape(3, 3)[:, 2]
+    return float(np.dot(new, old)) >= np.cos(np.deg2rad(25.0))
+
+
+def _tangential_offset(foot, frame, tcp) -> np.ndarray:
+    """Foot minus TCP, with the surface-normal part removed."""
+    outward = -np.asarray(frame, dtype=np.float64).reshape(3, 3)[:, 2]
+    length = float(np.linalg.norm(outward))
+    if length < 1e-12:
+        return np.asarray(foot, dtype=np.float64).reshape(3) - np.asarray(tcp, dtype=np.float64).reshape(3)
+    outward = outward / length
+    delta = np.asarray(foot, dtype=np.float64).reshape(3) - np.asarray(tcp, dtype=np.float64).reshape(3)
+    return delta - float(np.dot(delta, outward)) * outward
+
+
+def _lead_anchor(query, foot, frame, tcp):
+    """Point the gate measures against.
+
+    The TCP's closest point when it is still on this sheet. Otherwise the
+    foot with its sideways offset from the TCP removed, so a closest point on
+    the other sheet cannot pull the foot across.
+    """
+    hit_x, hit_R = query(np.asarray(tcp, dtype=np.float64).reshape(1, 3))
+    hit_x = np.asarray(hit_x, dtype=np.float64).reshape(3)
+    hit_R = np.asarray(hit_R, dtype=np.float64).reshape(3, 3)
+    if _same_sheet(hit_R, frame):
+        return hit_x
+    tang = _tangential_offset(foot, frame, tcp)
+    return np.asarray(foot, dtype=np.float64).reshape(3) - tang
+
+
+def _clamp_lead(query, foot, frame, tcp, max_gap, max_step):
+    """Walk the foot toward the TCP's anchor until the gap is ``max_gap``.
+
+    Each piece is projected. A piece that leaves the sheet, or that does not
+    get closer to the anchor, is refused.
+    """
+    from fixb_tcp_track import WALK_STEP_M
+
+    foot = np.asarray(foot, dtype=np.float64).reshape(3).copy()
+    frame = np.asarray(frame, dtype=np.float64).reshape(3, 3).copy()
+    anchor = _lead_anchor(query, foot, frame, tcp)
+    limited = False
+    moved = 0.0
+    while moved < max_step - 1e-6:
+        delta = anchor - foot
+        dist = float(np.linalg.norm(delta))
+        if dist <= max_gap + 1e-6 or dist < 1e-12:
+            break
+        limited = True
+        step = min(WALK_STEP_M, max_step - moved, dist - max_gap)
+        guess = foot + delta * (step / dist)
+        landed_x, landed_R = query(guess.reshape(1, 3))
+        landed_x = np.asarray(landed_x, dtype=np.float64).reshape(3)
+        landed_R = np.asarray(landed_R, dtype=np.float64).reshape(3, 3)
+        if not _same_sheet(landed_R, frame):
+            break
+        if float(np.linalg.norm(anchor - landed_x)) >= dist - 1e-4:
+            break
+        moved += float(np.linalg.norm(landed_x - foot))
+        foot, frame = landed_x, landed_R
+    return foot, frame, limited
+
+
+def _outward_angle_deg(frame) -> tuple[float, np.ndarray]:
+    """Angle of the outward normal from fixture up, and that unit normal."""
+    outward = -np.asarray(frame, dtype=np.float64).reshape(3, 3)[:, 2]
+    length = float(np.linalg.norm(outward))
+    if length < 1e-12:
+        return 0.0, outward
+    outward = outward / length
+    up = np.array([0.0, -1.0, 0.0])
+    angle = float(np.degrees(np.arccos(np.clip(float(np.dot(outward, up)), -1.0, 1.0))))
+    return angle, outward
+
+
+def _climb_up_fillet(query, foot, frame, v_par, dt):
+    """One chord back up the fillet when short pieces snap onto the steep face.
+
+    From the wall, a 2 mm step toward the fillet still closest-points onto the
+    wall. Probe 8, 10, 12, then 15 mm along ``v_par`` and take the shortest
+    landing that is at least 8° less steep and still on this face.
+    """
+    frame = np.asarray(frame, dtype=np.float64).reshape(3, 3)
+    step = frame[:, :2] @ np.asarray(v_par, dtype=np.float64).reshape(2)
+    step = step * float(dt)
+    length = float(np.linalg.norm(step))
+    if length < 1e-4 or not np.isfinite(length):
+        return np.asarray(foot, dtype=np.float64).reshape(3), frame
+    direction = step / length
+    here, here_n = _outward_angle_deg(frame)
+    foot = np.asarray(foot, dtype=np.float64).reshape(3)
+    for dist in (0.008, 0.010, 0.012, 0.015):
+        landed_x, landed_R = query((foot + direction * dist).reshape(1, 3))
+        landed_x = np.asarray(landed_x, dtype=np.float64).reshape(3)
+        landed_R = np.asarray(landed_R, dtype=np.float64).reshape(3, 3)
+        angle, landed_n = _outward_angle_deg(landed_R)
+        if float(np.dot(landed_n, here_n)) < np.cos(np.deg2rad(50.0)):
+            continue
+        if angle > here - 8.0:
+            continue
+        return landed_x, landed_R
+    return foot, frame
+
+
+def foot_walk_mode() -> str:
+    """``legacy`` keeps the 20 mm lead. ``geodesic`` follows the mesh triangles.
+
+    Set ``UMIFT_FOOT_WALK=geodesic`` to walk triangle to triangle. Anything else,
+    including an unset variable, keeps the 20 mm lead.
+    """
+    mode = os.environ.get("UMIFT_FOOT_WALK", "legacy").strip().lower()
+    if mode in ("geodesic", "surface"):
+        return "geodesic"
+    return "legacy"
+
+
+def foot_climb_enabled() -> bool:
+    """The fillet-climb chord is off unless ``UMIFT_FOOT_CLIMB`` is set.
+
+    ``1``, ``true``, ``on``, or ``yes`` enable it. Unset is off. The 20 mm lead
+    does not depend on this flag.
+    """
+    return os.environ.get("UMIFT_FOOT_CLIMB", "").strip().lower() in ("1", "true", "on", "yes")
+
+
+def _face_neighbors(faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Neighbor face and its edge index across each local edge. -1 is a boundary."""
+    faces = np.asarray(faces, dtype=np.int64)
+    buckets: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for face_id, (a, b, c) in enumerate(faces):
+        for edge, pair in enumerate(((b, c), (c, a), (a, b))):
+            buckets.setdefault(tuple(sorted((int(pair[0]), int(pair[1])))), []).append((face_id, edge))
+    neighbor = np.full((len(faces), 3), -1, dtype=np.int64)
+    neighbor_edge = np.full((len(faces), 3), -1, dtype=np.int64)
+    for pairs in buckets.values():
+        if len(pairs) != 2:
+            continue
+        (face_a, edge_a), (face_b, edge_b) = pairs
+        neighbor[face_a, edge_a] = face_b
+        neighbor_edge[face_a, edge_a] = edge_b
+        neighbor[face_b, edge_b] = face_a
+        neighbor_edge[face_b, edge_b] = edge_a
+    return neighbor, neighbor_edge
+
+
+def _mesh_neighbors(field) -> tuple[np.ndarray, np.ndarray]:
+    cached = getattr(field, "_face_neighbor_cache", None)
+    if cached is None:
+        cached = _face_neighbors(field.faces)
+        field._face_neighbor_cache = cached
+    return cached
+
+
+def _barycentric(verts: np.ndarray, point: np.ndarray) -> np.ndarray | None:
+    e1 = verts[1] - verts[0]
+    e2 = verts[2] - verts[0]
+    gram = np.array([[np.dot(e1, e1), np.dot(e1, e2)], [np.dot(e2, e1), np.dot(e2, e2)]])
+    if abs(float(np.linalg.det(gram))) < 1e-18:
+        return None
+    rel = np.asarray(point, dtype=np.float64).reshape(3) - verts[0]
+    a, b = np.linalg.solve(gram, [np.dot(e1, rel), np.dot(e2, rel)])
+    return np.array([1.0 - a - b, a, b], dtype=np.float64)
+
+
+def _bary_velocity(verts: np.ndarray, direction: np.ndarray) -> np.ndarray | None:
+    weights = _barycentric(verts, verts[0] + np.asarray(direction, dtype=np.float64).reshape(3))
+    if weights is None:
+        return None
+    # _barycentric of V0 + d is the weight of d, since V0 has weight (1, 0, 0).
+    return weights - np.array([1.0, 0.0, 0.0])
+
+
+def _locate_face(field, point: np.ndarray) -> tuple[int, np.ndarray | None]:
+    point = np.asarray(point, dtype=np.float64).reshape(3)
+    scene = getattr(field, "scene", None)
+    if scene is not None:
+        import open3d as o3d
+
+        query = o3d.core.Tensor(point.astype(np.float32).reshape(1, 3))
+        answer = scene.compute_closest_points(query)
+        tri = int(answer["primitive_ids"].numpy()[0])
+        if 0 <= tri < len(field.faces):
+            uv = answer["primitive_uvs"].numpy()[0]
+            return tri, np.array([1.0 - uv[0] - uv[1], uv[0], uv[1]], dtype=np.float64)
+    best_face, best_w, best_score = -1, None, -1e9
+    for face_id, face in enumerate(np.asarray(field.faces)):
+        weights = _barycentric(field.vertices[face], point)
+        if weights is None:
+            continue
+        score = float(np.min(weights))
+        if score > best_score:
+            best_face, best_w, best_score = face_id, weights, score
+    if best_w is None:
+        return -1, None
+    weights = np.clip(best_w, 0.0, None)
+    total = float(weights.sum())
+    if total < 1e-12:
+        return -1, None
+    return best_face, weights / total
+
+
+def _frame_on_triangle(field, face: int, weights: np.ndarray, prev_R: np.ndarray, travel: np.ndarray) -> np.ndarray:
+    from fixb_field import orthonormal_frames
+    from fixb_smooth_field import hold_tangent_through_spin
+
+    orientations = getattr(field, "_ori", None)
+    if orientations is None:
+        orientations = getattr(field, "frames", None)
+    if orientations is not None:
+        vid = np.asarray(field.faces[face], dtype=np.int64)
+        samples = orientations[vid]
+        t1 = weights @ samples[:, :, 0]
+        normal = weights @ samples[:, :, 2]
+        if float(np.linalg.norm(normal)) > 1e-8 and float(np.linalg.norm(t1)) > 1e-8:
+            landed = orthonormal_frames(t1, normal)
+            return hold_tangent_through_spin(prev_R, landed)
+    verts = field.vertices[field.faces[face]]
+    normal = np.cross(verts[1] - verts[0], verts[2] - verts[0])
+    if getattr(field, "orientation_z_inward", False):
+        normal = -normal
+    if float(np.linalg.norm(normal)) < 1e-12 or float(np.linalg.norm(travel)) < 1e-12:
+        return np.asarray(prev_R, dtype=np.float64).reshape(3, 3)
+    return orthonormal_frames(travel, normal)
+
+
+def _walk_on_surface(field, foot, frame, v_par, dt):
+    """Move ``v_par * dt`` across triangles. The path does not leave the surface."""
+    frame = np.asarray(frame, dtype=np.float64).reshape(3, 3)
+    foot = np.asarray(foot, dtype=np.float64).reshape(3)
+    if not hasattr(field, "faces") or not hasattr(field, "vertices"):
+        return foot, frame
+    step = frame[:, :2] @ np.asarray(v_par, dtype=np.float64).reshape(2)
+    step = step * float(dt)
+    if float(np.linalg.norm(step)) < 1e-6 or not np.isfinite(np.linalg.norm(step)):
+        return foot, frame
+    face, weights = _locate_face(field, foot)
+    if face < 0 or weights is None:
+        return foot, frame
+    neighbor, _neighbor_edge = _mesh_neighbors(field)
+    verts = field.vertices[field.faces[face]]
+    normal = np.cross(verts[1] - verts[0], verts[2] - verts[0])
+    norm = float(np.linalg.norm(normal))
+    if norm < 1e-12:
+        return foot, frame
+    normal = normal / norm
+    direction = step - normal * float(np.dot(step, normal))
+    remaining = float(np.linalg.norm(direction))
+    if remaining < 1e-6:
+        return foot, frame
+    direction = direction / remaining
+    came_from = -1
+    for _ in range(100):
+        if remaining < 1e-6:
+            break
+        verts = field.vertices[field.faces[face]]
+        velocity = _bary_velocity(verts, direction)
+        if velocity is None:
+            break
+        hit = None
+        for edge in range(3):
+            if velocity[edge] >= -1e-12:
+                continue
+            distance = -weights[edge] / velocity[edge]
+            if distance < -1e-8:
+                continue
+            if hit is None or distance < hit[0]:
+                hit = (distance, edge)
+        if hit is None or hit[0] >= remaining - 1e-9:
+            weights = weights + remaining * velocity
+            weights = np.clip(weights, 0.0, None)
+            weights = weights / max(float(weights.sum()), 1e-12)
+            remaining = 0.0
+            break
+        distance, edge = hit
+        if distance > 1e-8:
+            weights = weights + distance * velocity
+            remaining -= distance
+        weights = np.clip(weights, 0.0, None)
+        weights[edge] = 0.0
+        total = float(weights.sum())
+        if total < 1e-12:
+            break
+        weights = weights / total
+        nxt = int(neighbor[face, edge])
+        if nxt < 0 or nxt == came_from:
+            remaining = 0.0
+            break
+        point = weights @ verts
+        other = field.vertices[field.faces[nxt]]
+        edge_ids = [i for i in range(3) if i != edge]
+        edge_vec = verts[edge_ids[1]] - verts[edge_ids[0]]
+        edge_len = float(np.linalg.norm(edge_vec))
+        if edge_len < 1e-12:
+            break
+        edge_hat = edge_vec / edge_len
+        mid = 0.5 * (verts[edge_ids[0]] + verts[edge_ids[1]])
+        inward_old = verts[edge] - mid
+        inward_old = inward_old - edge_hat * float(np.dot(inward_old, edge_hat))
+        inward_len = float(np.linalg.norm(inward_old))
+        if inward_len < 1e-12:
+            break
+        outward = -inward_old / inward_len
+        along = float(np.dot(direction, edge_hat))
+        across = float(np.dot(direction, outward))
+        new_weights = _barycentric(other, point)
+        if new_weights is None:
+            break
+        new_weights = np.clip(new_weights, 0.0, None)
+        new_weights = new_weights / max(float(new_weights.sum()), 1e-12)
+        # The vertex that is not on this edge is the one the neighbor stores opposite the shared edge.
+        shared = {int(field.faces[face][i]) for i in edge_ids}
+        interior = 0
+        for local, vid in enumerate(field.faces[nxt]):
+            if int(vid) not in shared:
+                interior = local
+                break
+        inward_new = other[interior] - mid
+        inward_new = inward_new - edge_hat * float(np.dot(inward_new, edge_hat))
+        inward_new_len = float(np.linalg.norm(inward_new))
+        if inward_new_len < 1e-12:
+            break
+        inward_new = inward_new / inward_new_len
+        direction = along * edge_hat + across * inward_new
+        dir_len = float(np.linalg.norm(direction))
+        if dir_len < 1e-8:
+            break
+        direction = direction / dir_len
+        came_from = face
+        face = nxt
+        weights = new_weights
+    point = weights @ field.vertices[field.faces[face]]
+    landed = _frame_on_triangle(field, face, weights, frame, direction)
+    return point, landed
+
+
 def integrate_tcp_foot(
     field,
     p0: np.ndarray,
@@ -504,13 +882,16 @@ def integrate_tcp_foot(
     reject_streak: int = 0,
     R_tool: np.ndarray | None = None,
 ) -> Dict[str, np.ndarray]:
-    """Track the measured TCP with the label's ``step_foot`` on every step.
+    """Track the measured TCP, and slide the foot by ``v_par``.
 
     Episode start queries the closest point, as the labels do. Every later
-    step, including the first step of a later chunk, is ``step_foot`` from the
-    previous foot. There is no chunk-start snap. More than ``HOP_HOLD_LIMIT``
-    rejected steps re-anchor to the press-axis ray hit, not the closest point.
-    ``v_par`` still places the virtual target; it does not move the foot.
+    step adds ``v_par * dt`` in the tangent plane and projects that point back
+    onto the mesh, at most ``MAX_FOOT_STEP_M``. A same-sheet slide is kept.
+    The foot may lead the measured TCP by ``LEAD_M``. Only the extra is walked
+    back, at most ``MAX_FOOT_STEP_M`` per step. The fillet-climb chord stays
+    off unless ``UMIFT_FOOT_CLIMB`` is set. A step onto another sheet is
+    refused. The press offset along
+    the normal is not a lead.
     ``cap_origin`` is unused. ``hop_streak`` and ``step_allow`` are kept so
     older callers do not break.
     """
@@ -519,10 +900,10 @@ def integrate_tcp_foot(
     dt = np.asarray(dt, dtype=np.float64).reshape(-1)
     del cap_origin, hop_streak, step_allow
     h = len(delta_n)
-    from fixb_tcp_track import accept_local, step_foot
+    from fixb_tcp_track import MAX_FOOT_STEP_M
 
     tcp = np.asarray(p0, dtype=np.float64).reshape(3)
-    axis = None if R_tool is None else np.asarray(R_tool, dtype=np.float64).reshape(3, 3)[:, 2]
+    del R_tool
     query = lambda pts: _label_query(field, pts)
     episode_start = prev_x is None or prev_R is None
     x_s = np.zeros((h, 3))
@@ -540,34 +921,37 @@ def integrate_tcp_foot(
         rk = np.asarray(prev_R, dtype=np.float64).reshape(3, 3).copy()
     for k in range(h):
         if not (episode_start and k == 0):
-            free_x, free_R = query(tcp.reshape(1, 3))
-            free_x = np.asarray(free_x, dtype=np.float64).reshape(3)
-            free_R = np.asarray(free_R, dtype=np.float64).reshape(3, 3)
-            rejected = not accept_local(free_x, free_R, xs, rk)
-            if rejected:
-                streak += 1
+            if foot_walk_mode() == "geodesic":
+                # On the triangles. No chord snap, no 20 mm lead, no fillet climb.
+                xs, rk = _walk_on_surface(field, xs, rk, v_par[k], dt[k])
             else:
-                streak = 0
-            recovered = False
-            if streak > HOP_HOLD_LIMIT and axis is not None:
-                hit = press_ray_hit(field, tcp, axis)
-                if hit is not None:
-                    xs, rk = query(hit.reshape(1, 3))
-                    xs = np.asarray(xs, dtype=np.float64).reshape(3).copy()
-                    rk = np.asarray(rk, dtype=np.float64).reshape(3, 3).copy()
-                    print(
-                        f"[mold] press-axis re-anchor after {streak} rejected steps"
-                    )
+                # The gate is the distance to the TCP's closest point on this sheet.
+                anchor = _lead_anchor(query, xs, rk, tcp)
+                lead = float(np.linalg.norm(xs - anchor))
+                rejected = lead > LEAD_M
+                if rejected:
+                    streak += 1
+                else:
                     streak = 0
-                    recovered = True
-            if not recovered:
-                xs, rk = step_foot(query, tcp, xs, rk, free_x, free_R)
-                xs = np.asarray(xs, dtype=np.float64).reshape(3).copy()
-                rk = np.asarray(rk, dtype=np.float64).reshape(3, 3).copy()
+                # A same-sheet v_par slide stands, including when it increases the
+                # lead. Only the part past LEAD_M is walked back, one step at most.
+                slid_x, slid_R = _slide_on_mesh(query, xs, rk, v_par[k], dt[k])
+                xs, rk, limited = _clamp_lead(
+                    query, slid_x, slid_R, tcp, LEAD_M, MAX_FOOT_STEP_M
+                )
+                if foot_climb_enabled():
+                    xs, rk = _climb_up_fillet(query, xs, rk, v_par[k], dt[k])
+                foot_capped[k] = limited
                 hop_held[k] = rejected
-            reanchored[k] = recovered
             if hold_face:
                 xs, rk, face_held[k] = _reject_new_face(xs, rk, prev_x if k == 0 else x_s[k - 1], prev_R if k == 0 else frames[k - 1])
+                # A query whose normal has turned is not adopted above. Hold the
+                # commanded orientation anyway, as the 5° face hold used to.
+                if not face_held[k]:
+                    _hit_x, hit_R = query(tcp.reshape(1, 3))
+                    hit_R = np.asarray(hit_R, dtype=np.float64).reshape(3, 3)
+                    if not _same_face(hit_R, rk, FACE_HOLD_DEG):
+                        face_held[k] = True
         x_s[k] = xs
         frames[k] = rk
         prev_x, prev_R = xs, rk
@@ -1158,19 +1542,21 @@ class MoldAwareRuntime:
             self.last_triggers.append("tcp_penetration")
 
     def note_measured_mesh_distance(self, p_meas: np.ndarray, x_s: np.ndarray) -> None:
-        """Abort when the measured TCP is farther than max_distance_from_mesh_m.
+        """Abort when the newest measured TCP is farther than max_distance_from_mesh_m.
 
-        Off unless abort_on_measured_mesh_distance is set. On, decode_chunk
-        does not abort on the commanded ||x_d - x_s||.
+        The observation window still holds the approach and the homing lift.
+        Those older poses are not the pose about to move. Off unless
+        abort_on_measured_mesh_distance is set. On, decode_chunk does not
+        abort on the commanded ||x_d - x_s||.
         """
         if not self.limits.abort_on_measured_mesh_distance:
             return
-        dist = np.linalg.norm(
-            np.asarray(p_meas, dtype=np.float64).reshape(-1, 3)
-            - np.asarray(x_s, dtype=np.float64).reshape(-1, 3),
-            axis=1,
-        )
-        if np.any(dist > float(self.limits.max_distance_from_mesh_m)):
+        p = np.asarray(p_meas, dtype=np.float64).reshape(-1, 3)
+        x = np.asarray(x_s, dtype=np.float64).reshape(-1, 3)
+        if len(p) == 0 or len(x) == 0:
+            return
+        dist = float(np.linalg.norm(p[-1] - x[-1]))
+        if dist > float(self.limits.max_distance_from_mesh_m):
             self.last_triggers.append("max_distance_from_mesh")
 
     def wrench_hold_update(self, force_n: float) -> str:
@@ -1245,11 +1631,14 @@ class MoldAwareRuntime:
         dt: np.ndarray,
         apply_safety: bool = True,
         frame_seed: np.ndarray | None = None,
+        label_R: np.ndarray | None = None,
     ) -> Dict[str, np.ndarray]:
         """Anchored Fix B decode for one chunk. Returns fixture-frame poses.
 
         apply_safety=False skips speed/depth clamps (offline parity vs eval).
-        Live robot path keeps the default True.
+        Live robot path keeps the default True. ``label_R`` is the replay-only
+        label tool orientation: a step more than 25° from it is held before
+        the flange-plane check. Rollouts leave it unset.
         """
         self.last_triggers = []
         H = raw_action.shape[0]
@@ -1264,6 +1653,7 @@ class MoldAwareRuntime:
         self.last_hop_hold = np.zeros(H, dtype=bool)
         self.last_foot_reanchor = np.zeros(H, dtype=bool)
         self.last_foot_cap = np.zeros(H, dtype=bool)
+        self.last_ori_hold = np.zeros(H, dtype=bool)
 
         if self.run_type == "r1_world_world":
             pos = raw_action[:, 0:3].astype(np.float64)
@@ -1455,6 +1845,20 @@ class MoldAwareRuntime:
             dist = np.linalg.norm(x_d - x_s, axis=1)
             if np.any(dist > self.limits.max_distance_from_mesh_m):
                 self.last_triggers.append("max_distance_from_mesh")
+        if label_R is not None:
+            # Replay only. The flange check below must see this held orientation,
+            # or a step the 25° rule would reject aborts the episode first.
+            held_R = (
+                np.asarray(R0, dtype=np.float64).reshape(3, 3)
+                if self._cmd_Rd is None
+                else np.asarray(self._cmd_Rd, dtype=np.float64).reshape(3, 3)
+            )
+            R_d, self.last_ori_hold = hold_orientation_near_label(
+                R_d,
+                np.asarray(label_R, dtype=np.float64).reshape(-1, 3, 3),
+                held_R,
+                ORI_LABEL_HOLD_DEG,
+            )
         if apply_safety:
             x_d = self._hold_if_off_the_table(x_d, p0, held_vt)
             R_d, x_d = self._hold_if_camera_hits_table(R_d, x_d, R0, p0, held_vt)
@@ -1486,6 +1890,7 @@ class MoldAwareRuntime:
             "hop_hold": self.last_hop_hold,
             "foot_reanchor": self.last_foot_reanchor,
             "foot_cap": self.last_foot_cap,
+            "ori_hold": self.last_ori_hold,
         }
 
     def _outward_normal(self, rotation: np.ndarray) -> np.ndarray:

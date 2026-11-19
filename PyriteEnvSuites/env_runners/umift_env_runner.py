@@ -231,17 +231,38 @@ def _segment_inside_safe_zone(start_xyz, goal_xyz, safe_zone, n: int = 25) -> bo
     return True
 
 
+def _camera_poses_clear(poses_base, T_fixture_from_base, normal, offset) -> bool:
+    """True when every D405 housing corner stays above the flange plane."""
+    if normal is None:
+        return True
+    from fixb_labels import pose7_to_Rp
+    from mold_aware_runtime import CAM_TABLE_MARGIN_M, d405_housing_corners_in_tcp
+
+    T = np.asarray(T_fixture_from_base, dtype=np.float64).reshape(4, 4)
+    R, p = pose7_to_Rp(np.asarray(poses_base, dtype=np.float64).reshape(-1, 7))
+    Rf = np.einsum("ij,njk->nik", T[:3, :3], R)
+    pf = (T[:3, :3] @ p.T).T + T[:3, 3]
+    corners = d405_housing_corners_in_tcp()
+    pts = np.einsum("nij,kj->nki", Rf, corners) + pf[:, None, :]
+    clearance = float(offset) - np.einsum("nki,i->nk", pts, np.asarray(normal, dtype=np.float64))
+    return bool(np.all(clearance >= CAM_TABLE_MARGIN_M))
+
+
 def approach_start_pose(
     env,
     start_pose7: np.ndarray,
     field,
     T_fixture_from_base: np.ndarray,
     hardware_config_path: str,
+    table_normal=None,
+    table_offset=None,
 ) -> bool:
-    """Move to 5 cm above the start along the mold normal, then down to it.
+    """Move to 5 cm back along the tool axis, then straight down that axis.
 
-    Both waits are on the caller. Returns False when the pose is unreachable
-    or outside the workcell, without moving.
+    The hover used to be 5 cm along the mold normal. On the smooth field that
+    normal points into the mold, so the descent started inside the part.
+    Both waits are on the caller. Returns False without moving when the pose
+    is unreachable, outside the workcell, or a D405 corner meets the flange.
     """
     start = np.asarray(start_pose7, dtype=np.float64).reshape(7)
     start_fix = pose7_change_frame(start, T_fixture_from_base)
@@ -252,9 +273,12 @@ def approach_start_pose(
             f"[approach] Start is {sd * 1e3:.0f} mm from the mold. Not moving."
         )
         return False
-    normal = np.asarray(queried["R"], dtype=np.float64).reshape(3, 3)[:, 2]
+    from fixb_labels import pose7_to_Rp
+
+    tool_R, _ = pose7_to_Rp(start_fix.reshape(1, 7))
+    tool_z = np.asarray(tool_R, dtype=np.float64).reshape(3, 3)[:, 2]
     hover_fix = start_fix.copy()
-    hover_fix[:3] = start_fix[:3] + APPROACH_HOVER_M * normal
+    hover_fix[:3] = start_fix[:3] - APPROACH_HOVER_M * tool_z
     hover = pose7_change_frame(hover_fix, np.linalg.inv(T_fixture_from_base))
     safe_zone = read_cartesian_safe_zone(hardware_config_path)
     if safe_zone is None:
@@ -272,9 +296,14 @@ def approach_start_pose(
     if not _segment_inside_safe_zone(hover[:3], start[:3], safe_zone):
         print_red("[approach] The descent leaves the safe zone. Not moving.")
         return False
+    to_hover = su.pose7_interp(current, hover, np.linspace(0.0, 1.0, 25))
+    descent = su.pose7_interp(hover, start, np.linspace(0.0, 1.0, 25))
+    if not _camera_poses_clear(np.vstack([to_hover, descent]), T_fixture_from_base, table_normal, table_offset):
+        print_red("[approach] A D405 corner meets the flange on this path. Not moving.")
+        return False
     print(
-        "[approach] moveL to 5 cm above the start along the mold normal, "
-        f"at most {APPROACH_SPEED_MPS * 100:.0f} cm/s."
+        "[approach] moveL to 5 cm back along the tool axis, "
+        f"at most {APPROACH_SPEED_MPS * 100:.0f} cm/s, then straight down that axis."
     )
     try:
         _slow_move_l(env, hover)
@@ -1876,6 +1905,7 @@ def main():
             gt_replay.reset()
         if r4_jump_guard is not None:
             r4_jump_guard.reset()
+        approach_logged = False
         if r4vt:
             if gt_replay is not None and mold_T_fixture_from_base is not None:
                 from mold_aware_runtime import shift_fixture_up
@@ -1901,13 +1931,20 @@ def main():
             pose_txt = " ".join(f"{float(v):.5f}" for v in np.asarray(start_base).reshape(7))
             print(f"[r4vt] start pose (right_base, {pose_note}): {pose_txt}")
             approached = False
+            approach_logged = False
             if mold_runtime is not None and mold_T_fixture_from_base is not None:
+                # The descent is open-loop. Start the episode log first so the
+                # bump, if there is one, is in robot_data.
+                env.start_saving_data_for_a_new_episode()
+                approach_logged = True
                 approached = approach_start_pose(
                     env,
                     start_base,
                     mold_runtime.field,
                     mold_T_fixture_from_base,
                     pipeline_para["hardware_config_path"],
+                    table_normal=mold_runtime._table_normal,
+                    table_offset=mold_runtime._table_offset,
                 )
             if approached:
                 input("At the start pose. Press Enter to begin.")
@@ -1945,7 +1982,8 @@ def main():
             input("Press Enter to start the episode.")
 
         # env.start_saving_data_for_a_new_episode(pipeline_para["episode_data_save_path"])
-        env.start_saving_data_for_a_new_episode()
+        if not (r4vt and approach_logged):
+            env.start_saving_data_for_a_new_episode()
 
         log = None
         horizon_count = 0
@@ -2341,28 +2379,22 @@ def main():
                         * control_para["slow_down_factor"],
                         dtype=np.float64,
                     )
-                prev_Rd = (
-                    None
-                    if mold_runtime._cmd_Rd is None
-                    else np.asarray(mold_runtime._cmd_Rd, dtype=np.float64).copy()
-                )
-                decoded = mold_runtime.decode_chunk(raw_a, p0[0], R0[0], dt)
+                label_R = None
                 if gt_replay is not None and r4vt:
-                    from mold_aware_runtime import ORI_LABEL_HOLD_DEG, hold_orientation_near_label
+                    from mold_aware_runtime import ORI_LABEL_HOLD_DEG
 
                     label_idx = np.asarray(
-                        gt_replay.windows[gt_replay.k][: decoded["R_d"].shape[0]]
+                        gt_replay.windows[gt_replay.k][: raw_a.shape[0]]
                     )
                     label_R, _label_p = _pose7_to_Rp(gt_replay.demo[label_idx])
-                    held_R = R0[0] if prev_Rd is None else prev_Rd
-                    decoded["R_d"], ori_held = hold_orientation_near_label(
-                        decoded["R_d"], label_R, held_R, ORI_LABEL_HOLD_DEG
+                decoded = mold_runtime.decode_chunk(
+                    raw_a, p0[0], R0[0], dt, label_R=label_R
+                )
+                if label_R is not None and np.any(decoded["ori_hold"]):
+                    print_yellow(
+                        f"[mold][hold] orientation > {ORI_LABEL_HOLD_DEG:.0f} deg "
+                        f"from the label on {int(np.sum(decoded['ori_hold']))} steps"
                     )
-                    if np.any(ori_held):
-                        print_yellow(
-                            f"[mold][hold] orientation > {ORI_LABEL_HOLD_DEG:.0f} deg "
-                            f"from the label on {int(np.sum(ori_held))} steps"
-                        )
                 R_d_fixture = np.asarray(decoded["R_d"], dtype=np.float64).copy()
                 # Fixture +Y is down. Lift the commanded foot and the virtual
                 # target along −Y so a free-space bench stays off the table.

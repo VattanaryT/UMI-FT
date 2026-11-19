@@ -5,7 +5,8 @@ set -euo pipefail
 
 usage() {
   echo "usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--bench] [--bench-lift M]"
-  echo "  r4vt   track_clean epoch 55. UMIFT_MAX_DURATION_S overrides the 8 min cap."
+  echo "  r4vt   track_clean epoch 55, unless UMIFT_CKPT_PATH is already set."
+  echo "         UMIFT_MAX_DURATION_S overrides the 8 min cap."
   echo "  r1rel  UMIFT_CKPT_PATH=/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt"
   echo "  --replay-episode N   play that episode's labels through the runner (no policy call)"
   echo "  --bench              first free-space replay: clamp delta_n at -5 mm"
@@ -15,8 +16,9 @@ usage() {
   echo "    2026-11-16 orange extrinsics. UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE=1."
   echo "  r4vt, policy and replay: jump guard holds a commanded step over 248.70 mm or 75.96 deg"
   echo "    and aborts after 3 holds in a row. r1rel is unchanged."
-  echo "  r4vt, before the episode: moveL at <= 5 cm/s to 5 cm above the start along the mold"
-  echo "    normal, Enter, descend to the start, Enter. Replay uses the recorded pose."
+  echo "  r4vt, before the episode: moveL at <= 5 cm/s to 5 cm back along the tool axis,"
+  echo "    Enter, then straight down that axis. The episode log includes the move."
+  echo "    Replay uses the recorded pose."
   echo "    Policy uses the current TCP. A failed check falls back to jogging."
 }
 
@@ -55,10 +57,10 @@ done
 
 case "$arm" in
   r4vt)
-    export UMIFT_CKPT_PATH="/oct_v35_h4s_r4vt_track_clean/oct-v35-h4s-r4vt-track-clean_e100_bs64_valtopk_43351238/checkpoints/epoch=0055-val_loss=0.030.ckpt"
+    export UMIFT_CKPT_PATH="${UMIFT_CKPT_PATH:-/oct_v35_h4s_r4vt_track_clean/oct-v35-h4s-r4vt-track-clean_e100_bs64_valtopk_43351238/checkpoints/epoch=0055-val_loss=0.030.ckpt}"
     ;;
   r1rel)
-    export UMIFT_CKPT_PATH="/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt"
+    export UMIFT_CKPT_PATH="${UMIFT_CKPT_PATH:-/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt}"
     ;;
   *)
     usage

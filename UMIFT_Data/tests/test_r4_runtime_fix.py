@@ -159,4 +159,5 @@ def test_live_horizon_stays_6_and_both_arms_replay_it():
                 foot = row["position"]["foot_inplane_m"]
                 ori = row["orientation_deg"]
                 assert f"{depth['decode_max'] * 1e3:.3f}" == "0.000"
-                assert foot["decode_median"] < 0.001
+                # Live foot carries v_par, so it is no longer the stored label foot.
+                assert foot["decode_median"] < 0.006
