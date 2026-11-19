@@ -14,7 +14,8 @@ for entry in (SCRIPTS, ROOT, ROOT / "PyriteML", ROOT / "PyriteUtility"):
         sys.path.insert(0, str(entry))
 
 import replay_gt  # noqa: E402
-from gt_replay import GtReplay, apply_normalizer  # noqa: E402
+from fixb_labels import interp_rows, next_control_times  # noqa: E402
+from gt_replay import GtReplay, apply_normalizer, demo_tcp_disp  # noqa: E402
 
 
 def _reference(arm: str, episode: int, exec_h: int = 6):
@@ -50,6 +51,22 @@ def _reference(arm: str, episode: int, exec_h: int = 6):
     return actions
 
 
+def test_replay_tcp_disp_matches_the_sim_gate():
+    replay = GtReplay("r4vt", 40, exec_h=6, normalizer=None)
+    group = replay_gt._open_episode(replay_gt.R4VT_ZARR, 40)
+    robot_t = np.asarray(group["robot_time_stamps_0"], dtype=np.float64).reshape(-1)
+    rgb_t = np.asarray(group["rgb_time_stamps_0"], dtype=np.float64).reshape(-1)
+    position = np.asarray(group["ts_pose_fb_0"], dtype=np.float64)[:, :3]
+    arrived = next_control_times(robot_t, rgb_t)
+    expected = interp_rows(arrived, robot_t, position) - position
+    np.testing.assert_allclose(replay.tcp_disp, expected, atol=0.0, rtol=0.0)
+    np.testing.assert_allclose(demo_tcp_disp(robot_t, rgb_t, position), expected)
+    step = replay.tcp_step(6)
+    window = np.asarray(replay.windows[0][:6], dtype=np.int64)
+    assert step.shape == (6, 3)
+    np.testing.assert_allclose(step, expected[window])
+
+
 def test_chunks_match_offline_runner_mode():
     for arm in ("r4vt", "r1rel"):
         for episode in (0, 9):
@@ -62,6 +79,65 @@ def test_chunks_match_offline_runner_mode():
                 assert got.shape[1] == (27 if arm == "r4vt" else 21)
                 np.testing.assert_allclose(got, ref, atol=0.0, rtol=0.0)
                 np.testing.assert_allclose(got, off, atol=0.0, rtol=0.0)
+
+
+class _MockCudaTensor:
+    """Fails np.asarray the way a CUDA tensor does, until .cpu() is called."""
+
+    def __init__(self, values):
+        self._cpu = np.asarray(values, dtype=np.float32)
+
+    def detach(self):
+        return self
+
+    def cpu(self):
+        return self._cpu
+
+    def numpy(self):
+        raise TypeError("can't convert cuda:0 device type tensor to numpy")
+
+    def __array__(self, dtype=None, copy=None):
+        raise TypeError("can't convert cuda:0 device type tensor to numpy")
+
+
+class _MockCudaNormalizer:
+    def __init__(self, scale):
+        self.params_dict = {"action": {"scale": _MockCudaTensor(scale)}}
+
+    def normalize(self, values):
+        return np.asarray(values, dtype=np.float32)
+
+    def unnormalize(self, values):
+        return _MockCudaTensor(values)
+
+
+def test_replay_loader_reads_normalizer_tensors_on_cpu():
+    """The checkpoint normalizer is on CUDA. numpy must see a CPU copy."""
+    import torch
+    from diffusion_policy.model.common.normalizer import SingleFieldLinearNormalizer
+    from gt_replay import _normalizer_width
+
+    scale = torch.tensor([2.0, 0.5, 4.0], dtype=torch.float32)
+    offset = torch.tensor([-0.25, 0.5, 1.0], dtype=torch.float32)
+    stats = {
+        "min": torch.zeros(3),
+        "max": torch.ones(3),
+        "mean": torch.zeros(3),
+        "std": torch.ones(3),
+    }
+    normalizer = SingleFieldLinearNormalizer.create_manual(scale, offset, stats)
+    action = np.array([[0.2, -0.4, 0.8], [1.0, 0.0, -0.5]], dtype=np.float64)
+    if torch.cuda.is_available():
+        normalizer.cuda()
+        assert next(normalizer.parameters()).is_cuda
+    else:
+        normalizer = _MockCudaNormalizer(scale.numpy())
+    assert _normalizer_width(normalizer) == 3
+    got = apply_normalizer(normalizer, action)
+    assert isinstance(got, np.ndarray)
+    np.testing.assert_allclose(got, action, atol=1e-5)
+    nested = _MockCudaNormalizer(np.ones(10, dtype=np.float32))
+    assert _normalizer_width(nested) == 10
 
 
 def test_normalizer_roundtrip_is_identity():

@@ -6,6 +6,7 @@ import zarr
 from PyriteEnvSuites.env_runners.dataset_start_pose import (
     _LOCAL_DATASET_BY_TASK,
     central_episode_start,
+    dataset_zarr_for_option_d,
     pose7_change_frame,
     resolve_dataset_zarr,
     tcp_inside_safe_zone,
@@ -96,6 +97,24 @@ def test_hyak_dataset_name_finds_the_local_zarr(tmp_path, monkeypatch):
         == smooth
     )
     assert resolve_dataset_zarr(str(causal), "OCT-V35-FIXB-R4VT-H4S") == causal
+
+
+def test_r4vt_replay_option_d_uses_the_replay_zarr(tmp_path, monkeypatch):
+    causal = tmp_path / "r4vt_causal_foot" / "acp_replay_buffer.zarr"
+    causal.mkdir(parents=True)
+    cfg = "/data/r4vt_smooth_tcp_track_clean/acp_replay_buffer.zarr"
+    monkeypatch.setenv("UMIFT_REPLAY_EPISODE", "40")
+    monkeypatch.setenv("UMIFT_R4VT_ZARR", str(causal))
+    found, note = dataset_zarr_for_option_d(cfg, "OCT-V35-FIXB-R4VT-H4S", r4vt=True)
+    assert found == causal
+    assert note == "r4vt replay labels"
+    found, note = dataset_zarr_for_option_d(cfg, "OCT-V35-FIXB-R4VT-H4S", r4vt=False)
+    assert found != causal
+    assert note == ""
+    monkeypatch.delenv("UMIFT_REPLAY_EPISODE")
+    found, note = dataset_zarr_for_option_d(cfg, "OCT-V35-FIXB-R4VT-H4S", r4vt=True)
+    assert found != causal
+    assert note == ""
 
 
 def test_missing_cfg_path_uses_task_name(tmp_path, monkeypatch):

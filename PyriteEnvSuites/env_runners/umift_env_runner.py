@@ -42,9 +42,9 @@ from PyriteEnvSuites.env_runners.dataset_start_pose import (
     DATASET_START_EPISODE,
     central_episode_start,
     dataset_poses_are_fixture,
+    dataset_zarr_for_option_d,
     pose7_change_frame,
     read_cartesian_safe_zone,
-    resolve_dataset_zarr,
     tcp_inside_safe_zone,
 )
 from PyriteEnvSuites.env_runners.rollout_experiment_log import (
@@ -1897,14 +1897,17 @@ def main():
             f"[layup-eval] WARNING: could not capture right start joints ({exc}). "
             "Menu option 'e' will be unavailable until restart."
         )
-    dataset_start_zarr = resolve_dataset_zarr(_dataset_path_cfg, _task_name)
+    dataset_start_zarr, dataset_start_note = dataset_zarr_for_option_d(
+        _dataset_path_cfg, _task_name, r4vt=r4vt
+    )
     if dataset_start_zarr is None:
         print(
             "[dataset-start] option d is unavailable "
             f"(task={_task_name!r}, cfg path={_dataset_path_cfg!r})."
         )
     else:
-        print(f"[dataset-start] option d uses {dataset_start_zarr}")
+        note = f" ({dataset_start_note})" if dataset_start_note else ""
+        print(f"[dataset-start] option d uses {dataset_start_zarr}{note}")
 
     gt_replay = None
     replay_ep = os.environ.get("UMIFT_REPLAY_EPISODE", "").strip()
@@ -2323,7 +2326,12 @@ def main():
             # same postprocess (r1rel) or the same decode block (r4vt).
             if gt_replay is not None:
                 raw_action, _label_idx = gt_replay.current()
-                controller.last_raw_action = np.asarray(raw_action, dtype=np.float64)
+                raw_action = np.asarray(raw_action, dtype=np.float64)
+                if raw_action.shape[-1] == 10:
+                    from mold_aware_runtime import expand_r4_action
+
+                    raw_action = expand_r4_action(raw_action)
+                controller.last_raw_action = raw_action
                 if r4vt:
                     n_rows = controller.last_raw_action.shape[0]
                     eye = np.repeat(np.eye(4)[None], n_rows, axis=0)
@@ -2418,6 +2426,9 @@ def main():
                         gt_replay.windows[gt_replay.k][: raw_a.shape[0]]
                     )
                     label_R, _label_p = _pose7_to_Rp(gt_replay.demo[label_idx])
+                    # Replay only. The internal TCP follows the demo step.
+                    # A policy chunk leaves _tcp_step unset and follows the command.
+                    mold_runtime._tcp_step = gt_replay.tcp_step(raw_a.shape[0])
                 decoded = mold_runtime.decode_chunk(
                     raw_a, p0[0], R0[0], dt, label_R=label_R
                 )

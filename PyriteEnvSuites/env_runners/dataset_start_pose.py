@@ -10,6 +10,7 @@ actually used.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -111,6 +112,26 @@ def resolve_dataset_zarr(cfg_dataset_path: str, task_name: str) -> Optional[Path
     if fallback and Path(fallback).is_dir():
         return Path(fallback)
     return None
+
+
+def dataset_zarr_for_option_d(
+    cfg_dataset_path: str, task_name: str, *, r4vt: bool
+) -> Tuple[Optional[Path], str]:
+    """Zarr for menu option d, plus a short note when it is not the checkpoint's.
+
+    An r4vt replay plays ``UMIFT_R4VT_ZARR``. The loaded checkpoint can still
+    be the track_clean run, and that zarr is the wrong start cluster.
+    """
+    resolved = resolve_dataset_zarr(cfg_dataset_path, task_name)
+    if not r4vt or not os.environ.get("UMIFT_REPLAY_EPISODE", "").strip():
+        return resolved, ""
+    raw = os.environ.get("UMIFT_R4VT_ZARR", "").strip()
+    if not raw:
+        return resolved, ""
+    path = Path(raw)
+    if not path.is_dir():
+        return resolved, ""
+    return path, "r4vt replay labels"
 
 
 def _episode_names(root) -> list:

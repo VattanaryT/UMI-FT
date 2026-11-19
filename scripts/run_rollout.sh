@@ -12,7 +12,8 @@ usage() {
   echo "  --bench              first free-space replay: clamp delta_n at -5 mm"
   echo "  --bench-lift M       shift foot, virtual target, and start pose M metres"
   echo "                       along fixture up (−Y, away from the table)"
-  echo "  r4vt reads UMIFT_R4VT_ZARR (default: r4vt_smooth_tcp_track_clean) and the"
+  echo "  r4vt replay reads r4vt_causal_foot (10-d) unless UMIFT_R4VT_ZARR is set."
+  echo "  r4vt policy reads UMIFT_R4VT_ZARR (default: r4vt_smooth_tcp_track_clean) and the"
   echo "    2026-11-16 orange extrinsics. UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE=1."
   echo "  r4vt, policy and replay: jump guard holds a commanded step over 248.70 mm or 75.96 deg"
   echo "    and aborts after 3 holds in a row. r1rel is unchanged."
@@ -74,10 +75,24 @@ else
   unset UMIFT_REPLAY_EPISODE
 fi
 
-# Track-clean labels. The runner compares the checkpoint normalizer to this pickle.
-export UMIFT_R4VT_ZARR="${UMIFT_R4VT_ZARR:-/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_smooth_tcp_track_clean/acp_replay_buffer.zarr}"
-export UMIFT_ACTION_NORMALIZER="${UMIFT_ACTION_NORMALIZER:-/home/boeing/umi_ft_ws/worktrees/UMI-FT-smooth_frame/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_track_clean.pkl}"
-export UMIFT_ACTION_NORMALIZER_SHA="${UMIFT_ACTION_NORMALIZER_SHA:-29a48f69ff51807df631b1e350087d6991091cba9739f0be88b30e2c85cf3bd4}"
+# Policy labels stay track_clean. A replay reads the causal-foot 10-d labels.
+_CAUSAL_ZARR="/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_causal_foot/acp_replay_buffer.zarr"
+_CAUSAL_NORM="/home/boeing/umi_ft_ws/worktrees/UMI-FT-smooth_frame/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_causal_foot.pkl"
+_CAUSAL_SHA="14308b72d55600b4359dfa67d10aedab378e42ad26f2bbcac988eed4d97a1ac2"
+_TRACK_ZARR="/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_smooth_tcp_track_clean/acp_replay_buffer.zarr"
+_TRACK_NORM="/home/boeing/umi_ft_ws/worktrees/UMI-FT-smooth_frame/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_track_clean.pkl"
+_TRACK_SHA="29a48f69ff51807df631b1e350087d6991091cba9739f0be88b30e2c85cf3bd4"
+if [[ -n "$replay_episode" && "$arm" == "r4vt" ]]; then
+  export UMIFT_R4VT_ZARR="${UMIFT_R4VT_ZARR:-$_CAUSAL_ZARR}"
+  export UMIFT_R4VT_NORMALIZER="${UMIFT_R4VT_NORMALIZER:-$_CAUSAL_NORM}"
+  export UMIFT_R4VT_NORMALIZER_SHA="${UMIFT_R4VT_NORMALIZER_SHA:-$_CAUSAL_SHA}"
+  export UMIFT_ACTION_NORMALIZER="${UMIFT_ACTION_NORMALIZER:-$_CAUSAL_NORM}"
+  export UMIFT_ACTION_NORMALIZER_SHA="${UMIFT_ACTION_NORMALIZER_SHA:-$_CAUSAL_SHA}"
+else
+  export UMIFT_R4VT_ZARR="${UMIFT_R4VT_ZARR:-$_TRACK_ZARR}"
+  export UMIFT_ACTION_NORMALIZER="${UMIFT_ACTION_NORMALIZER:-$_TRACK_NORM}"
+  export UMIFT_ACTION_NORMALIZER_SHA="${UMIFT_ACTION_NORMALIZER_SHA:-$_TRACK_SHA}"
+fi
 export UMIFT_WORKCELL_EXTRINSICS="${UMIFT_WORKCELL_EXTRINSICS:-/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/PyriteConfig/tasks/umift/layup_workcell_extrinsics_20261116_orange.yaml}"
 export UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE="${UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE:-1}"
 # --bench is the first free-space replay: clamp delta_n at -5 mm.

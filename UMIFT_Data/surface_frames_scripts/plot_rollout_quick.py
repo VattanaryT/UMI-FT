@@ -11,6 +11,7 @@ virtual-target offset for δn and leave v blank.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -20,6 +21,35 @@ import zarr
 FIELD = Path(
     "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/shared/fixb_field.npz"
 )
+ORANGE = Path(
+    "/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/"
+    "PyriteConfig/tasks/umift/layup_workcell_extrinsics_20261116_orange.yaml"
+)
+
+
+def _T_fixture_from_base() -> np.ndarray:
+    """Inverse of T_right_base_from_fixture. Logged feet are right_base."""
+    path = Path(os.environ.get("UMIFT_WORKCELL_EXTRINSICS", str(ORANGE)))
+    rows = []
+    grab = False
+    for line in path.read_text().splitlines():
+        if line.startswith("T_right_base_from_fixture:"):
+            grab = True
+            continue
+        if not grab:
+            continue
+        if not line.strip().startswith("-"):
+            break
+        nums = line.split("[", 1)[1].split("]", 1)[0]
+        rows.append([float(item) for item in nums.split(",")])
+        if len(rows) == 4:
+            break
+    return np.linalg.inv(np.asarray(rows, dtype=np.float64))
+
+
+def foot_in_fixture(foot_base: np.ndarray) -> np.ndarray:
+    transform = _T_fixture_from_base()
+    return (transform[:3, :3] @ np.asarray(foot_base, dtype=np.float64).T).T + transform[:3, 3]
 
 
 def horizons(log):
@@ -107,7 +137,7 @@ def main(argv=None) -> None:
         step = max(1, len(mesh) // 4000)
         pts = mesh[::step]
         ax3.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=1, c="#bbbbbb", depthshade=False)
-    foot = data["foot"]
+    foot = foot_in_fixture(data["foot"])
     ax3.plot(foot[:, 0], foot[:, 1], foot[:, 2], color="#ff4d6a", linewidth=2)
     ax3.set_title("foot")
     fig.suptitle(args.log.name)

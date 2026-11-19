@@ -205,6 +205,31 @@ FIXTURE_UP = np.array([0.0, -1.0, 0.0])
 CAM_TABLE_MARGIN_M = 0.0
 # Replay only. A commanded tool this far from the label orientation is held.
 ORI_LABEL_HOLD_DEG = 25.0
+# Off unless UMIFT_RESET_TCP_TO_MEASURED is set. A carried TCP farther than
+# this from the measured TCP is dropped and the tracker starts at the measurement.
+TCP_RESET_GAP_M = 0.015
+
+
+def tcp_reset_enabled() -> bool:
+    return os.environ.get("UMIFT_RESET_TCP_TO_MEASURED", "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+def reset_carried_tcp(tcp_state: np.ndarray, measured: np.ndarray) -> np.ndarray:
+    """Keep the carried TCP. With the flag on, a gap over 15 mm uses the measurement."""
+    carried = np.asarray(tcp_state, dtype=np.float64).reshape(3)
+    measured = np.asarray(measured, dtype=np.float64).reshape(3)
+    if not tcp_reset_enabled():
+        return carried
+    gap = float(np.linalg.norm(carried - measured))
+    if gap <= TCP_RESET_GAP_M:
+        return carried
+    print(f"[mold][tcp] reset internal TCP to measured, gap {gap * 1e3:.1f} mm")
+    return measured.copy()
 
 
 def _import_frame_conventions():
@@ -944,7 +969,7 @@ def _integrate_causal_tcp(
     if prev is None or tcp_carry is None:
         tcp_state = measured.copy()
     else:
-        tcp_state = np.asarray(tcp_carry, dtype=np.float64).reshape(3).copy()
+        tcp_state = reset_carried_tcp(tcp_carry, measured)
     step = None if tcp_step is None else np.asarray(tcp_step, dtype=np.float64).reshape(-1, 3)
     xs = np.zeros((count, 3), dtype=np.float64)
     frames = np.zeros((count, 3, 3), dtype=np.float64)
