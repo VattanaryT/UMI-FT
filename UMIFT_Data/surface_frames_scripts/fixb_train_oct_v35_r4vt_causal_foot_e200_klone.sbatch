@@ -12,7 +12,9 @@
 #SBATCH --output=/gscratch/scrubbed/vtevy/logs/fixb/%j.out
 #SBATCH --error=/gscratch/scrubbed/vtevy/logs/fixb/%j.err
 
-# Causal-foot r4vt, 10 action dims, 200 epochs. Checkpoint every 20, and the last.
+# Causal-foot r4vt, 10 action dims, 200 epochs.
+# Checkpoints at epochs 0,5,10,15,20,25,30,35,40, then 60,80,100,120,140,160,180, and the last (199).
+# topk.k=20 keeps every one of those files. k=1 would delete them. latest.ckpt is still overwritten.
 # Episodes 35 and 44 stay excluded. The 17 constant slots are not in the action.
 # ΔR (dims 4:10) is masked after a field jump and is normalized, not left at scale 1.
 # Do not point UMIFT_HOST at UMI-FT-surface_frames, UMI-FT-fixb, or UMI-FT-frame_continuity.
@@ -95,13 +97,13 @@ apptainer exec "${APPTAINER_ARGS[@]}" "${SIF}" \
     val_dataloader.num_workers=4 \
     val_dataloader.shuffle=True \
     training.num_epochs=200 \
-    training.val_every=20 \
-    training.checkpoint_every=20 \
+    'training.val_at=[0,5,10,15,20,25,30,35,40,60,80,100,120,140,160,180,199]' \
+    'training.checkpoint_at=[0,5,10,15,20,25,30,35,40,60,80,100,120,140,160,180,199]' \
     training.log_gradient_norm=true \
     training.log_per_dim_action_loss=true \
     checkpoint.topk.monitor_key=val_loss \
     checkpoint.topk.mode=min \
-    checkpoint.topk.k=1 \
+    checkpoint.topk.k=20 \
     'checkpoint.topk.format_str="epoch={epoch:04d}-val_loss={val_loss:.3f}.ckpt"' \
     checkpoint.save_last_ckpt=true \
     task.drop_depth_inputs=true \
