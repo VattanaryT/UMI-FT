@@ -90,10 +90,17 @@ def boot() -> None:
 
 
 class FakeArm:
-    """Measured TCP is the last command. lag=1 is the command before that."""
+    """Measured TCP is the last command. lag=1 is the command before that.
 
-    def __init__(self, pose7: np.ndarray, lag: int = 0):
+    contact=False reports the command itself.
+    contact=True reports the closest surface point to the commanded position
+    and keeps the commanded rotation. ``project`` maps that position to the surface.
+    """
+
+    def __init__(self, pose7: np.ndarray, lag: int = 0, contact: bool = False, project=None):
         self.lag = int(lag)
+        self.contact = bool(contact)
+        self.project = project
         self._sent = [np.asarray(pose7, dtype=np.float64).reshape(7).copy()]
 
     def measure(self) -> np.ndarray:
@@ -101,7 +108,10 @@ class FakeArm:
         return self._sent[index].copy()
 
     def command(self, pose7: np.ndarray) -> None:
-        self._sent.append(np.asarray(pose7, dtype=np.float64).reshape(7).copy())
+        pose = np.asarray(pose7, dtype=np.float64).reshape(7).copy()
+        if self.contact:
+            pose[:3] = np.asarray(self.project(pose[:3]), dtype=np.float64).reshape(3)
+        self._sent.append(pose)
 
 
 class PoseLog:
@@ -406,53 +416,162 @@ def _note(guards: list, name: str, t: float) -> None:
         guards.append({"name": name, "t_s": float(t)})
 
 
-def label_parity(runtime, ep: dict) -> dict:
-    """Safety off, one runner step per RGB frame, measured TCP = the demo."""
-    from openloop_lib import r4vt_action_row
+def decode_vpar_enabled() -> bool:
+    """UMIFT_DECODE_VPAR=1 adds tangential velocity to the commanded TCP."""
+    return os.environ.get("UMIFT_DECODE_VPAR", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def command_tangential(foot, frame, v_par, delta_n, dt) -> tuple[np.ndarray, np.ndarray]:
+    """foot + (v1·t1 + v2·t2)·dt + δn·n_out. Frame z is the inward normal."""
+    frame = np.asarray(frame, dtype=np.float64).reshape(3, 3)
+    tang = frame[:, :2] @ np.asarray(v_par, dtype=np.float64).reshape(2) * float(dt)
+    outward = -frame[:, 2]
+    commanded = np.asarray(foot, dtype=np.float64).reshape(3) + tang + float(delta_n) * outward
+    return commanded, tang
+
+
+def install_causal_foot():
+    """Point the runner's foot walk at causal_foot. The smooth_frame file is not edited."""
+    import importlib.util
+
+    import mold_aware_runtime as runtime_mod
+
+    path = Path(__file__).resolve().with_name("causal_foot.py")
+    spec = importlib.util.spec_from_file_location("causal_foot", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    foot = module.CausalFoot(FIELD, FIELD.with_name("fixb_smooth_frames.npz"))
+    runtime_mod._harness_tcp = None
+    runtime_mod._harness_tcp_disp = None
+
+    def integrate(field, p0, v_par, delta_n, dt, prev_x=None, prev_R=None, **_kwargs):
+        del field
+        count = int(np.asarray(delta_n).reshape(-1).shape[0])
+        tcp = np.asarray(p0, dtype=np.float64).reshape(3)
+        prev = None
+        if prev_x is not None and prev_R is not None:
+            prev = (
+                np.asarray(prev_x, dtype=np.float64).reshape(3),
+                np.asarray(prev_R, dtype=np.float64).reshape(3, 3),
+            )
+        xs = np.zeros((count, 3), dtype=np.float64)
+        frames = np.zeros((count, 3, 3), dtype=np.float64)
+        depth = np.asarray(delta_n, dtype=np.float64).reshape(-1)
+        runtime_mod._harness_formula_xd = None
+        if decode_vpar_enabled():
+            # v·dt is the TCP's tangent, not the foot step. On the crown the
+            # closest-point foot hops when the TCP moves along the normal, which
+            # v does not contain. Carry the TCP by its full step and let the
+            # tracker read that TCP. x_d still adds the tangent once.
+            velocity = np.asarray(v_par, dtype=np.float64).reshape(count, 2)
+            dts = np.asarray(dt, dtype=np.float64).reshape(count)
+            disp = getattr(runtime_mod, "_harness_tcp_disp", None)
+            if disp is None or len(np.asarray(disp)) < count:
+                disp = None
+            else:
+                disp = np.asarray(disp, dtype=np.float64).reshape(-1, 3)[:count]
+            carried = getattr(runtime_mod, "_harness_tcp", None)
+            if prev is None or carried is None:
+                tcp_state = tcp.copy()
+            else:
+                tcp_state = np.asarray(carried, dtype=np.float64).reshape(3).copy()
+            commanded = np.zeros((count, 3), dtype=np.float64)
+            for k in range(count):
+                x, rotation = foot.step(tcp_state, prev)
+                xs[k] = x
+                frames[k] = rotation
+                commanded[k], _tang = command_tangential(
+                    x, rotation, velocity[k], depth[k], dts[k]
+                )
+                if disp is not None:
+                    tcp_state = tcp_state + disp[k]
+                prev = (x, rotation)
+            runtime_mod._harness_tcp = tcp_state
+            runtime_mod._harness_formula_xd = commanded
+            outward = -frames[:, :, 2]
+            x_d = commanded
+        else:
+            for k in range(count):
+                xs[k], frames[k] = foot.step(tcp, prev)
+                prev = (xs[k], frames[k])
+            outward = -frames[:, :, 2]
+            x_d = xs + depth[:, None] * outward
+        quiet = np.zeros(count, dtype=bool)
+        return {
+            "x_s": xs,
+            "x_d": x_d,
+            "R": frames,
+            "n_out": outward,
+            "face_held": quiet,
+            "hop_hold": quiet,
+            "foot_reanchor": quiet,
+            "foot_cap": quiet,
+            "hop_streak": np.array(0),
+            "reject_streak": np.array(0),
+            "step_reject": quiet,
+            "ray_recovery": quiet,
+        }
+
+    runtime_mod.integrate_tcp_foot = integrate
+    if not getattr(runtime_mod.MoldAwareRuntime.decode_chunk, "_vpar_wrap", False):
+        original = runtime_mod.MoldAwareRuntime.decode_chunk
+
+        def decode_chunk(self, raw_action, p0, R0, dt, apply_safety=True, frame_seed=None, label_R=None):
+            runtime_mod._harness_formula_xd = None
+            out = original(
+                self, raw_action, p0, R0, dt,
+                apply_safety=apply_safety, frame_seed=frame_seed, label_R=label_R,
+            )
+            commanded = getattr(runtime_mod, "_harness_formula_xd", None)
+            if commanded is not None:
+                # The VT limiter rebuilds x_d as foot + δn·n and drops the sum.
+                n = int(out["x_d"].shape[0])
+                out["x_d"] = np.asarray(commanded, dtype=np.float64)[:n]
+                out["delta_n"] = np.sum((out["x_d"] - out["x_s"]) * out["n_out"], axis=1)
+            return out
+
+        decode_chunk._vpar_wrap = True
+        runtime_mod.MoldAwareRuntime.decode_chunk = decode_chunk
+    return foot
+
+
+def label_parity(runtime, ep: dict, label_x: np.ndarray, label_R: np.ndarray) -> dict:
+    """Safety off. The runner foot and the label foot see the same demo TCP series."""
+    import mold_aware_runtime as runtime_mod
 
     runtime.release_command_foot()
-    foot, frame, pos, rot = [], [], [], []
-    times = []
-    t0 = float(ep["robot_t"][0])
-    for rgb_i, rgb_t in enumerate(ep["rgb_t"]):
-        k = int(np.clip(np.searchsorted(ep["robot_t"], rgb_t), 0, len(ep["robot_t"]) - 1))
-        action = r4vt_action_row(ep["v"][k], ep["dn"][k], ep["dR"][k])
-        decoded = runtime.decode_chunk(
-            action,
-            ep["p"][k],
-            ep["R"][k],
+    prev_x = None
+    prev_R = None
+    foot_err = []
+    frame_err = []
+    for i, tcp in enumerate(ep["p"]):
+        dec = runtime_mod.integrate_tcp_foot(
+            runtime.field,
+            tcp,
+            ep["v"][i],
+            ep["dn"][i : i + 1],
             np.array([DT]),
-            apply_safety=False,
+            prev_x=prev_x,
+            prev_R=prev_R,
         )
-        foot.append(np.linalg.norm(decoded["x_s"][0] - ep["foot"][k]))
-        frame.append(_geodesic_deg(decoded["R_field"][0:1], ep["frame"][k : k + 1])[0])
-        pos.append(np.linalg.norm(decoded["x_d"][0] - ep["p"][k]))
-        rot.append(_geodesic_deg(decoded["R_d"][0:1], ep["R"][k : k + 1])[0])
-        times.append(float(rgb_t - t0))
-        if rgb_i and rgb_i % 200 == 0:
-            print(f"[label_check] parity {rgb_i}/{len(ep['rgb_t'])}", flush=True)
+        prev_x, prev_R = dec["x_s"][0], dec["R"][0]
+        foot_err.append(np.linalg.norm(dec["x_s"][0] - label_x[i]))
+        frame_err.append(_geodesic_deg(dec["R"][0:1], label_R[i : i + 1])[0])
+        if i and i % 2000 == 0:
+            print(f"[label_check] parity {i}/{len(ep['p'])}", flush=True)
+    probe = runtime.decode_chunk(
+        __import__("openloop_lib").r4vt_action_row(ep["v"][0], ep["dn"][0], ep["dR"][0]),
+        ep["p"][0],
+        ep["R"][0],
+        np.array([DT]),
+        apply_safety=False,
+    )
     return {
-        "foot_mm": _stats(np.asarray(foot) * 1e3),
-        "frame_deg": _stats(frame),
-        "tool_pos_mm": _stats(np.asarray(pos) * 1e3),
-        "tool_rot_deg": _stats(rot),
-        "n": len(times),
-        "t_end_s": None if not times else float(times[-1]),
+        "foot_mm": _stats(np.asarray(foot_err) * 1e3),
+        "frame_deg": _stats(frame_err),
+        "decode_matches_first_mm": float(np.linalg.norm(probe["x_s"][0] - label_x[0]) * 1e3),
+        "n": len(foot_err),
     }
-
-
-def builder_vs_stored(runtime, ep: dict) -> dict:
-    """Label-builder foot (track_local_feet) against the stored mold foot."""
-    from fixb_tcp_track import track_local_feet
-
-    def query(points):
-        found = runtime.field.query(np.asarray(points, dtype=np.float64))
-        return found["x_s"], found["R"]
-
-    foot, frame, _held = track_local_feet(query, ep["p"])
-    err = np.linalg.norm(foot - ep["foot"], axis=1)
-    ang = _geodesic_deg(frame, ep["frame"])
-    return {"foot_mm": _stats(err * 1e3), "frame_deg": _stats(ang), "held": int(_held)}
 
 
 def demo_tilt(ep: dict) -> dict:
@@ -460,18 +579,78 @@ def demo_tilt(ep: dict) -> dict:
     return _tilt_regions(_tilt_from_normal(ep["R"][k], ep["normal"][k]), ep["normal"][k])
 
 
-def run_gt(ep, runtime, pose_fn, on_command, lift_m, log, guards, clearance, foot_err, tilt, normal, stop_on_hard=True):
+def causal_source(ep: dict):
+    """Label chunks from the shared tracker. Same windows the runner pushes."""
+    import zarr
+    from fixb_labels import (
+        delta_R_from_field_tool,
+        interp_rows,
+        next_control_times,
+        pose7_to_Rp,
+        so3_to_rot6d_rows,
+    )
+    from fixb_tcp_track import project_tcp_velocity
+    from fixb_tcp_velocity_labels import _dn
+    from openloop_lib import r4vt_action_row
+
+    import replay_gt
+
+    foot = install_causal_foot()
+    x, frame = foot.track(ep["p"])
+    outward = -frame[:, :, 2]
+    velocity, _dt = project_tcp_velocity(frame, ep["p"], ep["robot_t"], ep["rgb_t"])
+    group = zarr.open(os.environ["UMIFT_R4VT_ZARR"], mode="r")["data"][f"episode_{ep['_episode']}"]
+    virtual = pose7_to_Rp(np.asarray(group["ts_pose_virtual_target_0"], dtype=np.float64))[1]
+    stiffness = np.asarray(group["stiffness_0"], dtype=np.float64).reshape(-1)
+    depth = _dn(virtual, x, outward)
+    delta_r = so3_to_rot6d_rows(delta_R_from_field_tool(frame, ep["R"]))
+    windows = replay_gt._windows(ep["robot_t"], ep["rgb_t"], EXEC_H)
+    actions = [
+        r4vt_action_row(velocity[idx], depth[idx], delta_r[idx], stiffness=stiffness[idx])
+        for idx in windows
+    ]
+
+    class _Source:
+        def __init__(self):
+            self.actions = actions
+            self.windows = windows
+            self.k = 0
+            self.demo = ep["pose"]
+            self.tcp_disp = None
+
+        def remaining(self):
+            return self.k < len(self.actions)
+
+        def current(self):
+            return self.actions[self.k], self.windows[self.k]
+
+        def advance(self):
+            self.k += 1
+
+    source = _Source()
+    arrived = next_control_times(ep["robot_t"], ep["rgb_t"])
+    source.tcp_disp = interp_rows(arrived, ep["robot_t"], ep["p"]) - ep["p"]
+    source.foot = x
+    source.frame = frame
+    source.normal = outward
+    return source
+
+
+def run_gt(ep, runtime, pose_fn, on_command, lift_m, log, guards, clearance, foot_err, tilt, normal, stop_on_hard=True, source=None):
     """GT chunks through the real decode. pose_fn(gt) is the measured TCP."""
     from fixb_labels import pose7_to_Rp
     from jump_guard import TargetJumpGuard
     from mold_aware_runtime import FixBActionEnsembler
 
-    import replay_gt
+    if source is None:
+        import replay_gt
 
-    replay_gt.R4VT_ZARR = Path(os.environ["UMIFT_R4VT_ZARR"])
-    from gt_replay import GtReplay
+        replay_gt.R4VT_ZARR = Path(os.environ["UMIFT_R4VT_ZARR"])
+        from gt_replay import GtReplay
 
-    gt = GtReplay("r4vt", int(ep["_episode"]), EXEC_H)
+        gt = GtReplay("r4vt", int(ep["_episode"]), EXEC_H)
+    else:
+        gt = source
     ens = FixBActionEnsembler(decay_m=DECAY)
     guard = TargetJumpGuard()
     t0 = float(ep["robot_t"][0])
@@ -503,6 +682,12 @@ def run_gt(ep, runtime, pose_fn, on_command, lift_m, log, guards, clearance, foo
             break
         raw, _window = gt.current()
         label_R, _p = pose7_to_Rp(gt.demo[np.asarray(window[:EXEC_H], dtype=np.int64)])
+        disp = getattr(gt, "tcp_disp", None)
+        if disp is not None:
+            import mold_aware_runtime as runtime_mod
+
+            taken = np.asarray(window[:EXEC_H], dtype=np.int64)
+            runtime_mod._harness_tcp_disp = np.asarray(disp, dtype=np.float64)[taken]
         step = runner_step(runtime, ens, guard, horizons, raw, pose7, label_R, lift_m)
         for row in step["guards"]:
             _note(guards, row["name"], last_t)
@@ -522,7 +707,7 @@ def run_gt(ep, runtime, pose_fn, on_command, lift_m, log, guards, clearance, foo
                 tilt.append(_tilt_from_normal(decoded["R_d"][:n], decoded["n_out"][:n]))
                 normal.append(np.asarray(decoded["n_out"][:n], dtype=np.float64))
             if not step["decode_hard"]:
-                on_command(step["waypoints"], last_t)
+                on_command(step["waypoints"], last_t, decoded)
         gt.advance()
         if horizons == 1 or horizons % 20 == 0:
             print(f"[sim] h={horizons} t={last_t:.1f}s", flush=True)
@@ -553,8 +738,9 @@ def label_check(episode: int, bench: bool) -> dict:
     ep["_episode"] = episode
     lift = _apply_bench(bench)
     runtime, _t = make_runtime(bench)
-    parity = label_parity(runtime, ep)
-    built = builder_vs_stored(runtime, ep)
+    foot = install_causal_foot()
+    label_x, label_R = foot.track(ep["p"])
+    parity = label_parity(runtime, ep, label_x, label_R)
     runtime.reset()
     folder, log = _open_log("label_check", f"ep{episode}")
     guards, clearance, foot_err, tilt, normal = [], [], [], [], []
@@ -563,7 +749,7 @@ def label_check(episode: int, bench: bool) -> dict:
         return gt.demo[int(gt.windows[gt.k][0])]
 
     motion = run_gt(
-        ep, runtime, at_demo, lambda _pose, _t: None, lift, log, guards, clearance, foot_err, tilt, normal
+        ep, runtime, at_demo, lambda _pose, _t, _decoded=None: None, lift, log, guards, clearance, foot_err, tilt, normal
     )
     summary = {
         "mode": "label_check",
@@ -571,7 +757,6 @@ def label_check(episode: int, bench: bool) -> dict:
         "bench": bench,
         "foot_climb": os.environ.get("UMIFT_FOOT_CLIMB", ""),
         "runner_sha": _runner_sha(),
-        "builder_vs_stored": built,
         "runner_vs_label_safety_off": parity,
         "demo_tilt_deg": demo_tilt(ep),
         "open_loop": _summary_motion(foot_err, tilt, normal, clearance, guards, motion),
@@ -580,38 +765,99 @@ def label_check(episode: int, bench: bool) -> dict:
     return summary
 
 
-def replay(episode: int, bench: bool, lag: int) -> dict:
+def _rgb_tilt(ep: dict, normal: np.ndarray) -> dict:
+    k = np.clip(np.searchsorted(ep["robot_t"], ep["rgb_t"]), 0, len(ep["robot_t"]) - 1)
+    return _tilt_regions(_tilt_from_normal(ep["R"][k], normal[k]), normal[k])
+
+
+def _surface_point(runtime, position: np.ndarray) -> np.ndarray:
+    """Closest mesh point to a commanded TCP. Rotation is left to the caller."""
+    surface, _vid, _w = runtime.field.closest(np.asarray(position, dtype=np.float64).reshape(1, 3))
+    return np.asarray(surface, dtype=np.float64).reshape(3)
+
+
+def replay(episode: int, bench: bool, lag: int, contact: bool = False) -> dict:
     ep = _episode(episode)
     ep["_episode"] = episode
     lift = _apply_bench(bench)
     runtime, _t = make_runtime(bench)
+    source = causal_source(ep)
+    ep["foot"] = source.foot
     from mold_aware_runtime import shift_fixture_up
 
-    start = ep["pose"][0].copy()
+    # The TCP step is relative to the first label index. pose[0] can be earlier.
+    start_index = int(source.windows[0][0]) if decode_vpar_enabled() else 0
+    start = ep["pose"][start_index].copy()
     if lift:
         start = shift_fixture_up(start.reshape(1, 7), lift).reshape(7)
-    arm = FakeArm(start, lag=lag)
+    def project(position):
+        return _surface_point(runtime, position)
+
+    arm = FakeArm(start, lag=lag, contact=contact, project=project if contact else None)
     log_pose = PoseLog(float(ep["robot_t"][0]), start)
     folder, log = _open_log("replay", f"ep{episode}")
     guards, clearance, foot_err, tilt, normal = [], [], [], [], []
+    tang_cmd, tang_demo = [], []
+    previous = {"x": None, "index": None}
 
-    def on_command(waypoints, t_s):
+    def on_command(waypoints, t_s, decoded=None):
         if waypoints is None:
             return
         t0 = float(ep["robot_t"][0]) + t_s
+        last = len(waypoints) - 1
         for i, pose in enumerate(waypoints):
-            log_pose.add(t0 + i * DT, pose)
-        arm.command(waypoints[-1])
+            logged = np.asarray(pose, dtype=np.float64).reshape(7).copy()
+            if contact:
+                logged[:3] = project(logged[:3])
+            log_pose.add(t0 + i * DT, logged)
+        arm.command(waypoints[last])
+        if decoded is None:
+            return
+        window = source.windows[source.k]
+        commanded = np.asarray(decoded["x_d"], dtype=np.float64)
+        outward = np.asarray(decoded["n_out"], dtype=np.float64)
+        for i in range(commanded.shape[0]):
+            index = int(window[i])
+            if previous["x"] is not None:
+                normal_i = outward[i]
+                normal_i = normal_i / max(float(np.linalg.norm(normal_i)), 1e-12)
+                step = commanded[i] - previous["x"]
+                tang_cmd.append(float(np.linalg.norm(step - normal_i * np.dot(step, normal_i))))
+                demo_step = ep["p"][index] - ep["p"][previous["index"]]
+                tang_demo.append(float(np.linalg.norm(demo_step - normal_i * np.dot(demo_step, normal_i))))
+            previous["x"] = commanded[i].copy()
+            previous["index"] = index
 
     motion = run_gt(
-        ep, runtime, lambda _gt: arm.measure(), on_command, lift, log, guards, clearance, foot_err, tilt, normal
+        ep,
+        runtime,
+        lambda _gt: arm.measure(),
+        on_command,
+        lift,
+        log,
+        guards,
+        clearance,
+        foot_err,
+        tilt,
+        normal,
+        source=source,
     )
     summary = {
         "mode": "replay",
         "episode": episode,
         "bench": bench,
         "lag": lag,
+        "contact": contact,
+        "integrate_v_par": decode_vpar_enabled(),
+        "tangential_step_mm": {
+            "commanded": _stats(np.asarray(tang_cmd) * 1e3),
+            "demo": _stats(np.asarray(tang_demo) * 1e3),
+        },
         "foot_climb": os.environ.get("UMIFT_FOOT_CLIMB", ""),
+        "label_tilt_deg": {
+            "causal": _rgb_tilt(ep, source.normal),
+            "track_clean": _rgb_tilt(ep, ep["normal"]),
+        },
         "runner_sha": _runner_sha(),
         "demo_tilt_deg": demo_tilt(ep),
         **_summary_motion(foot_err, tilt, normal, clearance, guards, motion),
@@ -628,8 +874,8 @@ def _tail(values, n: int) -> np.ndarray:
     return np.concatenate([pad, values], axis=0)
 
 
-def _policy_action(policy, controller, shape_meta, device, ep, pose_log, now_abs: float, runtime):
-    """Full-rate tails ending at now, then the runner's MPC predict."""
+def policy_obs(shape_meta, ep, pose_log, now_abs: float, runtime) -> dict:
+    """Full-rate tails ending at now. The runner's MPC strides these."""
     import PyriteUtility.spatial_math.spatial_utilities as su
 
     robot_k = int(np.searchsorted(ep["robot_t"], now_abs, side="right"))
@@ -641,7 +887,6 @@ def _policy_action(policy, controller, shape_meta, device, ep, pose_log, now_abs
         "robot_time_stamps_0": times,
     }
     runtime.fill_obs_raw(obs_raw)
-    obs_hard = list(runtime.last_hard_triggers)
     sparse = shape_meta["sample"]["obs"]["sparse"]
     obs = {}
     for key, attr in sparse.items():
@@ -674,6 +919,12 @@ def _policy_action(policy, controller, shape_meta, device, ep, pose_log, now_abs
             obs[key] = np.zeros((need, 6), dtype=np.float32)
         else:
             raise RuntimeError(f"sim has no tape for obs key {key}")
+    return obs
+
+
+def _policy_action(policy, controller, shape_meta, device, ep, pose_log, now_abs: float, runtime):
+    obs = policy_obs(shape_meta, ep, pose_log, now_abs, runtime)
+    obs_hard = list(runtime.last_hard_triggers)
     controller.compute_one_horizon_action(obs, device)
     return np.asarray(controller.last_raw_action, dtype=np.float64), obs_hard
 
@@ -789,6 +1040,16 @@ def main(argv=None) -> None:
     common.add_argument("--episode", type=int, default=40)
     common.add_argument("--bench", action="store_true")
     common.add_argument("--lag", type=int, default=0)
+    common.add_argument(
+        "--contact",
+        action="store_true",
+        help="report the closest surface point to the commanded TCP; keep its rotation",
+    )
+    common.add_argument(
+        "--integrate-v-par",
+        action="store_true",
+        help="set UMIFT_DECODE_VPAR so x_d includes the tangential sum",
+    )
     check = sub.add_parser("label_check", parents=[common])
     play = sub.add_parser("replay", parents=[common])
     roll = sub.add_parser("rollout", parents=[common])
@@ -799,7 +1060,9 @@ def main(argv=None) -> None:
     if args.mode == "label_check":
         label_check(args.episode, args.bench)
     elif args.mode == "replay":
-        replay(args.episode, args.bench, args.lag)
+        if args.integrate_v_par:
+            os.environ["UMIFT_DECODE_VPAR"] = "1"
+        replay(args.episode, args.bench, args.lag, args.contact)
     else:
         rollout(args.episode, args.ckpt, args.seconds, args.lag)
     del check, play

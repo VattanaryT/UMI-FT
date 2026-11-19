@@ -25,6 +25,42 @@ def test_fake_arm_is_the_last_command_with_optional_lag():
     assert np.allclose(lagged.measure(), 1)
 
 
+def test_contact_arm_projects_the_command_onto_the_surface():
+    start = np.zeros(7)
+    start[3] = 1.0
+
+    def project(position):
+        out = np.asarray(position, dtype=np.float64).reshape(3).copy()
+        out[2] = 0.0
+        return out
+
+    arm = sh.FakeArm(start, contact=True, project=project)
+    command = start.copy()
+    command[:3] = [0.01, -0.02, -0.03]
+    arm.command(command)
+    measured = arm.measure()
+    assert np.allclose(measured[:3], [0.01, -0.02, 0.0])
+    assert measured[3] == 1.0
+
+    plain = sh.FakeArm(start, contact=False, project=project)
+    plain.command(command)
+    assert np.allclose(plain.measure()[:3], command[:3])
+
+    lagged = sh.FakeArm(start, lag=1, contact=True, project=project)
+    lagged.command(command)
+    assert np.allclose(lagged.measure(), start)
+
+
+def test_tangential_command_includes_each_step():
+    frame = np.eye(3)
+    foot = np.zeros(3)
+    first, tang = sh.command_tangential(foot, frame, np.array([0.15, 0.0]), -0.02, 0.1)
+    assert np.allclose(tang, [0.015, 0.0, 0.0])
+    assert np.allclose(first, [0.015, 0.0, 0.02])
+    second, _tang = sh.command_tangential(foot + tang, frame, np.array([0.15, 0.05]), -0.02, 0.1)
+    assert np.allclose(second, [0.030, 0.005, 0.02])
+
+
 def test_control_log_is_readable_by_plot_rollout_quick(tmp_path):
     import zarr
     from plot_rollout_quick import series
