@@ -629,7 +629,7 @@ def test_new_face_at_chunk_start_stays_on_the_held_sheet():
     assert decoded["R_field"][0, :, 2] @ np.array([0.0, 0.0, 1.0]) == pytest.approx(1.0)
 
 
-def test_vt_ramps_in_and_a_later_25mm_step_holds():
+def test_vt_ramps_in_and_a_later_25mm_step_is_clipped():
     runtime = _runtime()
     tcp = np.array([0.0, 0.0, 0.0])
     dt = np.array([1.0 / 15.0])
@@ -639,8 +639,23 @@ def test_vt_ramps_in_and_a_later_25mm_step_holds():
     assert moved == pytest.approx(allow, abs=1e-6)
     runtime._vt_elapsed_s = VT_RAMP_S
     second = runtime.decode_chunk(_action(-0.05), tcp, np.eye(3), dt)
-    assert np.allclose(second["x_d"][0], first["x_d"][0], atol=1e-8)
+    clipped = float(np.linalg.norm(second["x_d"][0] - first["x_d"][0]))
+    assert clipped == pytest.approx(r4_safety_limits().max_step_m, abs=1e-6)
     assert bool(second["clamp_step"][0])
+
+
+def test_10d_action_fills_constant_slots_and_decodes_delta_r():
+    ten = np.zeros((1, 10), dtype=np.float64)
+    ten[0, 0:3] = [0.1, -0.2, -0.03]
+    ten[0, 3] = 400.0
+    ten[0, 4:10] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    runtime = _runtime()
+    decoded = runtime.decode_chunk(
+        ten, np.zeros(3), np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+    )
+    assert decoded["stiffness"][0] == pytest.approx(400.0)
+    assert np.allclose(decoded["R_d"][0], decoded["R_field"][0], atol=1e-6)
+    assert decoded["raw"].shape[-1] == 27
 
 
 E30_LOG = Path("/home/boeing/data/control_log/checkpoints_e30_rollout0_1794958462")

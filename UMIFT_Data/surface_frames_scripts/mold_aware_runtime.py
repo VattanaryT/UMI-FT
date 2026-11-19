@@ -26,6 +26,7 @@ DEFAULT_META = DEFAULT_FIELD.with_name("fixb_meta.json")
 
 
 def rot6d_rows_to_R(r6: np.ndarray) -> np.ndarray:
+    """Gram-Schmidt. Columns of the result are the rotation's axes."""
     a1 = r6[..., 0:3]
     a2 = r6[..., 3:6]
     b1 = a1 / np.clip(np.linalg.norm(a1, axis=-1, keepdims=True), 1e-9, None)
@@ -33,6 +34,28 @@ def rot6d_rows_to_R(r6: np.ndarray) -> np.ndarray:
     b2 = b2 / np.clip(np.linalg.norm(b2, axis=-1, keepdims=True), 1e-9, None)
     b3 = np.cross(b1, b2)
     return np.stack([b1, b2, b3], axis=-2)
+
+
+# Identity rot6d: the first two columns of I. The 10-d action drops these slots.
+_IDENTITY_ROT6 = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64)
+
+
+def expand_r4_action(action: np.ndarray) -> np.ndarray:
+    """10-d ``[v1, v2, δn, stiffness, ΔR]`` → the 27-d layout.
+
+    Dropped slots are the constant identity rotations, the unused virtual
+    target, and the gripper and grasp force. A 27-d action is returned as-is.
+    """
+    action = np.asarray(action, dtype=np.float64)
+    if action.shape[-1] != 10:
+        return action
+    out = np.zeros(action.shape[:-1] + (27,), dtype=np.float64)
+    out[..., 0:3] = action[..., 0:3]
+    out[..., 3:9] = _IDENTITY_ROT6
+    out[..., 12:18] = _IDENTITY_ROT6
+    out[..., 18] = action[..., 3]
+    out[..., 21:27] = action[..., 4:10]
+    return out
 
 
 def Rp_to_SE3(R: np.ndarray, p: np.ndarray) -> np.ndarray:
@@ -866,6 +889,95 @@ def _walk_on_surface(field, foot, frame, v_par, dt):
     return point, landed
 
 
+def _command_tangential(foot, frame, v_par, delta_n, dt) -> np.ndarray:
+    """foot + (v1·t1 + v2·t2)·dt + δn·n_out. Frame z is the inward normal."""
+    frame = np.asarray(frame, dtype=np.float64).reshape(3, 3)
+    tang = frame[:, :2] @ np.asarray(v_par, dtype=np.float64).reshape(2) * float(dt)
+    outward = -frame[:, 2]
+    return np.asarray(foot, dtype=np.float64).reshape(3) + tang + float(delta_n) * outward
+
+
+def _causal_foot_for(field):
+    foot = getattr(field, "_causal_foot", None)
+    if foot is not None:
+        return foot
+    paths = getattr(field, "_causal_npz", None)
+    if paths is None:
+        return None
+    from causal_foot import CausalFoot
+
+    foot = CausalFoot(paths[0], paths[1])
+    field._causal_foot = foot
+    return foot
+
+
+def _integrate_causal_tcp(
+    field,
+    p0,
+    v_par,
+    delta_n,
+    dt,
+    prev_x,
+    prev_R,
+    tcp_carry,
+    tcp_step,
+) -> Dict[str, np.ndarray]:
+    """Foot from the causal tracker at an internal TCP.
+
+    The TCP starts at the measurement. Later chunks keep it. Each step it
+    advances by ``tcp_step`` when that is the known full displacement (tangent
+    and normal), otherwise by the command ``x_d``. The tangent is added to
+    ``x_d`` once. ``dt`` is the value the caller passes (1/15 on the runner).
+    """
+    tracker = _causal_foot_for(field)
+    v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
+    delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
+    dt = np.asarray(dt, dtype=np.float64).reshape(-1)
+    count = len(delta_n)
+    measured = np.asarray(p0, dtype=np.float64).reshape(3)
+    prev = None
+    if prev_x is not None and prev_R is not None:
+        prev = (
+            np.asarray(prev_x, dtype=np.float64).reshape(3),
+            np.asarray(prev_R, dtype=np.float64).reshape(3, 3),
+        )
+    if prev is None or tcp_carry is None:
+        tcp_state = measured.copy()
+    else:
+        tcp_state = np.asarray(tcp_carry, dtype=np.float64).reshape(3).copy()
+    step = None if tcp_step is None else np.asarray(tcp_step, dtype=np.float64).reshape(-1, 3)
+    xs = np.zeros((count, 3), dtype=np.float64)
+    frames = np.zeros((count, 3, 3), dtype=np.float64)
+    commanded = np.zeros((count, 3), dtype=np.float64)
+    quiet = np.zeros(count, dtype=bool)
+    for k in range(count):
+        x, rotation = tracker.step(tcp_state, prev)
+        xs[k] = x
+        frames[k] = rotation
+        commanded[k] = _command_tangential(x, rotation, v_par[k], delta_n[k], dt[k])
+        if step is not None and k < len(step):
+            tcp_state = tcp_state + step[k]
+        else:
+            tcp_state = commanded[k]
+        prev = (x, rotation)
+    outward = -frames[:, :, 2]
+    return {
+        "x_s": xs,
+        "x_d": commanded,
+        "R": frames,
+        "n_out": outward,
+        "face_held": quiet,
+        "hop_hold": quiet,
+        "foot_reanchor": quiet,
+        "foot_cap": quiet,
+        "hop_streak": np.array(0),
+        "reject_streak": np.array(0),
+        "step_reject": quiet,
+        "ray_recovery": quiet,
+        "tcp_carry": tcp_state,
+    }
+
+
 def integrate_tcp_foot(
     field,
     p0: np.ndarray,
@@ -881,6 +993,8 @@ def integrate_tcp_foot(
     step_allow: np.ndarray | None = None,
     reject_streak: int = 0,
     R_tool: np.ndarray | None = None,
+    tcp_carry: np.ndarray | None = None,
+    tcp_step: np.ndarray | None = None,
 ) -> Dict[str, np.ndarray]:
     """Track the measured TCP, and slide the foot by ``v_par``.
 
@@ -893,8 +1007,13 @@ def integrate_tcp_foot(
     refused. The press offset along
     the normal is not a lead.
     ``cap_origin`` is unused. ``hop_streak`` and ``step_allow`` are kept so
-    older callers do not break.
+    older callers do not break. A smooth r4vt field uses the causal tracker
+    instead of this walk.
     """
+    if _causal_foot_for(field) is not None:
+        return _integrate_causal_tcp(
+            field, p0, v_par, delta_n, dt, prev_x, prev_R, tcp_carry, tcp_step
+        )
     v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
     delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
     dt = np.asarray(dt, dtype=np.float64).reshape(-1)
@@ -997,7 +1116,7 @@ def blend_action_rows(actions, starts, steps, decay_m: float = 0.01) -> np.ndarr
     """
     from fixb_labels import so3_to_rot6d_rows
 
-    actions = [np.asarray(a, dtype=np.float64) for a in actions]
+    actions = [expand_r4_action(np.asarray(a, dtype=np.float64)) for a in actions]
     starts = [int(s) for s in starts]
     horizon = actions[0].shape[0]
     width = actions[0].shape[1]
@@ -1166,6 +1285,9 @@ class MoldAwareRuntime:
     # Last commanded foot. The next replan holds this face and this point.
     _cmd_foot: Optional[np.ndarray] = None
     _cmd_R: Optional[np.ndarray] = None
+    # Internal TCP for the causal tracker. Not reset from the measurement.
+    _cmd_tcp: Optional[np.ndarray] = None
+    _tcp_step: Optional[np.ndarray] = None
     _cmd_Rd: Optional[np.ndarray] = None
     _cmd_vt: Optional[np.ndarray] = None
     _vt_elapsed_s: float = 0.0
@@ -1205,6 +1327,7 @@ class MoldAwareRuntime:
                 from fixb_smooth_field import SmoothFrameField
 
                 mold = SmoothFrameField(field_path, side)
+                mold._causal_npz = (field_path, side)
         return cls(
             field=mold,
             R_off=np.asarray(meta["R_off"], dtype=np.float64),
@@ -1234,6 +1357,8 @@ class MoldAwareRuntime:
         self._cmd_R = None
         self._cmd_Rd = None
         self._cmd_vt = None
+        self._cmd_tcp = None
+        self._tcp_step = None
         self._vt_elapsed_s = 0.0
         self._hop_hold_streak = 0
         self._reject_streak = 0
@@ -1246,6 +1371,8 @@ class MoldAwareRuntime:
         self._cmd_R = None
         self._cmd_Rd = None
         self._cmd_vt = None
+        self._cmd_tcp = None
+        self._tcp_step = None
         self._vt_elapsed_s = 0.0
         self._hop_hold_streak = 0
         self._reject_streak = 0
@@ -1576,26 +1703,26 @@ class MoldAwareRuntime:
 
     def _limit_commanded_vt(
         self,
+        x_d: np.ndarray,
         x_s: np.ndarray,
         normal: np.ndarray,
-        delta_n: np.ndarray,
         dt: np.ndarray,
         p0: np.ndarray,
     ):
-        """Ramp the virtual target in, then hold a step longer than 25 mm.
+        """Clip a step longer than 25 mm. Do not rebuild the point on the normal.
 
-        For the first ``VT_RAMP_S`` seconds the offset is scaled by elapsed time
-        and the VT may move at most that fraction of ``max_step_m`` from the
-        previous command (the measured TCP, on the first call). After the ramp,
-        a longer step keeps the last safe VT.
+        ``x_d`` is already ``foot + v·dt + δn·n``. The first ``VT_RAMP_S``
+        seconds may move at most that fraction of ``max_step_m``. A longer
+        step is shortened along the same direction. It is not held in place.
         """
-        x_s = np.asarray(x_s, dtype=np.float64)
-        normal = np.asarray(normal, dtype=np.float64)
+        desired = np.asarray(x_d, dtype=np.float64).reshape(-1, 3)
+        x_s = np.asarray(x_s, dtype=np.float64).reshape(-1, 3)
+        normal = np.asarray(normal, dtype=np.float64).reshape(-1, 3)
         normal = normal / np.clip(np.linalg.norm(normal, axis=-1, keepdims=True), 1e-9, None)
-        delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1).copy()
         dt = np.asarray(dt, dtype=np.float64).reshape(-1)
-        steps = len(delta_n)
-        x_d = np.zeros((steps, 3), dtype=np.float64)
+        steps = len(desired)
+        out = np.zeros((steps, 3), dtype=np.float64)
+        delta_n = np.zeros(steps, dtype=np.float64)
         hit = np.zeros(steps, dtype=bool)
         if self._cmd_vt is None:
             prev = np.asarray(p0, dtype=np.float64).reshape(3).copy()
@@ -1605,23 +1732,19 @@ class MoldAwareRuntime:
         for i in range(steps):
             self._vt_elapsed_s += float(dt[i])
             scale = 1.0 if VT_RAMP_S <= 0 else min(1.0, self._vt_elapsed_s / VT_RAMP_S)
-            desired = x_s[i] + float(delta_n[i]) * scale * normal[i]
-            delta = desired - prev
+            delta = desired[i] - prev
             dist = float(np.linalg.norm(delta))
             allow = full * scale
-            if scale >= 1.0 and dist > full:
-                vt = prev.copy()
-                hit[i] = True
-            elif dist > allow and dist > 1e-12:
-                vt = prev + delta * (allow / dist)
+            if dist > allow and dist > 1e-12:
+                point = prev + delta * (allow / dist)
                 hit[i] = True
             else:
-                vt = desired
-            delta_n[i] = float(np.dot(vt - x_s[i], normal[i]))
-            x_d[i] = x_s[i] + delta_n[i] * normal[i]
-            prev = x_d[i].copy()
+                point = desired[i]
+            out[i] = point
+            delta_n[i] = float(np.dot(point - x_s[i], normal[i]))
+            prev = point.copy()
         self._cmd_vt = prev.copy()
-        return x_d, delta_n, hit
+        return out, delta_n, hit
 
     def decode_chunk(
         self,
@@ -1654,6 +1777,8 @@ class MoldAwareRuntime:
         self.last_foot_reanchor = np.zeros(H, dtype=bool)
         self.last_foot_cap = np.zeros(H, dtype=bool)
         self.last_ori_hold = np.zeros(H, dtype=bool)
+        raw_action = expand_r4_action(np.asarray(raw_action, dtype=np.float64))
+        H = raw_action.shape[0]
 
         if self.run_type == "r1_world_world":
             pos = raw_action[:, 0:3].astype(np.float64)
@@ -1728,7 +1853,12 @@ class MoldAwareRuntime:
             step_allow=label_step,
             reject_streak=self._reject_streak,
             R_tool=np.asarray(R0, dtype=np.float64).reshape(3, 3),
+            tcp_carry=self._cmd_tcp,
+            tcp_step=self._tcp_step,
         )
+        self._tcp_step = None
+        if "tcp_carry" in dec:
+            self._cmd_tcp = np.asarray(dec["tcp_carry"], dtype=np.float64).reshape(3).copy()
         self._hop_hold_streak = int(np.asarray(dec["hop_streak"]).reshape(-1)[0])
         self._reject_streak = int(np.asarray(dec["reject_streak"]).reshape(-1)[0])
         self.last_step_reject = np.asarray(dec["step_reject"], dtype=bool).reshape(H)
@@ -1830,7 +1960,7 @@ class MoldAwareRuntime:
         if apply_safety:
             held_vt = None if self._cmd_vt is None else np.asarray(self._cmd_vt, dtype=np.float64).reshape(3).copy()
             x_d, delta_n, step_hit = self._limit_commanded_vt(
-                x_s, n_out, delta_n, dt, p0
+                x_d, x_s, n_out, dt, p0
             )
             self.last_clamp_step = step_hit
             if np.any(step_hit):

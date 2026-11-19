@@ -1058,10 +1058,33 @@ def print_loaded_action_normalizer(policy) -> None:
         f"scale_offset_sha {digest[:16]}"
     )
     expect = os.environ.get("UMIFT_ACTION_NORMALIZER", "").strip()
+    expect_sha = os.environ.get("UMIFT_ACTION_NORMALIZER_SHA", "").strip()
+    if scale.size == 10:
+        causal = (
+            Path(__file__).resolve().parents[2]
+            / "UMIFT_Data/surface_frames_scripts/assets"
+            / "oct_v35_h4s_r4vt_action_normalizer_minmax_causal_foot.pkl"
+        )
+        pinned = (
+            "14308b72d55600b4359dfa67d10aedab378e42ad26f2bbcac988eed4d97a1ac2"
+        )
+        use_causal = not expect or not Path(expect).is_file()
+        if expect and Path(expect).is_file() and causal.is_file():
+            with Path(expect).open("rb") as handle:
+                saved_dim = int(
+                    pickle.load(handle)
+                    .params_dict["action"]["scale"]
+                    .detach()
+                    .float()
+                    .numel()
+                )
+            use_causal = saved_dim != 10
+        if use_causal and causal.is_file():
+            expect = str(causal)
+            expect_sha = pinned
     if not expect:
         return
     path = Path(expect)
-    expect_sha = os.environ.get("UMIFT_ACTION_NORMALIZER_SHA", "").strip()
     file_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     with path.open("rb") as handle:
         saved = pickle.load(handle)
@@ -1699,6 +1722,14 @@ def main():
         action_type = "pose9"
         id_list = [0]
         action_to_trajectory = ts_to_js_traj
+    elif (
+        shape_meta["action"]["shape"][0] == 10
+        and "robot0_mold_geom" in shape_meta.get("obs", {})
+    ):
+        # Causal-foot 10-d. The MPC expands it to 27 before decode.
+        action_type = "pose9pose9s1a2"
+        id_list = [0]
+        action_to_trajectory = pose9pose9s1a2_to_traj
     elif shape_meta["action"]["shape"][0] == 10:
         action_type = "pose9g1"
         id_list = [0]
