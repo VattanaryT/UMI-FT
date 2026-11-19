@@ -19,7 +19,7 @@ def test_normalizer_sha_and_held_out_episodes():
 def test_gt_action_decodes_to_about_zero():
     result = cf.score_labels([9])
     summary = result["summary"]["all"]
-    for key in ("position_mm", "rotation_deg", "delta_n_mm", "tilt_deg"):
+    for key in ("position_mm", "rotation_deg", "delta_n_mm", "tilt_deg", "v1_mm_s", "v2_mm_s", "stiffness"):
         pair = summary[key]
         assert pair["n"] > 0
         assert pair["median"] < 1e-3, (key, pair)

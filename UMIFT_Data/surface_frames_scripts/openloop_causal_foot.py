@@ -263,11 +263,25 @@ def errors_against_label(runner, walked, index, pred_action=None, pose_source=No
             for i in index
         ]
     )
+    if pred_action is None:
+        v1 = np.zeros(len(index))
+        v2 = np.zeros(len(index))
+        stiff = np.zeros(len(index))
+    else:
+        expanded = runner.expand_r4_action(np.asarray(pred_action, dtype=np.float64))
+        velocity = np.asarray(source["v"], dtype=np.float64)
+        label_stiff = np.asarray(source["stiffness"], dtype=np.float64).reshape(-1)
+        v1 = np.abs(expanded[:, 0] - velocity[index, 0]) * 1e3
+        v2 = np.abs(expanded[:, 1] - velocity[index, 1]) * 1e3
+        stiff = np.abs(expanded[:, 18] - label_stiff[index])
     return {
         "position_mm": np.linalg.norm(x_d - label_cmd, axis=1) * 1e3,
         "rotation_deg": geodesic_deg(r_d, walked["R"][index]),
         "delta_n_mm": np.abs(depth - source["dn"][index]) * 1e3,
         "tilt_deg": _axis_deg(r_d[:, :, 2], walked["R"][index][:, :, 2]),
+        "v1_mm_s": v1,
+        "v2_mm_s": v2,
+        "stiffness": stiff,
         "region": region_code(walked["normal"][index]),
         "mode": _mode(walked["dR"][index], runner),
         "x_d": x_d,
@@ -287,8 +301,19 @@ def _pair(values) -> dict | None:
     }
 
 
+METRIC_KEYS = (
+    "position_mm",
+    "rotation_deg",
+    "delta_n_mm",
+    "tilt_deg",
+    "v1_mm_s",
+    "v2_mm_s",
+    "stiffness",
+)
+
+
 def summarize(rows: list[dict]) -> dict:
-    keys = ("position_mm", "rotation_deg", "delta_n_mm", "tilt_deg")
+    keys = METRIC_KEYS
     if not rows:
         return {"all": {key: None for key in keys}}
     region = np.concatenate([row["region"] for row in rows])
@@ -303,6 +328,38 @@ def summarize(rows: list[dict]) -> dict:
         name: {key: _pair(values[mask]) for key, values in packed.items()}
         for name, mask in groups.items()
     }
+
+
+def index_queries(episodes: list[int] | None = None) -> dict:
+    """The label-check query list, without walking the foot.
+
+    ``query_indices`` only needs timestamps and ``bad_span_0``. Region and ΔR
+    mode are read from the same zarr arrays the walk uses.
+    """
+    import zarr
+
+    if episodes is None:
+        episodes = held_out_episodes()
+    root = zarr.open(str(CAUSAL_ZARR), "r")["data"]
+    long = _long_dt()
+    runner = load_runner()
+    per_episode = {}
+    for episode in episodes:
+        group = root[f"episode_{episode}"]
+        walked = {
+            "robot_t": np.asarray(group["robot_time_stamps_0"], dtype=np.float64).reshape(-1),
+            "rgb_t": np.asarray(group["rgb_time_stamps_0"], dtype=np.float64).reshape(-1),
+            "bad": np.asarray(group["bad_span_0"], dtype=bool).reshape(-1),
+        }
+        queries = query_indices(walked, episode, long.get(episode, set()))
+        per_episode[episode] = {
+            "queries": queries,
+            "normal": np.asarray(group["mold_normal_0"], dtype=np.float64),
+            "dR": np.asarray(group["fixb_delta_R_rot6d_0"], dtype=np.float64),
+            "robot_t": walked["robot_t"],
+            "rgb_t": walked["rgb_t"],
+        }
+    return {"episodes": episodes, "per_episode": per_episode, "runner": runner}
 
 
 def score_label_episode(runner, group, episode: int, long_idx: set[int]) -> dict:
@@ -333,20 +390,36 @@ def score_labels(episodes: list[int] | None = None) -> dict:
 
 
 def format_table(summary: dict) -> str:
-    lines = [
-        f"{'split':<16} {'n':>6} {'pos mm':>16} {'rot °':>16} {'δn mm':>16} {'tilt °':>16}"
-    ]
     order = ("all",) + REGION_NAMES + ("near_identity", "return_yaw")
-    for name in order:
-        block = summary.get(name) or {}
-        cells = []
-        count = ""
-        for key in ("position_mm", "rotation_deg", "delta_n_mm", "tilt_deg"):
-            pair = block.get(key)
-            if not pair:
-                cells.append(f"{'—':>16}")
-                continue
-            count = str(pair["n"])
-            cells.append(f"{pair['median']:.3g} / {pair['p90']:.3g}".rjust(16))
-        lines.append(f"{name:<16} {count:>6} {''.join(cells)}")
-    return "\n".join(lines)
+    blocks = (
+        (
+            ("position_mm", "pos mm"),
+            ("rotation_deg", "rot °"),
+            ("delta_n_mm", "δn mm"),
+            ("tilt_deg", "tilt °"),
+        ),
+        (
+            ("v1_mm_s", "v1 mm/s"),
+            ("v2_mm_s", "v2 mm/s"),
+            ("stiffness", "stiffness"),
+        ),
+    )
+    lines = []
+    for columns in blocks:
+        lines.append(
+            f"{'split':<16} {'n':>6}" + "".join(f"{label:>16}" for _key, label in columns)
+        )
+        for name in order:
+            block = summary.get(name) or {}
+            cells = []
+            count = ""
+            for key, _label in columns:
+                pair = block.get(key)
+                if not pair:
+                    cells.append(f"{'—':>16}")
+                    continue
+                count = str(pair["n"])
+                cells.append(f"{pair['median']:.3g} / {pair['p90']:.3g}".rjust(16))
+            lines.append(f"{name:<16} {count:>6} {''.join(cells)}")
+        lines.append("")
+    return "\n".join(lines).rstrip()
