@@ -2,7 +2,7 @@
 date: 2026-11-19
 stream: infra
 branch: sim_harness
-commit: uncommitted
+commit: b21dfa3
 status: done
 artifacts:
   - /home/boeing/data/control_log/sim_replay_ep40_1795089017
