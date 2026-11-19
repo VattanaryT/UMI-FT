@@ -2,7 +2,7 @@
 date: 2026-11-19
 stream: bc
 branch: causal_foot
-commit: uncommitted
+commit: e2888d0
 status: in-progress
 artifacts:
   - /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_causal_foot/acp_replay_buffer.zarr
