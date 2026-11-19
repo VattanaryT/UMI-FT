@@ -1253,6 +1253,7 @@ def main():
         from mold_aware_runtime import (
             FixBActionEnsembler,
             MoldAwareRuntime,
+            camera_table_from_flange,
             fixb_decode_dt,
             infer_run_type,
             r4_safety_limits,
@@ -1288,6 +1289,10 @@ def main():
             limits=r4_limits,
         )
         mold_T_fixture_from_base = load_workcell_extrinsics().T_fixture_from_right_base
+        _cam_n, _cam_off, _cam_base_y = camera_table_from_flange(
+            Path(control_para["mold_aware_field_npz"]), mold_T_fixture_from_base
+        )
+        mold_runtime.set_table_plane(_cam_n, _cam_off)
         # Depth stays at set_depth_to_zero (default True). These policies have a
         # depth input, but inference feeds zeros and does not open the depth stream.
         control_para["periodic_scan_enabled"] = False
@@ -1310,13 +1315,28 @@ def main():
             from jump_guard import MAX_CONSECUTIVE_HOLDS, MAX_STEP_DEG, MAX_STEP_MM, TargetJumpGuard
 
             r4_jump_guard = TargetJumpGuard()
-            from mold_aware_runtime import FOOT_CAP_M, VT_RAMP_S
+            from fixb_tcp_track import GATE_M
+            from mold_aware_runtime import (
+                CAM_TABLE_MARGIN_M,
+                HOP_HOLD_LIMIT,
+                ORI_LABEL_HOLD_DEG,
+                RD_SLEW_AFTER_RAMP_DEG,
+                VT_RAMP_S,
+            )
 
             print(
                 f"[mold] first-step limits: rd_slew="
                 f"{mold_runtime.limits.enable_rd_slew} "
-                f"{mold_runtime.limits.max_rd_slew_deg:.0f} deg/step from measured TCP, "
-                f"foot_cap={FOOT_CAP_M * 1000:.0f} mm from measured TCP, "
+                f"{mold_runtime.limits.max_rd_slew_deg:.0f} deg/step for {VT_RAMP_S:.0f}s "
+                f"then {RD_SLEW_AFTER_RAMP_DEG:.0f} deg/step, "
+                f"start foot=mesh closest point, "
+                f"every step=label tracker within {GATE_M * 1000:.0f} mm, "
+                f"press-axis re-anchor after {HOP_HOLD_LIMIT} rejects, "
+                f"camera table=flange edge at base Y {_cam_base_y * 1000:.1f} mm, "
+                f"camera margin={CAM_TABLE_MARGIN_M * 1000:.0f} mm, "
+                f"replay orientation hold={ORI_LABEL_HOLD_DEG:.0f} deg, "
+                f"mesh limit={mold_runtime.limits.max_distance_from_mesh_m * 1000:.0f} mm, "
+                f"foot step=label tracker, "
                 f"face_hold="
                 f"{'off' if getattr(_field, 'orientation_z_inward', False) else 'on'}, "
                 f"vt_ramp={VT_RAMP_S:.0f} s, "
@@ -2321,7 +2341,28 @@ def main():
                         * control_para["slow_down_factor"],
                         dtype=np.float64,
                     )
+                prev_Rd = (
+                    None
+                    if mold_runtime._cmd_Rd is None
+                    else np.asarray(mold_runtime._cmd_Rd, dtype=np.float64).copy()
+                )
                 decoded = mold_runtime.decode_chunk(raw_a, p0[0], R0[0], dt)
+                if gt_replay is not None and r4vt:
+                    from mold_aware_runtime import ORI_LABEL_HOLD_DEG, hold_orientation_near_label
+
+                    label_idx = np.asarray(
+                        gt_replay.windows[gt_replay.k][: decoded["R_d"].shape[0]]
+                    )
+                    label_R, _label_p = _pose7_to_Rp(gt_replay.demo[label_idx])
+                    held_R = R0[0] if prev_Rd is None else prev_Rd
+                    decoded["R_d"], ori_held = hold_orientation_near_label(
+                        decoded["R_d"], label_R, held_R, ORI_LABEL_HOLD_DEG
+                    )
+                    if np.any(ori_held):
+                        print_yellow(
+                            f"[mold][hold] orientation > {ORI_LABEL_HOLD_DEG:.0f} deg "
+                            f"from the label on {int(np.sum(ori_held))} steps"
+                        )
                 R_d_fixture = np.asarray(decoded["R_d"], dtype=np.float64).copy()
                 # Fixture +Y is down. Lift the commanded foot and the virtual
                 # target along −Y so a free-space bench stays off the table.
@@ -2370,6 +2411,15 @@ def main():
                     mj = decoded.get("mesh_jump_hold")
                     if mj is not None and bool(mj[i]):
                         flags.append("mesh_jump_hold")
+                    hop = decoded.get("hop_hold")
+                    if hop is not None and bool(hop[i]):
+                        flags.append("hop_hold")
+                    cap = decoded.get("foot_cap")
+                    if cap is not None and bool(cap[i]):
+                        flags.append("foot_cap")
+                    reanchor = decoded.get("foot_reanchor")
+                    if reanchor is not None and bool(reanchor[i]):
+                        flags.append("reanchor")
                     ep_n_action_steps += 1
                     if flags:
                         ep_n_clamp_steps += 1

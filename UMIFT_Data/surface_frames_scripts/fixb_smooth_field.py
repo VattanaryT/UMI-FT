@@ -167,6 +167,50 @@ def circular_mean(angle: np.ndarray) -> float:
     return float(np.arctan2(np.mean(np.sin(a)), np.mean(np.cos(a))))
 
 
+# A closest point on the same face can sit on a tip vortex. Its normal still
+# agrees, but t1 has spun. Carry the previous tangent; do not take that frame.
+NORMAL_AGREE_COS = float(np.cos(np.deg2rad(25.0)))
+TANGENT_SPIN_HOLD_DEG = 30.0
+
+
+def tangent_spin_deg(R_prev: np.ndarray, R_new: np.ndarray) -> float:
+    """Signed angle of t1 about the new normal, in degrees."""
+    R_prev = np.asarray(R_prev, dtype=np.float64).reshape(3, 3)
+    R_new = np.asarray(R_new, dtype=np.float64).reshape(3, 3)
+    n = R_new[:, 2]
+    old = R_prev[:, 0] - np.dot(R_prev[:, 0], n) * n
+    new = R_new[:, 0] - np.dot(R_new[:, 0], n) * n
+    old_n = float(np.linalg.norm(old))
+    new_n = float(np.linalg.norm(new))
+    if old_n < 1e-8 or new_n < 1e-8:
+        return 0.0
+    old = old / old_n
+    new = new / new_n
+    return float(np.degrees(np.arctan2(np.dot(n, np.cross(old, new)), np.dot(old, new))))
+
+
+def tangent_on_normal(seed_R: np.ndarray, queried_R: np.ndarray) -> np.ndarray:
+    """Queried normal, with t1 taken from ``seed_R`` when it has a tangent part."""
+    queried_R = np.asarray(queried_R, dtype=np.float64).reshape(3, 3)
+    n = queried_R[:, 2]
+    t1 = np.asarray(seed_R, dtype=np.float64).reshape(3, 3)[:, 0]
+    t1 = t1 - np.dot(t1, n) * n
+    if float(np.linalg.norm(t1)) < 1e-8:
+        return queried_R.copy()
+    return orthonormal_frames(t1, n)
+
+
+def hold_tangent_through_spin(R_prev: np.ndarray, R_new: np.ndarray) -> np.ndarray:
+    """Keep the previous tangent when the new frame only spins about the normal."""
+    R_prev = np.asarray(R_prev, dtype=np.float64).reshape(3, 3)
+    R_new = np.asarray(R_new, dtype=np.float64).reshape(3, 3)
+    if float(np.dot(R_prev[:, 2], R_new[:, 2])) < NORMAL_AGREE_COS:
+        return R_new.copy()
+    if abs(tangent_spin_deg(R_prev, R_new)) <= TANGENT_SPIN_HOLD_DEG:
+        return R_new.copy()
+    return tangent_on_normal(R_prev, R_new)
+
+
 def rotate_t1(t1: np.ndarray, normal: np.ndarray, theta: float) -> np.ndarray:
     t2 = np.cross(normal, t1)
     out = np.cos(theta) * t1 + np.sin(theta) * t2
@@ -227,9 +271,22 @@ class SmoothFrameField(FixBMoldField):
         return out
 
     def track_step(self, p, p_prev, x_prev, R_prev):
-        del p_prev, x_prev, R_prev
+        """Closest point, but a spin about an agreeing normal keeps the tangent.
+
+        The position hop is returned as queried. The 10 mm hop hold lives in
+        the caller, not here.
+        """
+        del p_prev, x_prev
         q = self.query(p)
-        return q["x_s"].reshape(-1, 3), q["R"].reshape(-1, 3, 3)
+        x = np.asarray(q["x_s"], dtype=np.float64).reshape(-1, 3)
+        R = np.asarray(q["R"], dtype=np.float64).reshape(-1, 3, 3)
+        if R_prev is None:
+            return x, R
+        prev = np.asarray(R_prev, dtype=np.float64).reshape(-1, 3, 3)
+        out = np.empty_like(R)
+        for i in range(len(R)):
+            out[i] = hold_tangent_through_spin(prev[0 if len(prev) == 1 else i], R[i])
+        return x, out
 
     def track_foot(self, p, R_tool=None, x_seed=None, R_seed=None, R_tool_seed=None, p_seed=None, R_out_seed=None):
         del R_tool, x_seed, R_seed, R_tool_seed, p_seed, R_out_seed

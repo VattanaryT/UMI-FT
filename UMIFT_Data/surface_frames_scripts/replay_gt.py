@@ -174,6 +174,14 @@ def _pose_R(pose7: np.ndarray) -> np.ndarray:
     return mats[..., :3, :3]
 
 
+def _label_frame(action: np.ndarray, tool_R: np.ndarray) -> np.ndarray:
+    """R_field = R_tool @ ΔRᵀ. Replay seeds a fresh window with this."""
+    from mold_aware_runtime import rot6d_rows_to_R
+
+    dR = rot6d_rows_to_R(np.asarray(action, dtype=np.float64).reshape(-1, 27)[:1, 21:27])[0]
+    return np.asarray(tool_R, dtype=np.float64).reshape(3, 3) @ dR.T
+
+
 def _inplane(points: np.ndarray, foot: np.ndarray, normal: np.ndarray) -> np.ndarray:
     delta = np.asarray(points, dtype=np.float64) - np.asarray(foot, dtype=np.float64)
     normal = np.asarray(normal, dtype=np.float64)
@@ -777,13 +785,15 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
     dt_exec = fixb_decode_dt(exec_h, 1, RUNNER_DT_S)
     for k, indices in enumerate(windows):
         head = int(indices[0])
+        tool0 = _pose_R(demo[head])[0]
         runtime.release_command_foot()
         decoded = runtime.decode_chunk(
             actions[k],
             demo[head, :3],
-            _pose_R(demo[head])[0],
+            tool0,
             dt_chunk,
             apply_safety=False,
+            frame_seed=_label_frame(actions[k], tool0),
         )
         pose, stiff = _nominal_pose(None, None, "r4vt", decoded)
         chunks.append({"pose7": pose, "nominal_pose7": pose, "stiffness": stiff})
@@ -808,13 +818,15 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
                 }
             )
         ensembler.push(k * int(exec_h), actions[k])
+        blended_action = ensembler.pop(exec_h)
         runtime.release_command_foot()
         action_decoded = runtime.decode_chunk(
-            ensembler.pop(exec_h),
+            blended_action,
             demo[head, :3],
-            _pose_R(demo[head])[0],
+            tool0,
             dt_exec,
             apply_safety=False,
+            frame_seed=_label_frame(blended_action, tool0),
         )
         x_g, R_g, _field_g, aborted = jump_guard.apply(
             action_decoded["x_d"],

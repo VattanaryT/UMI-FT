@@ -75,6 +75,49 @@ class _Inward:
         return hit["x_s"], hit["R"]
 
 
+def test_nine_mm_hop_with_a_99_deg_spin_keeps_the_frame():
+    """Episode 0 index 11250: the foot hops 9.6 mm and t1 spins 99° about n."""
+    from fixb_smooth_field import (
+        SmoothFrameField,
+        hold_tangent_through_spin,
+        orthonormal_frames,
+        tangent_spin_deg,
+    )
+    from mold_aware_runtime import FOOT_CAP_M, _hold_if_far
+
+    normal = np.array([0.0, 0.0, -1.0])
+    previous = orthonormal_frames(np.array([1.0, 0.0, 0.0]), normal)
+    theta = np.deg2rad(99.0)
+    spun = orthonormal_frames(np.array([np.cos(theta), np.sin(theta), 0.0]), normal)
+    origin = np.zeros(3)
+    hopped = np.array([0.0096, 0.0, 0.0])
+    held = hold_tangent_through_spin(previous, spun)
+    assert abs(tangent_spin_deg(previous, held)) < 1.0
+    assert np.linalg.norm(hopped - origin) == pytest.approx(0.0096)
+    assert np.linalg.norm(hopped - origin) < FOOT_CAP_M
+
+    field = object.__new__(SmoothFrameField)
+
+    def query(p, **_ignored):
+        points = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+        return {
+            "x_s": np.repeat(hopped.reshape(1, 3), len(points), axis=0),
+            "R": np.repeat(spun.reshape(1, 3, 3), len(points), axis=0),
+        }
+
+    field.query = query
+    foot, frame = SmoothFrameField.track_step(field, hopped, origin, origin, previous)
+    assert np.linalg.norm(foot[0] - origin) == pytest.approx(0.0096)
+    assert abs(tangent_spin_deg(previous, frame[0])) < 1.0
+    kept_foot, kept_frame = _hold_if_far(foot[0], frame[0], origin, previous)
+    assert np.allclose(kept_foot, foot[0])
+    assert np.allclose(kept_frame, frame[0])
+    small = orthonormal_frames(
+        np.array([np.cos(np.deg2rad(10.0)), np.sin(np.deg2rad(10.0)), 0.0]), normal
+    )
+    assert np.allclose(hold_tangent_through_spin(previous, small), small)
+
+
 def test_positive_delta_n_stays_outside_when_z_points_in():
     runtime = MoldAwareRuntime(
         field=_Inward(),
