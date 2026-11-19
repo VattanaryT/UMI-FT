@@ -1144,6 +1144,30 @@ def action21_to_action_sample(
     return action_processed
 
 
+# After raw_to_action21: v1, v2, δn, stiffness, ΔR rot6d. The other 17 slots are constant.
+R4_10_COLUMNS = (0, 1, 2, 18, 21, 22, 23, 24, 25, 26)
+
+
+def action_r4_10_from_action27(action: np.ndarray) -> np.ndarray:
+    return np.asarray(action)[..., list(R4_10_COLUMNS)]
+
+
+def action_r4_10_to_action_sample(
+    action_sparse: np.ndarray,
+    action_dense: np.ndarray,
+    id_list: list,
+    base_pose: list,
+):
+    """Pass the 10-d r4 vector through. It is not an SE3 pose."""
+    del id_list, base_pose
+    if action_sparse.shape[-1] != 10:
+        raise ValueError(f"r4_10 action dim {action_sparse.shape[-1]}, expected 10")
+    processed = {"sparse": action_sparse, "dense": {}}
+    if len(action_dense) > 0:
+        raise NotImplementedError
+    return processed
+
+
 def action9_postprocess(
     action: np.ndarray,
     current_SE3: list,

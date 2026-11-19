@@ -10,6 +10,8 @@ from PyriteConfig.tasks.umift.umift_type_conversions import (
     action10_to_action_sample,
     action19_to_action_sample,
     action21_to_action_sample,
+    action_r4_10_from_action27,
+    action_r4_10_to_action_sample,
     obs_to_obs_sample,
     raw_to_action9,
     raw_to_action10,
@@ -84,6 +86,8 @@ class UmiFTDataset(BaseImageDataset):
             or shape_meta["action"]["shape"][0] == 18
         ):
             action_type = "pose9"
+        elif shape_meta["action"]["shape"][0] == 10 and shape_meta.get("reduced_r4"):
+            action_type = "r4_10"
         elif (
             shape_meta["action"]["shape"][0] == 10
             or shape_meta["action"]["shape"][0] == 20
@@ -126,8 +130,11 @@ class UmiFTDataset(BaseImageDataset):
             action_to_action_sample = action19_to_action_sample
         elif action_type == "pose9pose9s1g2":
             action_to_action_sample = action21_to_action_sample
+        elif action_type == "r4_10":
+            action_to_action_sample = action_r4_10_to_action_sample
         else:
             raise RuntimeError("unsupported")
+        self.action_to_action_sample = action_to_action_sample
 
         sampler = SequenceSamplerUmiFT(
             shape_meta=shape_meta,
@@ -199,6 +206,15 @@ class UmiFTDataset(BaseImageDataset):
                     replay_buffer["data"][ep],
                     self.id_list,
                 )
+            elif self.action_type == "r4_10":
+                raw_to_action21(
+                    replay_buffer_raw["data"][ep],
+                    replay_buffer["data"][ep],
+                    self.id_list,
+                )
+                replay_buffer["data"][ep]["action"] = action_r4_10_from_action27(
+                    replay_buffer["data"][ep]["action"]
+                )
             else:
                 raise RuntimeError("unsupported")
             # print(f"episode {ep}")
@@ -220,6 +236,8 @@ class UmiFTDataset(BaseImageDataset):
             action_to_action_sample = action19_to_action_sample
         elif self.action_type == "pose9pose9s1g2":
             action_to_action_sample = action21_to_action_sample
+        elif self.action_type == "r4_10":
+            action_to_action_sample = action_r4_10_to_action_sample
         else:
             raise RuntimeError("unsupported")
 
@@ -315,6 +333,8 @@ class UmiFTDataset(BaseImageDataset):
             # 21 (r1–r3) or 27 (r4: + ΔR rot6d)
             AL = int(data_cache_sparse["action"].shape[-1] // max(len(self.id_list), 1))
             assert AL in (21, 27), f"unexpected per-arm action dim {AL}"
+        elif self.action_type == "r4_10":
+            AL = 10
         else:
             raise RuntimeError("unsupported")
 

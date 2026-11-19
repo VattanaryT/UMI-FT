@@ -23,16 +23,24 @@ _R4_LOSS_GROUPS = (
     ("grip_grasp", 19, 21),
     ("delta_R", 21, 27),
 )
+_R4_10_LOSS_GROUPS = (
+    ("v_t", 0, 2),
+    ("delta_n", 2, 3),
+    ("stiffness", 3, 4),
+    ("delta_R", 4, 10),
+)
 
 
 def _r4_group_mse(per: torch.Tensor, w: torch.Tensor) -> dict:
     """Masked mean of per-element diffusion MSE. Keys are python floats."""
+    groups = _R4_10_LOSS_GROUPS if per.shape[-1] == 10 else _R4_LOSS_GROUPS
+    delta_r0 = 4 if per.shape[-1] == 10 else 21
     out = {}
-    for name, a, b in _R4_LOSS_GROUPS:
+    for name, a, b in groups:
         ww = w[..., a:b]
         pp = per[..., a:b]
         out[name] = float(((pp * ww).sum() / ww.sum().clamp_min(1.0)).detach().item())
-    out["delta_R_masked_frac"] = float((w[..., 21] == 0).detach().float().mean().item())
+    out["delta_R_masked_frac"] = float((w[..., delta_r0] == 0).detach().float().mean().item())
     return out
 
 
@@ -520,7 +528,7 @@ class DiffusionUnetTimmMod1Policy(BaseImagePolicy):
                     f"pred shape {tuple(per.shape)}"
                 )
             sparse_loss = (per * w).sum() / w.sum().clamp_min(1.0)
-            if per.shape[-1] >= 27:
+            if per.shape[-1] >= 27 or per.shape[-1] == 10:
                 self.r4_group_log = _r4_group_mse(per, w)
         else:
             w = torch.ones_like(per)

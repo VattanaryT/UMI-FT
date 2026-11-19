@@ -7,6 +7,7 @@ Existing r4 datasets are unchanged.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
@@ -117,6 +118,20 @@ def drop_excluded_queries(
     return stats
 
 
+def _mark_reduced_r4(shape_meta):
+    """Copy shape_meta and mark the 10-d r4 action so it is not pose9+gripper."""
+    try:
+        from omegaconf import OmegaConf
+
+        if OmegaConf.is_config(shape_meta):
+            shape_meta = OmegaConf.to_container(shape_meta, resolve=True)
+    except ImportError:
+        pass
+    copied = copy.deepcopy(dict(shape_meta))
+    copied["reduced_r4"] = True
+    return copied
+
+
 class UmiFTDatasetR4VT(UmiFTDatasetOctR4):
     """October r4vt. Episodes 35 and 44, bad spans, and long waits are not sampled."""
 
@@ -129,12 +144,15 @@ class UmiFTDatasetR4VT(UmiFTDatasetOctR4):
         exclude_episodes,
         long_dt_mask_path: str,
         exclusion_stats_path: str | None = None,
+        reduced_r4: bool = False,
         **kwargs,
     ):
         self._exclude = [int(ep) for ep in exclude_episodes]
         self._long_dt_mask_path = str(long_dt_mask_path)
         self._exclusion_stats_path = exclusion_stats_path
         self._dataset_path = dataset_path
+        if reduced_r4:
+            shape_meta = _mark_reduced_r4(shape_meta)
         super().__init__(
             shape_meta=shape_meta,
             dataset_path=dataset_path,
