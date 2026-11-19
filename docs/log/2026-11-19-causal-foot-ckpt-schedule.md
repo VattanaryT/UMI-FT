@@ -2,7 +2,7 @@
 date: 2026-11-19
 stream: bc
 branch: causal_foot
-commit: uncommitted
+commit: 1b0a0d9
 status: in-progress
 artifacts: []
 ---
