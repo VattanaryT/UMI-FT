@@ -2,7 +2,7 @@
 date: 2026-11-19
 stream: frame
 branch: runner_causal_foot
-commit: uncommitted
+commit: a7b0837
 status: done
 artifacts:
   - /mnt/data/umidata/ft/data/control_log/sim_replay_ep40_1795109493.json
