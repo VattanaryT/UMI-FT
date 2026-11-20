@@ -38,6 +38,25 @@ from PyriteUtility.planning_control.policy_clock import (
     PolicyElapsedClock,
     scale_obs_windows_by_slow_down,
 )
+from PyriteEnvSuites.env_runners.policy_start_pose import (
+    POLICY_LOOKBACK_S,
+    MAX_ROT_STEP_DEG,
+    allow_normal_gap,
+    arrival_error,
+    descent_alpha_at_surface,
+    first_frame_pose7,
+    position_accepted,
+    position_parts,
+    movej_path,
+    plan_wrist_unwind,
+    pose7_to_ur_rotvec,
+    pose_rotation_deg,
+    query_wrist_ik,
+    read_policy_start_episode,
+    rotation_capped_waypoints,
+    wrist3_seeds,
+    zarr_for_policy_start,
+)
 from PyriteEnvSuites.env_runners.dataset_start_pose import (
     DATASET_START_EPISODE,
     central_episode_start,
@@ -51,6 +70,11 @@ from PyriteEnvSuites.env_runners.rollout_experiment_log import (
     CAMERA_HZ,
     append_rollout_journal,
     format_horizon_banner,
+)
+from PyriteEnvSuites.env_runners.stiffness_floor import (
+    apply_press_stiffness_floor,
+    read_press_stiffness_floor,
+    write_stiffness_trace,
 )
 from PyriteUtility.planning_control.scan_encoder_monitor import (
     ScanEncoderMonitor,
@@ -193,17 +217,33 @@ APPROACH_HOVER_M = 0.05
 APPROACH_MAX_MESH_M = 0.15
 
 
-def _slow_move_l(env, goal_pose7: np.ndarray, max_speed_mps: float = APPROACH_SPEED_MPS) -> None:
-    """Cartesian move of robot 0. Duration keeps the TCP at or under max_speed_mps."""
+def _slow_move_l(
+    env,
+    goal_pose7: np.ndarray,
+    max_speed_mps: float = APPROACH_SPEED_MPS,
+    max_rot_step_deg: Optional[float] = None,
+) -> None:
+    """Cartesian move of robot 0. Duration keeps the TCP at or under max_speed_mps.
+
+    ``max_rot_step_deg`` splits the slerp so each step stays under that angle.
+    The 0.2 rad servo check is between successive commands, and 5 deg is under it.
+    """
     obs_raw = env.get_observation_from_buffer()
     current = np.asarray(obs_raw["ts_pose_fb_0"][-1], dtype=np.float64).reshape(7)
     goal = np.asarray(goal_pose7, dtype=np.float64).reshape(7)
     dist = float(np.linalg.norm(goal[:3] - current[:3]))
     duration_s = max(dist / float(max_speed_mps), 0.5)
     n_samples = max(2, int(round(duration_s / 0.02)))
-    alpha = np.linspace(0.0, 1.0, n_samples)
-    waypoints = su.pose7_interp(current, goal, alpha)
-    timestamps = alpha * duration_s
+    if max_rot_step_deg is None:
+        alpha = np.linspace(0.0, 1.0, n_samples)
+        waypoints = su.pose7_interp(current, goal, alpha)
+        timestamps = alpha * duration_s
+    else:
+        waypoints = rotation_capped_waypoints(
+            current, goal, max_step_deg=max_rot_step_deg, min_steps=n_samples - 1
+        )
+        duration_s = max(duration_s, 0.02 * (len(waypoints) - 1))
+        timestamps = np.linspace(0.0, duration_s, len(waypoints))
     ids = list(getattr(env, "id_list", [0]))
     if ids == [0]:
         pose_cmd = waypoints.T
@@ -256,6 +296,8 @@ def approach_start_pose(
     hardware_config_path: str,
     table_normal=None,
     table_offset=None,
+    max_rot_step_deg: Optional[float] = None,
+    stop_at_contact: bool = False,
 ) -> bool:
     """Move to 5 cm back along the tool axis, then straight down that axis.
 
@@ -286,18 +328,45 @@ def approach_start_pose(
         return False
     obs_raw = env.get_observation_from_buffer()
     current = np.asarray(obs_raw["ts_pose_fb_0"][-1], dtype=np.float64).reshape(7)
-    for name, pose in (("hover", hover), ("start", start)):
-        if not tcp_inside_safe_zone(pose[:3], safe_zone):
-            print_red(f"[approach] {name} pose is outside the safe zone {safe_zone}. Not moving.")
-            return False
+    if not tcp_inside_safe_zone(hover[:3], safe_zone):
+        print_red(f"[approach] hover pose is outside the safe zone {safe_zone}. Not moving.")
+        return False
     if not _segment_inside_safe_zone(current[:3], hover[:3], safe_zone):
         print_red("[approach] The move to the hover leaves the safe zone. Not moving.")
         return False
-    if not _segment_inside_safe_zone(hover[:3], start[:3], safe_zone):
+    descent_goal = start
+    if stop_at_contact:
+        alphas = np.linspace(0.0, 1.0, 25)
+        samples = (1.0 - alphas)[:, None] * hover_fix[:3] + alphas[:, None] * start_fix[:3]
+        sds = np.asarray(field.query(samples)["sd"], dtype=np.float64).reshape(-1)
+        alpha = descent_alpha_at_surface(alphas, sds)
+        sd_start = float(sds[-1])
+        if alpha < 1.0 - 1e-6:
+            goal_fix = start_fix.copy()
+            goal_fix[:3] = (1.0 - alpha) * hover_fix[:3] + alpha * start_fix[:3]
+            descent_goal = pose7_change_frame(
+                goal_fix, np.linalg.inv(T_fixture_from_base)
+            )
+            short_mm = float(np.linalg.norm(goal_fix[:3] - start_fix[:3]) * 1e3)
+            print(
+                f"[approach] Episode TCP is {-sd_start * 1e3:.1f} mm inside the mold. "
+                f"Stopping the descent at the surface, {short_mm:.1f} mm short of that TCP."
+            )
+        else:
+            print(
+                f"[approach] Episode TCP is {sd_start * 1e3:.1f} mm outside the mold. "
+                "Descending to that pose."
+            )
+    if not tcp_inside_safe_zone(descent_goal[:3], safe_zone):
+        print_red(
+            f"[approach] descent pose is outside the safe zone {safe_zone}. Not moving."
+        )
+        return False
+    if not _segment_inside_safe_zone(hover[:3], descent_goal[:3], safe_zone):
         print_red("[approach] The descent leaves the safe zone. Not moving.")
         return False
     to_hover = su.pose7_interp(current, hover, np.linspace(0.0, 1.0, 25))
-    descent = su.pose7_interp(hover, start, np.linspace(0.0, 1.0, 25))
+    descent = su.pose7_interp(hover, descent_goal, np.linspace(0.0, 1.0, 25))
     if not _camera_poses_clear(np.vstack([to_hover, descent]), T_fixture_from_base, table_normal, table_offset):
         print_red("[approach] A D405 corner meets the flange on this path. Not moving.")
         return False
@@ -306,18 +375,219 @@ def approach_start_pose(
         f"at most {APPROACH_SPEED_MPS * 100:.0f} cm/s, then straight down that axis."
     )
     try:
-        _slow_move_l(env, hover)
+        _slow_move_l(env, hover, max_rot_step_deg=max_rot_step_deg)
     except Exception as exc:
         print_red(f"[approach] Move to the hover failed ({exc}).")
         return False
     input("At the hover. Press Enter to descend to the start pose.")
     print("[approach] descending to the start pose.")
     try:
-        _slow_move_l(env, start)
+        _slow_move_l(env, descent_goal, max_rot_step_deg=max_rot_step_deg)
     except Exception as exc:
         print_red(f"[approach] Descent failed ({exc}).")
         return False
     return True
+
+
+def _pose_txt(pose7) -> str:
+    return " ".join(f"{float(v):.5f}" for v in np.asarray(pose7).reshape(7))
+
+
+def apply_policy_wrist_winding(env, target_pose7, *, python: str, ip: str) -> float:
+    """Shift wrist 3 onto the winding that can take the +174 deg return flip.
+
+    Pauses the servo, solves IK of the target pose, joint-moves only wrist 3,
+    then resumes. The Cartesian hover runs after this, from that winding.
+    """
+    if not env.pause_rtde_control():
+        raise RuntimeError("pause_rtde_control failed before the wrist-3 move.")
+    try:
+        current = read_robot_joints_via_rtde(Path(python), ip)
+        seeds = wrist3_seeds(current)
+        sols = query_wrist_ik(
+            python, ip, pose7_to_ur_rotvec(target_pose7), seeds
+        )
+        path, chosen = plan_wrist_unwind(current, sols)
+        if path:
+            print(
+                "[policy-start] wrist 3 "
+                f"{current[5]:.3f} rad. Turning it to {path[-1][5]:.3f} rad "
+                f"so the start pose ({chosen:.3f} rad) has room for +174 deg."
+            )
+            movej_path(python, ip, path)
+        else:
+            print(
+                "[policy-start] wrist 3 "
+                f"{current[5]:.3f} rad already leads to {chosen:.3f} rad, "
+                "which has room for +174 deg."
+            )
+        return chosen
+    finally:
+        if not env.resume_rtde_control():
+            raise RuntimeError(
+                "resume_rtde_control failed after the wrist-3 move."
+            )
+
+
+def _policy_pose_error(env, target_pose7, field, T_fixture_from_base):
+    """Reached pose, tangential/normal gap, angle, and both signed distances."""
+    reached = np.asarray(
+        env.get_observation_from_buffer()["ts_pose_fb_0"][-1], dtype=np.float64
+    ).reshape(7)
+    target = np.asarray(target_pose7, dtype=np.float64).reshape(7)
+    target_fix = pose7_change_frame(target, T_fixture_from_base)
+    reached_fix = pose7_change_frame(reached, T_fixture_from_base)
+    target_q = field.query(target_fix[:3])
+    reached_q = field.query(reached_fix[:3])
+    n_fix = np.asarray(target_q["n_out"], dtype=np.float64).reshape(3)
+    n_base = T_fixture_from_base[:3, :3].T @ n_fix
+    tangential_m, normal_m = position_parts(reached[:3], target[:3], n_base)
+    return {
+        "reached": reached,
+        "tangential_m": tangential_m,
+        "normal_m": normal_m,
+        "ang_deg": pose_rotation_deg(target, reached),
+        "target_sd": float(np.asarray(target_q["sd"]).reshape(-1)[0]),
+        "reached_sd": float(np.asarray(reached_q["sd"]).reshape(-1)[0]),
+    }
+
+
+def _wait_policy_descent(
+    env,
+    target_pose7,
+    field,
+    T_fixture_from_base,
+    *,
+    max_rot_step_deg: float,
+    timeout_s: float = 20.0,
+) -> dict:
+    """Let a slow descent finish. One re-command if it stalls short of an outside TCP.
+
+    The timed move returns after the commanded duration. Admittance reaches the
+    hover during the Enter wait and is still short of the episode TCP when that
+    wait is not there. Poll until the pose is accepted, the arm stops, or the
+    timeout. Signed distance is positive outside the mold.
+    """
+    deadline = time.time() + float(timeout_s)
+    retried = False
+    slow_polls = 0
+    last_print = 0.0
+    prev = None
+    prev_t = None
+    state = _policy_pose_error(env, target_pose7, field, T_fixture_from_base)
+    while True:
+        now = time.time()
+        state = _policy_pose_error(env, target_pose7, field, T_fixture_from_base)
+        allow = allow_normal_gap(
+            state["target_sd"], state["reached_sd"], state["normal_m"]
+        )
+        if position_accepted(
+            state["tangential_m"],
+            state["normal_m"],
+            state["ang_deg"],
+            allow_normal=allow,
+        ):
+            return state
+        speed = 0.0
+        if prev is not None and prev_t is not None and now > prev_t:
+            speed = float(
+                np.linalg.norm(state["reached"][:3] - prev[:3]) / (now - prev_t)
+            )
+        prev = state["reached"].copy()
+        prev_t = now
+        gap = float(np.hypot(state["tangential_m"], state["normal_m"]))
+        if now - last_print >= 1.0:
+            print(
+                "[policy-start] waiting for the descent. "
+                f"{gap * 1e3:.1f} mm left "
+                f"({state['tangential_m'] * 1e3:.1f} tangential, "
+                f"{state['normal_m'] * 1e3:+.1f} normal), "
+                f"reached sd {state['reached_sd'] * 1e3:+.1f} mm, "
+                f"episode TCP sd {state['target_sd'] * 1e3:+.1f} mm."
+            )
+            last_print = now
+        stalled = speed < 0.0015
+        slow_polls = slow_polls + 1 if stalled else 0
+        if slow_polls >= 3 and not retried and state["target_sd"] >= -0.002:
+            print("[policy-start] Descent stalled. Commanding the episode TCP again.")
+            _slow_move_l(
+                env, target_pose7, max_rot_step_deg=max_rot_step_deg
+            )
+            retried = True
+            slow_polls = 0
+            prev = None
+            continue
+        if slow_polls >= 3 or now >= deadline:
+            if retried:
+                return state
+            where = "stopped" if slow_polls >= 3 else "timed out"
+            raise RuntimeError(
+                "[policy-start] Descent "
+                f"{where} {gap * 1e3:.1f} mm from the episode TCP "
+                f"({state['tangential_m'] * 1e3:.1f} mm tangential, "
+                f"{state['normal_m'] * 1e3:+.1f} mm normal). "
+                f"Reached sd {state['reached_sd'] * 1e3:+.1f} mm, "
+                f"episode TCP sd {state['target_sd'] * 1e3:+.1f} mm "
+                "(positive is outside the mold). Aborting."
+            )
+        time.sleep(0.2)
+
+
+def confirm_policy_start_reached(
+    env,
+    target_pose7,
+    *,
+    python: str,
+    ip: str,
+    field,
+    T_fixture_from_base,
+) -> None:
+    """Abort unless the thread is alive, the pose is accepted, and wrist 3 has room."""
+    server = getattr(env, "server", None)
+    alive = bool(server is not None and server.is_running())
+    tangential_m = 0.0
+    normal_m = 0.0
+    ang_deg = 0.0
+    q6 = 0.0
+    allow = False
+    if alive:
+        state = _policy_pose_error(env, target_pose7, field, T_fixture_from_base)
+        tangential_m = state["tangential_m"]
+        normal_m = state["normal_m"]
+        ang_deg = state["ang_deg"]
+        allow = allow_normal_gap(
+            state["target_sd"], state["reached_sd"], state["normal_m"]
+        )
+        q6 = float(read_robot_joints_via_rtde(Path(python), ip)[5])
+        gap = float(np.hypot(tangential_m, normal_m))
+        print(f"[policy-start] target  {_pose_txt(target_pose7)}")
+        print(f"[policy-start] reached {_pose_txt(state['reached'])}")
+        print(
+            f"[policy-start] error {gap * 1e3:.1f} mm "
+            f"({tangential_m * 1e3:.1f} tangential, {normal_m * 1e3:+.1f} normal), "
+            f"{ang_deg:.1f} deg. "
+            f"sd reached {state['reached_sd'] * 1e3:+.1f} mm, "
+            f"episode TCP {state['target_sd'] * 1e3:+.1f} mm "
+            "(positive is outside). "
+            f"wrist 3 {q6:.3f} rad ({np.degrees(q6):.1f} deg)."
+        )
+    if not alive:
+        raise RuntimeError(
+            "[policy-start] "
+            + arrival_error(False, 0.0, 0.0, 0.0, 0.0)
+        )
+    wrist_err = arrival_error(True, 0.0, 0.0, 0.0, q6)
+    if wrist_err:
+        raise RuntimeError(f"[policy-start] {wrist_err}")
+    if not position_accepted(
+        tangential_m, normal_m, ang_deg, allow_normal=allow
+    ):
+        gap = float(np.hypot(tangential_m, normal_m))
+        print_red(
+            "[policy-start] WARNING TCP is outside "
+            f"5 mm / 3 deg ({gap * 1e3:.1f} mm, {ang_deg:.1f} deg) "
+            "after the re-command. Continuing to the 8 s hold."
+        )
 
 
 def move_to_dataset_start_pose(
@@ -970,6 +1240,7 @@ def log_horizon(
     shape_meta: dict,
     log_policy_vision: bool,
     scan_encoder_stats: Optional[dict] = None,
+    stiffness_trace: Optional[dict] = None,
 ) -> None:
     """Write one MPC horizon to the episode control log (executed slice only)."""
     horizon_log = log.create_group(f"horizon_{horizon_count}")
@@ -994,6 +1265,11 @@ def log_horizon(
             f"ts_stiffnesses_{robot_id}",
             data=outputs_ts_stiffnesses[robot_id][:, : 6 * exe],
         )
+        if stiffness_trace is not None and robot_id in stiffness_trace:
+            raw_k, floored_k = stiffness_trace[robot_id]
+            write_stiffness_trace(
+                action_log, robot_id, raw_k[:exe], floored_k[:exe]
+            )
     action_log.create_dataset(
         "timestamps_s",
         data=timestamps[:exe] + action_start_time_s,
@@ -1309,6 +1585,7 @@ def main():
             fixb_decode_dt,
             infer_run_type,
             r4_safety_limits,
+            read_bench_dn_floor_m,
         )
 
         mold_run_type = infer_run_type(_task_name, shape_meta)
@@ -1321,6 +1598,7 @@ def main():
         env_floor = os.environ.get("UMIFT_ENABLE_DELTA_N_FLOOR")
         if env_floor is not None and env_floor.strip() != "":
             delta_n_floor = env_floor.strip().lower() in ("1", "true", "yes")
+        bench_dn_floor_m = read_bench_dn_floor_m()
         env_lift = os.environ.get("UMIFT_BENCH_LIFT_M")
         if env_lift is not None and env_lift.strip() != "":
             bench_lift_m = float(env_lift)
@@ -1330,6 +1608,7 @@ def main():
                 wrench_hold_n=float(control_para["wrench_hold_n"]),
                 abort_on_measured_mesh_distance=abort_measured,
                 enable_delta_n_floor=delta_n_floor,
+                max_press_depth_m=-bench_dn_floor_m,
             )
             if r4vt
             else None
@@ -1397,6 +1676,7 @@ def main():
             print(
                 f"[mold] r4vt action blend, "
                 f"dn_floor={mold_runtime.limits.enable_delta_n_floor} "
+                f"at {bench_dn_floor_m * 1e3:.0f} mm "
                 f"tcp_penetration_m={mold_runtime.limits.max_tcp_penetration_m} "
                 f"wrench_hold_n={mold_runtime.limits.wrench_hold_n} "
                 f"abort_on_measured_mesh_distance="
@@ -1814,6 +2094,11 @@ def main():
         * p_timestep_s
         * control_para["slow_down_factor"]
     )
+    stiffness_floor = read_press_stiffness_floor()
+    if stiffness_floor is None:
+        print("[stiffness] press-axis floor off")
+    else:
+        print(f"[stiffness] press-axis floor {stiffness_floor:.0f} N/m")
     printOrNot(vbs_h2, "Starting main loop.")
     r4_action_ensembler = (
         FixBActionEnsembler(
@@ -1929,6 +2214,11 @@ def main():
             f"{len(gt_replay.actions)} label chunks, "
             f"H={gt_replay.exec_h}, no policy call"
         )
+        if os.environ.get("UMIFT_POLICY_START_EPISODE", "").strip():
+            raise RuntimeError(
+                "UMIFT_POLICY_START_EPISODE is for policy rollouts. "
+                "Unset it for a GT replay."
+            )
 
     #########################################
     # main loop starts
@@ -1940,7 +2230,11 @@ def main():
         if r4_jump_guard is not None:
             r4_jump_guard.reset()
         approach_logged = False
+        policy_hold = False
         if r4vt:
+            policy_episode = (
+                None if gt_replay is not None else read_policy_start_episode()
+            )
             if gt_replay is not None and mold_T_fixture_from_base is not None:
                 from mold_aware_runtime import shift_fixture_up
 
@@ -1957,15 +2251,43 @@ def main():
                 start_base = shift_fixture_up(gt_replay.start_pose7, bench_lift_m)
                 pose_note = f"recorded episode {gt_replay.episode}, fixture frame"
             else:
-                start_base = np.asarray(
-                    env.get_observation_from_buffer()["ts_pose_fb_0"][-1],
-                    dtype=np.float64,
-                ).reshape(7)
-                pose_note = "current TCP"
+                if policy_episode is not None:
+                    zpath = zarr_for_policy_start(fallback=dataset_start_zarr)
+                    if zpath is None:
+                        raise RuntimeError(
+                            "[policy-start] No zarr for "
+                            f"UMIFT_POLICY_START_EPISODE={policy_episode}."
+                        )
+                    if mold_T_fixture_from_base is None:
+                        raise RuntimeError(
+                            "[policy-start] No fixture extrinsics. Not moving."
+                        )
+                    pose_fix = first_frame_pose7(zpath, policy_episode)
+                    if dataset_poses_are_fixture(zpath):
+                        start_base = pose7_change_frame(
+                            pose_fix, np.linalg.inv(mold_T_fixture_from_base)
+                        )
+                    else:
+                        start_base = np.asarray(pose_fix, dtype=np.float64).reshape(7)
+                    pose_note = f"episode {policy_episode} first frame"
+                else:
+                    start_base = np.asarray(
+                        env.get_observation_from_buffer()["ts_pose_fb_0"][-1],
+                        dtype=np.float64,
+                    ).reshape(7)
+                    pose_note = "current TCP"
             pose_txt = " ".join(f"{float(v):.5f}" for v in np.asarray(start_base).reshape(7))
             print(f"[r4vt] start pose (right_base, {pose_note}): {pose_txt}")
             approached = False
             approach_logged = False
+            rot_cap = MAX_ROT_STEP_DEG if policy_episode is not None else None
+            if policy_episode is not None:
+                apply_policy_wrist_winding(
+                    env,
+                    start_base,
+                    python=str(control_para["keyence_python"]),
+                    ip=str(control_para["layup_eval_right_ip"]),
+                )
             if mold_runtime is not None and mold_T_fixture_from_base is not None:
                 # The descent is open-loop. Start the episode log first so the
                 # bump, if there is one, is in robot_data.
@@ -1979,8 +2301,30 @@ def main():
                     pipeline_para["hardware_config_path"],
                     table_normal=mold_runtime._table_normal,
                     table_offset=mold_runtime._table_offset,
+                    max_rot_step_deg=rot_cap,
+                    stop_at_contact=policy_episode is not None,
                 )
-            if approached:
+            if policy_episode is not None:
+                if not approached:
+                    raise RuntimeError("[policy-start] Approach did not run. Aborting.")
+                _wait_policy_descent(
+                    env,
+                    start_base,
+                    mold_runtime.field,
+                    mold_T_fixture_from_base,
+                    max_rot_step_deg=MAX_ROT_STEP_DEG,
+                )
+                confirm_policy_start_reached(
+                    env,
+                    start_base,
+                    python=str(control_para["keyence_python"]),
+                    ip=str(control_para["layup_eval_right_ip"]),
+                    field=mold_runtime.field,
+                    T_fixture_from_base=mold_T_fixture_from_base,
+                )
+                policy_hold = True
+                input("At the start pose. Press Enter to begin.")
+            elif approached:
                 input("At the start pose. Press Enter to begin.")
             else:
                 print("[r4vt] Jog the right arm to that pose, then press Enter.")
@@ -2103,6 +2447,7 @@ def main():
                     log.attrs["enable_delta_n_floor"] = bool(
                         mold_runtime.limits.enable_delta_n_floor
                     )
+                    log.attrs["bench_dn_floor_mm"] = float(bench_dn_floor_m * 1e3)
                     log.attrs["abort_on_measured_mesh_distance"] = bool(
                         mold_runtime.limits.abort_on_measured_mesh_distance
                     )
@@ -2112,6 +2457,9 @@ def main():
                     log.attrs["wrench_hold_n"] = float(control_para["wrench_hold_n"])
                     log.attrs["bench_lift_m"] = float(bench_lift_m)
             log.attrs["log_policy_vision"] = bool(control_para["log_policy_vision"])
+            log.attrs["stiffness_floor_enabled"] = stiffness_floor is not None
+            if stiffness_floor is not None:
+                log.attrs["stiffness_floor_n_per_m"] = float(stiffness_floor)
             if gt_replay is not None:
                 log.attrs["mode"] = "gt_replay"
                 log.attrs["gt_replay_episode"] = int(gt_replay.episode)
@@ -2134,6 +2482,12 @@ def main():
         episode_initial_time_s = env.current_hardware_time_s
         last_scan_time_s = -float("inf")
         killer = GracefulKiller()
+        if policy_hold:
+            print(
+                f"[policy-start] Holding still for {POLICY_LOOKBACK_S:.0f} s "
+                "so the lookback is this pose."
+            )
+            time.sleep(POLICY_LOOKBACK_S)
         while not killer.kill_now:
             horizon_initial_time_s = env.current_hardware_time_s
             printOrNot(vbs_h1, "Starting new horizon at ", horizon_initial_time_s)
@@ -2680,6 +3034,7 @@ def main():
 
             if action_stiffnesses is not None:
                 print("action_stiffness: ", action_stiffnesses[0])
+            stiffness_trace = {}
             # print("action_target_z: ", action_sparse_target_mats[0][:, 2, 3])
             # print("action_virtual_target_z: ", action_sparse_vt_mats[0][:, 2, 3])
             print(
@@ -2699,6 +3054,8 @@ def main():
                 )
 
                 ts_stiffnesses = np.zeros([6, 6 * ts_targets_virtual.shape[0]])
+                raw_steps = []
+                floored_steps = []
                 for i in range(ts_targets_virtual.shape[0]):
                     SE3_target = action_sparse_target_mats[id][i].reshape([4, 4])
                     SE3_virtual_target = action_sparse_vt_mats[id][i].reshape([4, 4])
@@ -2728,9 +3085,13 @@ def main():
                     stiffness_matrix_full = np.eye(6) * default_stiffness_rot
 
                     if action_stiffnesses is None:
-                        target_stiffness = default_stiffness
+                        raw_k = default_stiffness
                     else:
-                        target_stiffness = action_stiffnesses[id][i]
+                        raw_k = action_stiffnesses[id][i]
+                    _, floored_k = apply_press_stiffness_floor(raw_k, stiffness_floor)
+                    target_stiffness = float(floored_k[0])
+                    raw_steps.append(float(np.asarray(raw_k, dtype=np.float64)))
+                    floored_steps.append(target_stiffness)
 
                     M = np.diag(
                         [target_stiffness, default_stiffness, default_stiffness]
@@ -2755,6 +3116,10 @@ def main():
                 else:
                     outputs_ts_targets[id] = ts_targets_virtual
                 outputs_ts_stiffnesses[id] = ts_stiffnesses
+                stiffness_trace[id] = (
+                    np.asarray(raw_steps, dtype=np.float64),
+                    np.asarray(floored_steps, dtype=np.float64),
+                )
 
             # the "now" when the observation is taken
             action_start_time_s = obs_raw["robot_time_stamps_0"][-1]
@@ -2890,6 +3255,14 @@ def main():
                     if outputs_eoat is not None:
                         outputs_eoat[id] = outputs_eoat[id][:exec_h, :]
             timestamps = timestamps[:exec_h]
+            for id in id_list:
+                raw_k, floored_k = stiffness_trace[id]
+                stiffness_trace[id] = (raw_k[:exec_h], floored_k[:exec_h])
+                print(
+                    "[stiffness] "
+                    f"raw {np.array2string(stiffness_trace[id][0], precision=0, floatmode='fixed')} "
+                    f"floored {np.array2string(stiffness_trace[id][1], precision=0, floatmode='fixed')}"
+                )
 
             if control_para["enable_control_log"] and log is not None:
                 log_horizon(
@@ -2909,6 +3282,7 @@ def main():
                     shape_meta=shape_meta,
                     log_policy_vision=control_para["log_policy_vision"],
                     scan_encoder_stats=scan_encoder_stats,
+                    stiffness_trace=stiffness_trace,
                 )
                 if gt_replay is not None:
                     exe = min(exec_h, outputs_ts_targets[0].shape[0])
@@ -3058,6 +3432,10 @@ def main():
             "horizons": horizon_banner,
             "control_log": finished_episode_log_path,
             "camera_hz_expected": CAMERA_HZ,
+            "stiffness_floor_enabled": stiffness_floor is not None,
+            "stiffness_floor_n_per_m": (
+                None if stiffness_floor is None else float(stiffness_floor)
+            ),
         }
         if gt_replay is not None:
             journal["mode"] = "gt_replay"
@@ -3084,6 +3462,7 @@ def main():
                 journal["enable_delta_n_floor"] = bool(
                     mold_runtime.limits.enable_delta_n_floor
                 )
+                journal["bench_dn_floor_mm"] = float(bench_dn_floor_m * 1e3)
                 journal["abort_on_measured_mesh_distance"] = bool(
                     mold_runtime.limits.abort_on_measured_mesh_distance
                 )

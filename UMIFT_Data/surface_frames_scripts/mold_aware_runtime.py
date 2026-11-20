@@ -158,11 +158,28 @@ def fixb_decode_dt(
     return np.full(int(n_steps), step_s, dtype=np.float64)
 
 
+def read_bench_dn_floor_m(environ=None) -> float:
+    """Signed δn floor in meters. ``UMIFT_BENCH_DN_FLOOR_MM`` defaults to −5.
+
+    Negative is into the mold. The bench flag decides whether the floor is applied.
+    """
+    source = os.environ if environ is None else environ
+    text = str(source.get("UMIFT_BENCH_DN_FLOOR_MM", "")).strip()
+    mm = -5.0 if text == "" else float(text)
+    if not np.isfinite(mm) or mm > 0.0:
+        shown = text or "-5"
+        raise ValueError(
+            f"UMIFT_BENCH_DN_FLOOR_MM={shown} must be a finite floor <= 0"
+        )
+    return float(mm) / 1000.0
+
+
 def r4_safety_limits(
     max_tcp_penetration_m: float = 0.020,
     wrench_hold_n: float = 90.0,
     abort_on_measured_mesh_distance: bool = False,
     enable_delta_n_floor: bool = False,
+    max_press_depth_m: float = 0.005,
 ) -> SafetyLimits:
     """r4vt limits. The δn floor stays off unless a bench replay asks for it.
 
@@ -170,8 +187,10 @@ def r4_safety_limits(
 
     Abort on measured TCP depth. Hold, then abort, on force. The measured-mesh
     flag skips the commanded-depth abort and checks the TCP instead.
+    ``max_press_depth_m`` is how far the bench floor may press, default 5 mm.
     """
     return SafetyLimits(
+        max_press_depth_m=float(max_press_depth_m),
         enable_delta_n_floor=bool(enable_delta_n_floor),
         enable_tcp_penetration_abort=True,
         max_tcp_penetration_m=float(max_tcp_penetration_m),

@@ -10,6 +10,8 @@ usage() {
   echo "  r1rel  UMIFT_CKPT_PATH=/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt"
   echo "  --replay-episode N   play that episode's labels through the runner (no policy call)"
   echo "  --bench              first free-space replay: clamp delta_n at -5 mm"
+  echo "  UMIFT_STIFFNESS_FLOOR=3000   press-axis floor at schedule time (off if unset)"
+  echo "  UMIFT_BENCH_DN_FLOOR_MM=-5   bench δn floor in mm (default -5, needs --bench)"
   echo "  --bench-lift M       shift foot, virtual target, and start pose M metres"
   echo "                       along fixture up (−Y, away from the table)"
   echo "  r4vt replay reads r4vt_causal_foot (10-d) unless UMIFT_R4VT_ZARR is set."
@@ -20,7 +22,12 @@ usage() {
   echo "  r4vt, before the episode: moveL at <= 5 cm/s to 5 cm back along the tool axis,"
   echo "    Enter, then straight down that axis. The episode log includes the move."
   echo "    Replay uses the recorded pose."
-  echo "    Policy uses the current TCP. A failed check falls back to jogging."
+  echo "    Policy uses the current TCP, unless UMIFT_POLICY_START_EPISODE=N."
+  echo "    That approaches episode N's first TCP pose, full orientation, and"
+  echo "    holds 8 s before the first query. If that TCP is inside the mold,"
+  echo "    the descent stops at the surface and the normal gap is allowed."
+  echo "    Ignored for a GT replay."
+  echo "    A failed check falls back to jogging, except the policy start, which aborts."
 }
 
 die() {
