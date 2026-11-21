@@ -72,6 +72,32 @@ def test_r1rel_uses_the_october_r1_zarr():
     assert _LOCAL_DATASET_BY_TASK["OCT-V35-FIXB-R1REL-H4S"] == r1
 
 
+def test_hyak_dataset_name_finds_the_local_zarr(tmp_path, monkeypatch):
+    import PyriteEnvSuites.env_runners.dataset_start_pose as start_pose
+
+    root = tmp_path / "mold"
+    causal = root / "set" / "r4vt_frame_continuity_causal" / "acp_replay_buffer.zarr"
+    smooth = root / "set" / "r4vt_smooth_frame" / "acp_replay_buffer.zarr"
+    causal.mkdir(parents=True)
+    smooth.mkdir(parents=True)
+    monkeypatch.setattr(start_pose, "_LOCAL_MOLD_ROOT", root)
+    assert (
+        resolve_dataset_zarr(
+            "/data/r4vt_frame_continuity_causal/acp_replay_buffer.zarr",
+            "OCT-V35-FIXB-R4VT-H4S",
+        )
+        == causal
+    )
+    assert (
+        resolve_dataset_zarr(
+            "/data/r4vt_smooth_frame/acp_replay_buffer.zarr",
+            "OCT-V35-FIXB-R4VT-H4S",
+        )
+        == smooth
+    )
+    assert resolve_dataset_zarr(str(causal), "OCT-V35-FIXB-R4VT-H4S") == causal
+
+
 def test_missing_cfg_path_uses_task_name(tmp_path, monkeypatch):
     import PyriteEnvSuites.env_runners.dataset_start_pose as start_pose
 

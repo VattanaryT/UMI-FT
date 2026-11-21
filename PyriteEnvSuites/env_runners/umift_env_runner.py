@@ -1171,6 +1171,7 @@ def main():
     # Mold-aware / Fix B: detect run type from checkpoint task name.
     mold_runtime = None
     mold_run_type = "none"
+    bench_lift_m = 0.0
     r4vt = False
     r4_jump_guard = None
     _task_name = ""
@@ -1205,11 +1206,19 @@ def main():
         env_abort = os.environ.get("UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE")
         if env_abort is not None and env_abort.strip() != "":
             abort_measured = env_abort.strip().lower() in ("1", "true", "yes")
+        delta_n_floor = False
+        env_floor = os.environ.get("UMIFT_ENABLE_DELTA_N_FLOOR")
+        if env_floor is not None and env_floor.strip() != "":
+            delta_n_floor = env_floor.strip().lower() in ("1", "true", "yes")
+        env_lift = os.environ.get("UMIFT_BENCH_LIFT_M")
+        if env_lift is not None and env_lift.strip() != "":
+            bench_lift_m = float(env_lift)
         r4_limits = (
             r4_safety_limits(
                 max_tcp_penetration_m=float(control_para["max_tcp_penetration_m"]),
                 wrench_hold_n=float(control_para["wrench_hold_n"]),
                 abort_on_measured_mesh_distance=abort_measured,
+                enable_delta_n_floor=delta_n_floor,
             )
             if r4vt
             else None
@@ -1240,7 +1249,8 @@ def main():
                 f"tcp_penetration_m={mold_runtime.limits.max_tcp_penetration_m} "
                 f"wrench_hold_n={mold_runtime.limits.wrench_hold_n} "
                 f"abort_on_measured_mesh_distance="
-                f"{mold_runtime.limits.abort_on_measured_mesh_distance}"
+                f"{mold_runtime.limits.abort_on_measured_mesh_distance} "
+                f"bench_lift_m={bench_lift_m}"
             )
             print(
                 f"[jump-guard] step limit {MAX_STEP_MM:.2f} mm, {MAX_STEP_DEG:.2f} deg "
@@ -1769,10 +1779,19 @@ def main():
             r4_jump_guard.reset()
         if r4vt:
             if gt_replay is not None and mold_T_fixture_from_base is not None:
-                start_base = gt_replay.start_pose_base(mold_T_fixture_from_base)
+                from mold_aware_runtime import shift_fixture_up
+
+                start_fix = shift_fixture_up(gt_replay.start_pose7, bench_lift_m)
+                start_base = pose7_change_frame(
+                    start_fix, np.linalg.inv(mold_T_fixture_from_base)
+                )
                 pose_note = f"recorded episode {gt_replay.episode}"
+                if bench_lift_m:
+                    pose_note += f", lifted {bench_lift_m * 1e3:.0f} mm fixture up"
             elif gt_replay is not None:
-                start_base = gt_replay.start_pose7
+                from mold_aware_runtime import shift_fixture_up
+
+                start_base = shift_fixture_up(gt_replay.start_pose7, bench_lift_m)
                 pose_note = f"recorded episode {gt_replay.episode}, fixture frame"
             else:
                 start_base = np.asarray(
@@ -1910,11 +1929,17 @@ def main():
                     mold_runtime.limits.max_tangential_speed_mps
                 )
                 if r4vt:
-                    log.attrs["enable_delta_n_floor"] = False
+                    log.attrs["enable_delta_n_floor"] = bool(
+                        mold_runtime.limits.enable_delta_n_floor
+                    )
+                    log.attrs["abort_on_measured_mesh_distance"] = bool(
+                        mold_runtime.limits.abort_on_measured_mesh_distance
+                    )
                     log.attrs["max_tcp_penetration_m"] = float(
                         control_para["max_tcp_penetration_m"]
                     )
                     log.attrs["wrench_hold_n"] = float(control_para["wrench_hold_n"])
+                    log.attrs["bench_lift_m"] = float(bench_lift_m)
             log.attrs["log_policy_vision"] = bool(control_para["log_policy_vision"])
             if gt_replay is not None:
                 log.attrs["mode"] = "gt_replay"
@@ -2218,6 +2243,16 @@ def main():
                         dtype=np.float64,
                     )
                 decoded = mold_runtime.decode_chunk(raw_a, p0[0], R0[0], dt)
+                R_d_fixture = np.asarray(decoded["R_d"], dtype=np.float64).copy()
+                # Fixture +Y is down. Lift the commanded foot and the virtual
+                # target along −Y so a free-space bench stays off the table.
+                # The surface normal is −Y on the flange and −Z on the wall, so
+                # lifting along n would slide the wall section sideways.
+                if bench_lift_m:
+                    from mold_aware_runtime import shift_fixture_up
+
+                    decoded["x_s"] = shift_fixture_up(decoded["x_s"], bench_lift_m)
+                    decoded["x_d"] = shift_fixture_up(decoded["x_d"], bench_lift_m)
                 # Robot schedule_controls expects right_base SE3.
                 R_base, p_base = se3_batch_fixture_to_base(
                     decoded["R_d"], decoded["x_d"], mold_T_fixture_from_base
@@ -2247,6 +2282,12 @@ def main():
                     cr = decoded.get("clamp_rot_rate")
                     if cr is not None and bool(cr[i]):
                         flags.append("rot_rate")
+                    slew = decoded.get("rd_slew")
+                    if slew is not None and bool(slew[i]):
+                        flags.append("rd_slew")
+                    face = decoded.get("face_hold")
+                    if face is not None and bool(face[i]):
+                        flags.append("face_hold")
                     mj = decoded.get("mesh_jump_hold")
                     if mj is not None and bool(mj[i]):
                         flags.append("mesh_jump_hold")
@@ -2314,6 +2355,8 @@ def main():
                         "clamp_dn",
                         "clamp_tilt",
                         "clamp_rot_rate",
+                        "rd_slew",
+                        "face_hold",
                         "mesh_jump_hold",
                     ):
                         arr = decoded.get(key)
@@ -2322,6 +2365,7 @@ def main():
                     decoded["x_d"] = x_g
                     decoded["R_d"] = R_g
                     decoded["R_field"] = field_g
+                    mold_runtime.note_commanded_rd(R_d_fixture[n_keep - 1])
                     exe_h_preview = n_keep
                     r4_keep_len = n_keep
                     if aborted:
@@ -2831,11 +2875,17 @@ def main():
                 mold_runtime.limits.enable_mesh_jump_hold
             )
             if r4vt:
-                journal["enable_delta_n_floor"] = False
+                journal["enable_delta_n_floor"] = bool(
+                    mold_runtime.limits.enable_delta_n_floor
+                )
+                journal["abort_on_measured_mesh_distance"] = bool(
+                    mold_runtime.limits.abort_on_measured_mesh_distance
+                )
                 journal["max_tcp_penetration_m"] = float(
                     control_para["max_tcp_penetration_m"]
                 )
                 journal["wrench_hold_n"] = float(control_para["wrench_hold_n"])
+                journal["bench_lift_m"] = float(bench_lift_m)
         if cam_info is not None:
             journal["wrist_rate"] = cam_info.get("wrist_rate")
             journal["center_rate"] = cam_info.get("center_rate")

@@ -1,6 +1,6 @@
 """Live mold-aware obs + Fix B decode for umift_env_runner.
 
-Reuses FixBMoldField / integrate_fixb / heading_branch / tracked_project from the
+Reuses FixBMoldField / heading_branch / tracked_project from the
 training/eval scripts. Training stringer assets default to
 ``stringer_scanner_v2_fixb/shared/fixb_field.npz``.
 """
@@ -15,9 +15,8 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from fixb_field import FixBMoldField, integrate_fixb
-from fixb_labels import heading_branch, pose7_to_Rp, so3_to_rot6d_rows
-from fixb_labels_tracked import HOP_EXCESS_M, tracked_project
+from fixb_field import FixBMoldField
+from fixb_labels import QUERY_SMOOTH_S, heading_branch, pose7_to_Rp, smooth_positions, so3_to_rot6d_rows
 
 DEFAULT_FIELD = Path(
     "/mnt/data/umidata/ft/mold_aware_datasets/stringer_scanner_v2_fixb/shared/fixb_field.npz"
@@ -85,8 +84,9 @@ class SafetyLimits:
     # 0.030 aborted the 2026-10-29 contact runs (commanded δn already ~27 mm).
     # 0.10 lets those chunks run; still stops a large fly-off. Demos peak ~0.32 m.
     max_distance_from_mesh_m: float = 0.10
-    # Off: abort on commanded ||x_d - x_s||. On: skip that check and abort on
-    # the measured TCP's distance to the surface. Penetration abort is separate.
+    # Off: abort when commanded ||x_d - x_s|| exceeds max_distance_from_mesh_m.
+    # On: skip that check and abort when the measured TCP is that far from its foot.
+    # Penetration abort is separate.
     abort_on_measured_mesh_distance: bool = False
     max_foot_hop_m: float = 0.020
     stop_on_normal_flip: bool = True
@@ -97,6 +97,9 @@ class SafetyLimits:
     enable_tilt_clamp: bool = False
     enable_rot_rate_clamp: bool = False
     enable_mesh_jump_hold: bool = False
+    # Cross-chunk cap on commanded R_d. On for the r4 runtime.
+    enable_rd_slew: bool = False
+    max_rd_slew_deg: float = 3.0
 
 
 # Soft clamps (applied / flagged) vs hard stops (abort-worthy).
@@ -107,6 +110,8 @@ SOFT_CLAMP_KEYS = (
     "max_tilt",
     "max_rot_rate",
     "mesh_jump_hold",
+    "rd_slew",
+    "face_hold",
 )
 HARD_STOP_KEYS = (
     "normal_flip",
@@ -128,16 +133,172 @@ def r4_safety_limits(
     max_tcp_penetration_m: float = 0.020,
     wrench_hold_n: float = 90.0,
     abort_on_measured_mesh_distance: bool = False,
+    enable_delta_n_floor: bool = False,
 ) -> SafetyLimits:
-    """r4vt: no δn floor. Abort on measured TCP depth. Hold, then abort, on force."""
+    """r4vt limits. The δn floor stays off unless a bench replay asks for it.
+
+    Commanded orientation slews at 3° per step, including across replans.
+
+    Abort on measured TCP depth. Hold, then abort, on force. The measured-mesh
+    flag skips the commanded-depth abort and checks the TCP instead.
+    """
     return SafetyLimits(
-        enable_delta_n_floor=False,
+        enable_delta_n_floor=bool(enable_delta_n_floor),
         enable_tcp_penetration_abort=True,
         max_tcp_penetration_m=float(max_tcp_penetration_m),
         enable_wrench_hold=True,
         wrench_hold_n=float(wrench_hold_n),
         abort_on_measured_mesh_distance=bool(abort_on_measured_mesh_distance),
+        enable_rd_slew=True,
     )
+
+
+# One replan, and one step inside a replan. A larger hop keeps the previous foot.
+FOOT_CAP_M = 0.010
+# A new face whose normal has turned further than this keeps the held frame.
+FACE_HOLD_DEG = 5.0
+# Virtual-target offset grows from the measured TCP to the command over this long.
+VT_RAMP_S = 1.0
+# Fixture +Y is down. Bench replay lifts along −Y, off the table on every face.
+FIXTURE_UP = np.array([0.0, -1.0, 0.0])
+
+
+def shift_fixture_up(points: np.ndarray, lift_m: float) -> np.ndarray:
+    """Move positions by ``lift_m`` along fixture up (−Y). Pose7 uses [:, :3]."""
+    out = np.array(points, dtype=np.float64, copy=True)
+    if float(lift_m) == 0.0:
+        return out
+    out[..., 1] = out[..., 1] - float(lift_m)
+    return out
+
+
+def _hold_if_far(x, R, prev_x, prev_R, cap: float = FOOT_CAP_M):
+    if prev_x is None:
+        return x, R
+    if float(np.linalg.norm(x - np.asarray(prev_x, dtype=np.float64).reshape(3))) > cap:
+        return (
+            np.asarray(prev_x, dtype=np.float64).reshape(3).copy(),
+            np.asarray(prev_R, dtype=np.float64).reshape(3, 3).copy(),
+        )
+    return x, R
+
+
+def _step_toward_cap(x, R, origin, cap: float = FOOT_CAP_M):
+    """Move ``x`` toward ``origin`` until it is within ``cap``. Keep ``R``."""
+    origin = np.asarray(origin, dtype=np.float64).reshape(3)
+    point = np.asarray(x, dtype=np.float64).reshape(3)
+    delta = point - origin
+    dist = float(np.linalg.norm(delta))
+    if dist <= cap or dist < 1e-12:
+        return point, R
+    return origin + delta * (cap / dist), R
+
+
+def _hold_long_steps(pos: np.ndarray, prev, max_step: float):
+    """Copy the last safe position when a step is longer than ``max_step``."""
+    out = np.asarray(pos, dtype=np.float64).reshape(-1, 3).copy()
+    hit = np.zeros(len(out), dtype=bool)
+    origin = None if prev is None else np.asarray(prev, dtype=np.float64).reshape(3).copy()
+    for i in range(len(out)):
+        if origin is not None and float(np.linalg.norm(out[i] - origin)) > max_step:
+            out[i] = origin
+            hit[i] = True
+        else:
+            origin = out[i].copy()
+    return out, hit
+
+
+def _reject_new_face(x, R, prev_x, prev_R, max_deg: float = FACE_HOLD_DEG):
+    """Keep the previous foot and frame when the normal turns more than max_deg."""
+    if prev_R is None or prev_x is None:
+        return x, R, False
+    n_new = np.asarray(R, dtype=np.float64).reshape(3, 3)[:, 2]
+    n_prev = np.asarray(prev_R, dtype=np.float64).reshape(3, 3)[:, 2]
+    cosine = float(np.clip(np.dot(n_new, n_prev), -1.0, 1.0))
+    if float(np.degrees(np.arccos(cosine))) > max_deg:
+        return (
+            np.asarray(prev_x, dtype=np.float64).reshape(3).copy(),
+            np.asarray(prev_R, dtype=np.float64).reshape(3, 3).copy(),
+            True,
+        )
+    return x, R, False
+
+
+def _project_foot(field, p, prev_x, prev_R):
+    """First replan queries the TCP. Later calls hold the previous face."""
+    p = np.asarray(p, dtype=np.float64).reshape(3)
+    if prev_x is None or prev_R is None:
+        cur = field.query(p.reshape(1, 3))
+        return (
+            np.asarray(cur["x_s"], dtype=np.float64).reshape(3).copy(),
+            np.asarray(cur["R"], dtype=np.float64).reshape(3, 3).copy(),
+        )
+    x, R = field.track_step(
+        p.reshape(1, 3),
+        np.asarray(prev_x, dtype=np.float64).reshape(1, 3),
+        np.asarray(prev_x, dtype=np.float64).reshape(1, 3),
+        np.asarray(prev_R, dtype=np.float64).reshape(1, 3, 3),
+    )
+    return (
+        np.asarray(x, dtype=np.float64).reshape(3).copy(),
+        np.asarray(R, dtype=np.float64).reshape(3, 3).copy(),
+    )
+
+
+def integrate_tcp_foot(
+    field,
+    p0: np.ndarray,
+    v_par: np.ndarray,
+    delta_n: np.ndarray,
+    dt: np.ndarray,
+    prev_x: np.ndarray | None = None,
+    prev_R: np.ndarray | None = None,
+    hold_face: bool = False,
+    cap_origin: np.ndarray | None = None,
+) -> Dict[str, np.ndarray]:
+    """Face-held foot of the measured TCP, then tangent steps on that face.
+
+    The first replan queries the TCP. Later replans call ``track_step`` with
+    the measured TCP and the previous foot. A hop over 10 mm, or a normal
+    more than 5° from the held face, keeps the previous foot and frame.
+    ``cap_origin`` is the measured TCP on that first replan, so the first
+    foot also stays within 10 mm of the tool.
+    """
+    v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
+    delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
+    dt = np.asarray(dt, dtype=np.float64).reshape(-1)
+    h = len(delta_n)
+    xs, rk = _project_foot(field, p0, prev_x, prev_R)
+    if prev_x is None and cap_origin is not None:
+        xs, rk = _step_toward_cap(xs, rk, cap_origin, FOOT_CAP_M)
+    else:
+        xs, rk = _hold_if_far(xs, rk, prev_x, prev_R)
+    if hold_face:
+        xs, rk, held0 = _reject_new_face(xs, rk, prev_x, prev_R)
+    else:
+        held0 = False
+    x_s = np.zeros((h, 3))
+    frames = np.zeros((h, 3, 3))
+    face_held = np.zeros(h, dtype=bool)
+    face_held[0] = held0
+    for k in range(h):
+        x_s[k] = xs
+        frames[k] = rk
+        if k + 1 < h:
+            step = rk[:, :2] @ v_par[k] * float(dt[k])
+            nxt_x, nxt_R = _project_foot(field, xs + step, xs, rk)
+            nxt_x, nxt_R = _hold_if_far(nxt_x, nxt_R, xs, rk)
+            if hold_face:
+                xs, rk, face_held[k + 1] = _reject_new_face(nxt_x, nxt_R, xs, rk)
+            else:
+                xs, rk = nxt_x, nxt_R
+    normal = frames[:, :, 2]
+    return {
+        "x_s": x_s,
+        "x_d": x_s + delta_n[:, None] * normal,
+        "R": frames,
+        "face_held": face_held,
+    }
 
 
 def mean_rotation(rotations: np.ndarray, weights: np.ndarray) -> np.ndarray:
@@ -255,18 +416,48 @@ def _clamp_tilt_to_normal(R_d: np.ndarray, n: np.ndarray, max_deg: float) -> tup
 
 def _clamp_rot_rate(R_d: np.ndarray, max_deg: float) -> tuple:
     """Cap geodesic step between consecutive R_d. Returns (R_out, clamp_mask)."""
+    return _slew_orientations(R_d, None, max_deg)
+
+
+def _slew_orientations(
+    R_d: np.ndarray,
+    prev: np.ndarray | None,
+    max_deg: float,
+    freeze: np.ndarray | None = None,
+) -> tuple:
+    """Walk R_d toward each target, at most max_deg from the previous command.
+
+    ``prev`` is the last commanded orientation of the previous chunk. The first
+    step of this chunk slews from it, so a seam is capped the same way as a step.
+    A frozen step keeps that previous orientation instead of walking toward
+    the new face.
+    """
     R = np.asarray(R_d, dtype=np.float64).reshape(-1, 3, 3).copy()
     hit = np.zeros(len(R), dtype=bool)
-    if len(R) < 2 or max_deg <= 0:
+    if len(R) == 0:
         return R, hit
-    for i in range(1, len(R)):
-        rel = R[i - 1].T @ R[i]
-        rv = Rotation.from_matrix(rel).as_rotvec()
-        ang = float(np.degrees(np.linalg.norm(rv)))
-        if ang > max_deg and ang > 1e-9:
-            hit[i] = True
-            R[i] = R[i - 1] @ Rotation.from_rotvec(rv * (max_deg / ang)).as_matrix()
+    origin = None if prev is None else np.asarray(prev, dtype=np.float64).reshape(3, 3)
+    held = np.zeros(len(R), dtype=bool) if freeze is None else np.asarray(freeze, dtype=bool)
+    for i in range(len(R)):
+        if held[i] and origin is not None:
+            R[i] = origin
+            continue
+        if origin is None or max_deg <= 0:
+            origin = R[i]
+            continue
+        R[i], hit[i] = _slew_one(origin, R[i], max_deg)
+        origin = R[i]
     return R, hit
+
+
+def _slew_one(origin: np.ndarray, target: np.ndarray, max_deg: float) -> tuple:
+    rel = origin.T @ target
+    rv = Rotation.from_matrix(rel).as_rotvec()
+    ang = float(np.degrees(np.linalg.norm(rv)))
+    if ang > max_deg and ang > 1e-9:
+        stepped = origin @ Rotation.from_rotvec(rv * (max_deg / ang)).as_matrix()
+        return stepped, True
+    return target, False
 
 
 @dataclass
@@ -278,7 +469,26 @@ class MoldAwareRuntime:
     dry_run: bool = True
     _prev_foot: Optional[np.ndarray] = None
     _prev_n: Optional[np.ndarray] = None
+    _prev_R: Optional[np.ndarray] = None
+    _prev_R_out: Optional[np.ndarray] = None
+    _prev_p: Optional[np.ndarray] = None
+    _prev_R_tool: Optional[np.ndarray] = None
+    _cache_t: Optional[np.ndarray] = None
+    _cache_x: Optional[np.ndarray] = None
+    _cache_R: Optional[np.ndarray] = None
+    _cache_sd: Optional[np.ndarray] = None
+    _cache_curv: Optional[np.ndarray] = None
+    _cache_reason: Optional[np.ndarray] = None
+    _raw_t: Optional[np.ndarray] = None
+    _raw_p: Optional[np.ndarray] = None
+    _raw_s: Optional[np.ndarray] = None
     _wrench_over: bool = False
+    # Last commanded foot. The next replan holds this face and this point.
+    _cmd_foot: Optional[np.ndarray] = None
+    _cmd_R: Optional[np.ndarray] = None
+    _cmd_Rd: Optional[np.ndarray] = None
+    _cmd_vt: Optional[np.ndarray] = None
+    _vt_elapsed_s: float = 0.0
     last_triggers: list = field(default_factory=list)
     # Per-step bool masks from the latest decode_chunk (length H).
     last_clamp_speed: Optional[np.ndarray] = None
@@ -310,13 +520,41 @@ class MoldAwareRuntime:
     def reset(self) -> None:
         self._prev_foot = None
         self._prev_n = None
+        self._prev_R = None
+        self._prev_R_out = None
+        self._prev_p = None
+        self._prev_R_tool = None
+        self._cache_t = None
+        self._cache_x = None
+        self._cache_R = None
+        self._cache_sd = None
+        self._cache_curv = None
+        self._cache_reason = None
+        self._raw_t = None
+        self._raw_p = None
+        self._raw_s = None
         self._wrench_over = False
+        self._cmd_foot = None
+        self._cmd_R = None
+        self._cmd_Rd = None
+        self._cmd_vt = None
+        self._vt_elapsed_s = 0.0
         self.last_triggers = []
+
+    def release_command_foot(self) -> None:
+        """Next decode queries the TCP. Offline windows do this; the live runner does not."""
+        self._cmd_foot = None
+        self._cmd_R = None
+        self._cmd_Rd = None
+        self._cmd_vt = None
+        self._vt_elapsed_s = 0.0
         self.last_clamp_speed = None
         self.last_clamp_step = None
         self.last_clamp_dn = None
         self.last_clamp_tilt = None
         self.last_clamp_rot_rate = None
+        self.last_rd_slew = None
+        self.last_face_hold = None
         self.last_mesh_jump_hold = None
 
     @property
@@ -334,26 +572,42 @@ class MoldAwareRuntime:
         R_fb, p_fb = pose7_to_Rp(pose7)
         if len(p_fb) == 0:
             return {}
+        p_meas = np.asarray(p_fb, dtype=np.float64).copy()
 
-        # Online tracked foot: batch project with hop repair, seeded by previous foot.
-        x = tracked_project(self.field, p_fb)
-        if self._prev_foot is not None and len(x) > 0:
-            hop = np.linalg.norm(x[0] - self._prev_foot)
-            if hop > HOP_EXCESS_M:
-                x[0] = self.field.project((self._prev_foot + (p_fb[0] - self._prev_foot))[None])[0]
-                for i in range(1, len(x)):
-                    step = p_fb[i] - p_fb[i - 1]
-                    cand = self.field.project((x[i - 1] + step)[None])[0]
-                    if np.linalg.norm(x[i] - x[i - 1]) - np.linalg.norm(step) > HOP_EXCESS_M:
-                        x[i] = cand
-        self._prev_foot = x[-1].copy()
-
-        q = self.field.query(x, with_curvature=True)
-        # sd of the *tool* vs foot (same as training labels)
-        n = q["R"][..., 2]
-        sd = np.sum((p_fb - x) * n, axis=1)
+        # Same tracker as the labels: 0.1 s causal position smooth, 5 mm gate,
+        # tool-rotation switch, 25° slew. The decision face stays unslewed.
+        # The published frame is the slew. With robot timestamps, each sample
+        # is smoothed and tracked once from episode reset.
+        times = obs_raw.get(f"robot_time_stamps_{robot_id}")
+        times = None if times is None else np.asarray(times, dtype=np.float64).reshape(-1)
+        if times is not None and len(times) == len(p_fb):
+            p_fb = self._smooth_query(times, p_fb)
+            self._track_new_samples(times, p_fb, R_fb)
+            idx = self._cache_index(times)
+            x = self._cache_x[idx]
+            R = self._cache_R[idx]
+            sd = self._cache_sd[idx]
+            curv = self._cache_curv[idx]
+            reason = self._cache_reason[idx]
+        else:
+            q = self.field.query(
+                p_fb,
+                with_curvature=True,
+                R_tool=R_fb,
+                prev_x=self._prev_foot,
+                prev_R=self._prev_R,
+                prev_R_tool=self._prev_R_tool,
+                prev_p=self._prev_p,
+                prev_R_out=self._prev_R_out,
+            )
+            self._remember_tail(p_fb, R_fb, q)
+            x = np.asarray(q["x_s"], dtype=np.float64)
+            R = np.asarray(q["R"], dtype=np.float64)
+            sd = np.asarray(q["sd"], dtype=np.float64).reshape(-1)
+            curv = np.asarray(q["curv"], dtype=np.float64)
+        n = R[..., 2]
         self.note_tcp_penetration(sd)
-        self.note_measured_mesh_distance(p_fb, x)
+        self.note_measured_mesh_distance(p_meas, x)
         if self._prev_n is not None and self.limits.stop_on_normal_flip:
             if float(np.dot(self._prev_n, n[-1])) < 0:
                 self.last_triggers.append("normal_flip")
@@ -361,21 +615,121 @@ class MoldAwareRuntime:
 
         signed = sd.reshape(-1, 1).astype(np.float32)
         normal = n.astype(np.float32)
-        rot6d = so3_to_rot6d_rows(q["R"]).astype(np.float32)
-        curv = q["curv"].astype(np.float32)
+        rot6d = so3_to_rot6d_rows(R).astype(np.float32)
+        curv = np.asarray(curv, dtype=np.float32)
 
         obs_raw[f"mold_signed_distance_{robot_id}"] = signed
         obs_raw[f"mold_normal_{robot_id}"] = normal
         obs_raw[f"mold_R_field_rot6d_{robot_id}"] = rot6d
         obs_raw[f"mold_curvature_{robot_id}"] = curv
         obs_raw[f"mold_x_s_{robot_id}"] = x.astype(np.float32)
-        return {
+        out = {
             "sd": sd,
             "normal": n,
             "x_s": x,
-            "R": q["R"],
-            "curv": q["curv"],
+            "R": R,
+            "curv": curv,
         }
+        if times is not None and len(times) == len(pose7):
+            out["reason"] = reason
+        return out
+
+    def _remember_tail(self, p, R_tool, q) -> None:
+        """Face state for the next decision, and the published frame for the next slew."""
+        face = q["R_face"] if "R_face" in q else np.asarray(q["R"])[-1]
+        self._prev_foot = np.asarray(q["x_s"][-1], dtype=np.float64).copy()
+        self._prev_R = np.asarray(face, dtype=np.float64).reshape(3, 3).copy()
+        self._prev_R_out = np.asarray(q["R"][-1], dtype=np.float64).reshape(3, 3).copy()
+        self._prev_p = np.asarray(p[-1], dtype=np.float64).reshape(3).copy()
+        self._prev_R_tool = np.asarray(R_tool[-1], dtype=np.float64).reshape(3, 3).copy()
+
+    def _append_cache(self, times, q) -> None:
+        x = np.asarray(q["x_s"], dtype=np.float64)
+        R = np.asarray(q["R"], dtype=np.float64)
+        sd = np.asarray(q["sd"], dtype=np.float64).reshape(-1)
+        curv = np.asarray(q["curv"], dtype=np.float64)
+        reason = np.asarray(q.get("reason", np.zeros(len(sd))), dtype=np.int8).reshape(-1)
+        times = np.asarray(times, dtype=np.float64).reshape(-1)
+        if self._cache_t is None:
+            self._cache_t = times.copy()
+            self._cache_x = x.copy()
+            self._cache_R = R.copy()
+            self._cache_sd = sd.copy()
+            self._cache_curv = curv.copy()
+            self._cache_reason = reason.copy()
+            return
+        self._cache_t = np.concatenate([self._cache_t, times])
+        self._cache_x = np.concatenate([self._cache_x, x])
+        self._cache_R = np.concatenate([self._cache_R, R])
+        self._cache_sd = np.concatenate([self._cache_sd, sd])
+        self._cache_curv = np.concatenate([self._cache_curv, curv])
+        self._cache_reason = np.concatenate([self._cache_reason, reason])
+
+    def _smooth_query(self, times: np.ndarray, p: np.ndarray) -> np.ndarray:
+        """Same 0.1 s trailing smooth as the labels. Past samples only, kept across calls."""
+        times = np.asarray(times, dtype=np.float64).reshape(-1)
+        p = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+        if self._raw_t is None:
+            self._raw_t = times.copy()
+            self._raw_p = p.copy()
+            self._raw_s = smooth_positions(self._raw_t, self._raw_p, QUERY_SMOOTH_S)
+        else:
+            new = times > float(self._raw_t[-1]) + 1e-9
+            if np.any(new):
+                if not bool(np.all(new[int(np.flatnonzero(new)[0]) :])):
+                    raise RuntimeError("mold tracker expects new robot timestamps as a suffix")
+                start = len(self._raw_t)
+                self._raw_t = np.concatenate([self._raw_t, times[new]])
+                self._raw_p = np.concatenate([self._raw_p, p[new]])
+                extra = smooth_positions(self._raw_t, self._raw_p, QUERY_SMOOTH_S, start=start)
+                self._raw_s = np.concatenate([self._raw_s, extra])
+        idx = self._match_times(self._raw_t, times)
+        return self._raw_s[idx]
+
+    @staticmethod
+    def _match_times(have: np.ndarray, want: np.ndarray) -> np.ndarray:
+        pos = np.searchsorted(have, want)
+        pos = np.clip(pos, 0, len(have) - 1)
+        prev = np.clip(pos - 1, 0, len(have) - 1)
+        use_prev = np.abs(have[prev] - want) < np.abs(have[pos] - want)
+        idx = np.where(use_prev, prev, pos)
+        if float(np.max(np.abs(have[idx] - want))) > 1e-6:
+            raise RuntimeError("mold tracker is missing a robot timestamp")
+        return idx
+
+    def _track_new_samples(self, times, p, R_tool) -> None:
+        if self._cache_t is None:
+            q = self.field.query(p, with_curvature=True, R_tool=R_tool)
+            self._append_cache(times, q)
+            self._remember_tail(p, R_tool, q)
+            return
+        new = np.asarray(times) > float(self._cache_t[-1]) + 1e-9
+        if not np.any(new):
+            return
+        if not bool(np.all(new[int(np.flatnonzero(new)[0]) :])):
+            raise RuntimeError("mold tracker expects new robot timestamps as a suffix")
+        q = self.field.query(
+            p[new],
+            with_curvature=True,
+            R_tool=R_tool[new],
+            prev_x=self._prev_foot,
+            prev_R=self._prev_R,
+            prev_R_tool=self._prev_R_tool,
+            prev_p=self._prev_p,
+            prev_R_out=self._prev_R_out,
+        )
+        self._append_cache(times[new], q)
+        self._remember_tail(p[new], R_tool[new], q)
+
+    def _cache_index(self, times) -> np.ndarray:
+        pos = np.searchsorted(self._cache_t, times)
+        pos = np.clip(pos, 0, len(self._cache_t) - 1)
+        prev = np.clip(pos - 1, 0, len(self._cache_t) - 1)
+        use_prev = np.abs(self._cache_t[prev] - times) < np.abs(self._cache_t[pos] - times)
+        idx = np.where(use_prev, prev, pos)
+        if float(np.max(np.abs(self._cache_t[idx] - times))) > 1e-6:
+            raise RuntimeError("mold tracker cache is missing a robot timestamp")
+        return idx
 
     def unpack_fixb_action(
         self,
@@ -436,6 +790,55 @@ class MoldAwareRuntime:
         self.last_triggers.append("wrench_hold")
         return "hold"
 
+    def _limit_commanded_vt(
+        self,
+        x_s: np.ndarray,
+        normal: np.ndarray,
+        delta_n: np.ndarray,
+        dt: np.ndarray,
+        p0: np.ndarray,
+    ):
+        """Ramp the virtual target in, then hold a step longer than 25 mm.
+
+        For the first ``VT_RAMP_S`` seconds the offset is scaled by elapsed time
+        and the VT may move at most that fraction of ``max_step_m`` from the
+        previous command (the measured TCP, on the first call). After the ramp,
+        a longer step keeps the last safe VT.
+        """
+        x_s = np.asarray(x_s, dtype=np.float64)
+        normal = np.asarray(normal, dtype=np.float64)
+        normal = normal / np.clip(np.linalg.norm(normal, axis=-1, keepdims=True), 1e-9, None)
+        delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1).copy()
+        dt = np.asarray(dt, dtype=np.float64).reshape(-1)
+        steps = len(delta_n)
+        x_d = np.zeros((steps, 3), dtype=np.float64)
+        hit = np.zeros(steps, dtype=bool)
+        if self._cmd_vt is None:
+            prev = np.asarray(p0, dtype=np.float64).reshape(3).copy()
+        else:
+            prev = np.asarray(self._cmd_vt, dtype=np.float64).reshape(3).copy()
+        full = float(self.limits.max_step_m)
+        for i in range(steps):
+            self._vt_elapsed_s += float(dt[i])
+            scale = 1.0 if VT_RAMP_S <= 0 else min(1.0, self._vt_elapsed_s / VT_RAMP_S)
+            desired = x_s[i] + float(delta_n[i]) * scale * normal[i]
+            delta = desired - prev
+            dist = float(np.linalg.norm(delta))
+            allow = full * scale
+            if scale >= 1.0 and dist > full:
+                vt = prev.copy()
+                hit[i] = True
+            elif dist > allow and dist > 1e-12:
+                vt = prev + delta * (allow / dist)
+                hit[i] = True
+            else:
+                vt = desired
+            delta_n[i] = float(np.dot(vt - x_s[i], normal[i]))
+            x_d[i] = x_s[i] + delta_n[i] * normal[i]
+            prev = x_d[i].copy()
+        self._cmd_vt = prev.copy()
+        return x_d, delta_n, hit
+
     def decode_chunk(
         self,
         raw_action: np.ndarray,
@@ -456,18 +859,22 @@ class MoldAwareRuntime:
         self.last_clamp_dn = np.zeros(H, dtype=bool)
         self.last_clamp_tilt = np.zeros(H, dtype=bool)
         self.last_clamp_rot_rate = np.zeros(H, dtype=bool)
+        self.last_rd_slew = np.zeros(H, dtype=bool)
+        self.last_face_hold = np.zeros(H, dtype=bool)
         self.last_mesh_jump_hold = np.zeros(H, dtype=bool)
 
         if self.run_type == "r1_world_world":
             pos = raw_action[:, 0:3].astype(np.float64)
             R = rot6d_rows_to_R(raw_action[:, 3:9])
             q = self.field.query(pos)
-            if apply_safety and H > 1:
-                steps = np.linalg.norm(np.diff(pos, axis=0), axis=1)
-                step_hit = steps > self.limits.max_step_m
-                self.last_clamp_step[1:] = step_hit
+            if apply_safety:
+                seed = p0 if self._cmd_vt is None else self._cmd_vt
+                pos, step_hit = _hold_long_steps(pos, seed, self.limits.max_step_m)
+                self.last_clamp_step = step_hit
                 if np.any(step_hit):
                     self.last_triggers.append("max_step")
+                if len(pos):
+                    self._cmd_vt = np.asarray(pos[-1], dtype=np.float64).copy()
             return {
                 "x_d": pos,
                 "R_d": R,
@@ -505,20 +912,31 @@ class MoldAwareRuntime:
         self.last_clamp_speed = clamp_speed
 
         dt = np.asarray(dt, dtype=np.float64).reshape(H)
-        dec = integrate_fixb(
+        # First replan queries the TCP and caps that foot at 10 mm from it.
+        # Later replans hold the previous face.
+        cap_origin = p0 if apply_safety and self._cmd_foot is None else None
+        dec = integrate_tcp_foot(
             self.field,
-            np.asarray(p0, dtype=np.float64).reshape(1, 3),
-            v_par[None],
-            delta_n[None],
-            dt[None],
+            p0,
+            v_par,
+            delta_n,
+            dt,
+            prev_x=self._cmd_foot,
+            prev_R=self._cmd_R,
+            hold_face=apply_safety,
+            cap_origin=cap_origin,
         )
-        R_field = dec["R"][0]
-        x_d = dec["x_d"][0]
-        x_s = dec["x_s"][0]
+        R_field = dec["R"]
+        x_d = dec["x_d"]
+        x_s = dec["x_s"]
+        face_held = np.asarray(dec["face_held"], dtype=bool).reshape(H)
+        self.last_face_hold = face_held
+        if np.any(face_held):
+            self.last_triggers.append("face_hold")
 
         if self.run_type == "r4_world_fixb_tilt":
             # Learned ΔR in action[..., 21:27]; project rot6d → SO(3).
-            # Same mesh R_f as integrate_fixb / r2 labels — no twist re-resolution
+            # Same mesh R_f as the re-projected foot — no twist re-resolution
             # (flipping R_f here without flipping v_par would reverse the slide).
             # Hover keeps the predicted ΔR (only δn is overridden in unpack).
             if raw_action.shape[-1] < 27:
@@ -563,11 +981,32 @@ class MoldAwareRuntime:
             self.last_clamp_rot_rate = rate_hit
             if np.any(rate_hit):
                 self.last_triggers.append("max_rot_rate")
+        if (apply_safety and self.limits.enable_rd_slew) or np.any(face_held):
+            max_deg = (
+                float(self.limits.max_rd_slew_deg)
+                if apply_safety and self.limits.enable_rd_slew
+                else 180.0
+            )
+            # No previous command yet: slew the first step from the measured tool.
+            slew_prev = self._cmd_Rd
+            if (
+                slew_prev is None
+                and apply_safety
+                and self.limits.enable_rd_slew
+            ):
+                slew_prev = np.asarray(R0, dtype=np.float64).reshape(3, 3)
+            R_d, slew_hit = _slew_orientations(
+                R_d, slew_prev, max_deg, freeze=face_held
+            )
+            self.last_rd_slew = slew_hit
+            if np.any(slew_hit):
+                self.last_triggers.append("rd_slew")
 
-        if apply_safety and H > 1:
-            steps = np.linalg.norm(np.diff(x_d, axis=0), axis=1)
-            step_hit = steps > self.limits.max_step_m
-            self.last_clamp_step[1:] = step_hit
+        if apply_safety:
+            x_d, delta_n, step_hit = self._limit_commanded_vt(
+                x_s, R_field[:, :, 2], delta_n, dt, p0
+            )
+            self.last_clamp_step = step_hit
             if np.any(step_hit):
                 self.last_triggers.append("max_step")
         if (
@@ -578,6 +1017,10 @@ class MoldAwareRuntime:
             dist = np.linalg.norm(x_d - x_s, axis=1)
             if np.any(dist > self.limits.max_distance_from_mesh_m):
                 self.last_triggers.append("max_distance_from_mesh")
+
+        self._cmd_foot = np.asarray(x_s[-1], dtype=np.float64).copy()
+        self._cmd_R = np.asarray(R_field[-1], dtype=np.float64).reshape(3, 3).copy()
+        self._cmd_Rd = np.asarray(R_d[-1], dtype=np.float64).reshape(3, 3).copy()
 
         return {
             "x_d": x_d,
@@ -595,15 +1038,28 @@ class MoldAwareRuntime:
             "clamp_dn": self.last_clamp_dn,
             "clamp_tilt": self.last_clamp_tilt,
             "clamp_rot_rate": self.last_clamp_rot_rate,
+            "rd_slew": self.last_rd_slew,
+            "face_hold": self.last_face_hold,
             "mesh_jump_hold": self.last_mesh_jump_hold,
         }
+
+    def note_commanded_rd(self, rotation: np.ndarray) -> None:
+        """Last R_d that was actually scheduled, in the fixture frame."""
+        self._cmd_Rd = np.asarray(rotation, dtype=np.float64).reshape(3, 3).copy()
 
     def decoded_to_action_mats(
         self, decoded: Dict[str, np.ndarray]
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Nominal target = x_d; VT slightly deeper along -n for compliance direction."""
-        x_d, R_d = decoded["x_d"], decoded["R_d"]
-        n = decoded["R_field"][..., 2]
-        target = Rp_to_SE3(R_d, x_d)
-        vt = Rp_to_SE3(R_d, x_d - 0.002 * n)
+        """Reference pose is the foot. Virtual target is foot + delta_n along n.
+
+        The runner already schedules the virtual target and builds stiffness
+        from VT − nominal (label stiffness on that axis, 5000 on the other two),
+        the same way as standard_bc. The wrench command stays zero.
+        """
+        x_s = np.asarray(decoded["x_s"], dtype=np.float64)
+        r_d = decoded["R_d"]
+        n = np.asarray(decoded["R_field"][..., 2], dtype=np.float64)
+        delta_n = np.asarray(decoded["delta_n"], dtype=np.float64).reshape(-1)
+        target = Rp_to_SE3(r_d, x_s)
+        vt = Rp_to_SE3(r_d, x_s + delta_n[:, None] * n)
         return target, vt

@@ -98,9 +98,13 @@ class _FlatField:
         xs[:, 2] = 0.0
         return {"x_s": xs, "R": R}
 
+    def track_step(self, p, p_prev, x_prev, R_prev):
+        hit = self.query(p)
+        return hit["x_s"], hit["R"]
 
-def _deep_press(delta_n=-0.14):
-    action = np.zeros((2, 27))
+
+def _deep_press(delta_n=-0.14, steps=2):
+    action = np.zeros((steps, 27))
     action[:, 2] = delta_n
     action[:, 21:27] = EYE6
     runtime = _runtime(r4_safety_limits())
@@ -113,8 +117,9 @@ def test_measured_mesh_distance_defaults_off_and_keeps_commanded_abort():
     assert limits.abort_on_measured_mesh_distance is False
     assert limits.enable_tcp_penetration_abort is True
     assert limits.max_tcp_penetration_m == 0.020
-    runtime, action = _deep_press()
-    runtime.decode_chunk(action, np.zeros(3), np.eye(3), np.full(2, 1.0 / 15.0))
+    # The VT ramp holds a 2-step press under 100 mm. A 1 s chunk walks past it.
+    runtime, action = _deep_press(steps=15)
+    runtime.decode_chunk(action, np.zeros(3), np.eye(3), np.full(15, 1.0 / 15.0))
     assert "max_distance_from_mesh" in runtime.last_hard_triggers
     runtime.last_triggers = []
     runtime.note_measured_mesh_distance(
@@ -124,7 +129,7 @@ def test_measured_mesh_distance_defaults_off_and_keeps_commanded_abort():
     runtime.note_tcp_penetration(np.array([-0.021]))
     assert runtime.last_hard_triggers == ["tcp_penetration"]
     src = (SCRIPTS / "mold_aware_runtime.py").read_text()
-    assert "self.note_measured_mesh_distance(p_fb, x)" in src
+    assert "self.note_measured_mesh_distance(p_meas, x)" in src
     text = RUNNER.read_text()
     assert '"abort_on_measured_mesh_distance": False' in text
     assert "UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE" in text
@@ -133,10 +138,10 @@ def test_measured_mesh_distance_defaults_off_and_keeps_commanded_abort():
 def test_measured_mesh_distance_flag_checks_tcp_not_command():
     runtime = _runtime(r4_safety_limits(abort_on_measured_mesh_distance=True))
     runtime.field = _FlatField()
-    action = np.zeros((2, 27))
+    action = np.zeros((15, 27))
     action[:, 2] = -0.14
     action[:, 21:27] = EYE6
-    runtime.decode_chunk(action, np.zeros(3), np.eye(3), np.full(2, 1.0 / 15.0))
+    runtime.decode_chunk(action, np.zeros(3), np.eye(3), np.full(15, 1.0 / 15.0))
     assert "max_distance_from_mesh" not in runtime.last_hard_triggers
     assert runtime.limits.enable_tcp_penetration_abort is True
     runtime.last_triggers = []
