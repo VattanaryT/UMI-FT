@@ -72,7 +72,6 @@ from PyriteEnvSuites.env_runners.rollout_experiment_log import (
     format_horizon_banner,
 )
 from PyriteEnvSuites.env_runners.stiffness_floor import (
-    apply_press_stiffness_floor,
     read_press_stiffness_floor,
     write_stiffness_trace,
 )
@@ -3073,82 +3072,27 @@ def main():
             )
             outputs_eoat = action_eoat
             # decode stiffness matrix
+            from mold_aware_runtime import compliance_command
+
             for id in id_list:
-                SE3_TW = su.SE3_inv(su.pose7_to_SE3(obs_raw[f"ts_pose_fb_{id}"][-1]))
-                ts_targets_nominal = su.SE3_to_pose7(
-                    action_sparse_target_mats[id].reshape([-1, 4, 4])
+                (
+                    outputs_ts_nominal_targets[id],
+                    outputs_ts_targets[id],
+                    outputs_ts_stiffnesses[id],
+                    raw_k,
+                    floored_k,
+                ) = compliance_command(
+                    action_sparse_target_mats[id],
+                    action_sparse_vt_mats[id],
+                    None if action_stiffnesses is None else action_stiffnesses[id],
+                    obs_raw[f"ts_pose_fb_{id}"][-1],
+                    stiffness_floor=stiffness_floor,
+                    test_nominal_target=control_para["test_nominal_target"],
+                    test_nominal_target_stiffness=control_para[
+                        "test_nominal_target_stiffness"
+                    ],
                 )
-                ts_targets_virtual = su.SE3_to_pose7(
-                    action_sparse_vt_mats[id].reshape([-1, 4, 4])
-                )
-
-                ts_stiffnesses = np.zeros([6, 6 * ts_targets_virtual.shape[0]])
-                raw_steps = []
-                floored_steps = []
-                for i in range(ts_targets_virtual.shape[0]):
-                    SE3_target = action_sparse_target_mats[id][i].reshape([4, 4])
-                    SE3_virtual_target = action_sparse_vt_mats[id][i].reshape([4, 4])
-
-                    # stiffness: 1. convert vt to tool frame
-                    SE3_TVt = SE3_TW @ SE3_virtual_target
-                    SE3_Ttarget = SE3_TW @ SE3_target
-
-                    # stiffness: 2. compute stiffness matrix in the tool frame
-                    compliance_direction_tool = (
-                        SE3_TVt[:3, 3] - SE3_Ttarget[:3, 3]
-                    ).reshape(3)
-
-                    if np.linalg.norm(compliance_direction_tool) < 0.001:  #
-                        compliance_direction_tool = np.array([1.0, 0.0, 0.0])
-
-                    compliance_direction_tool /= np.linalg.norm(
-                        compliance_direction_tool
-                    )
-                    X = compliance_direction_tool
-                    Y = np.cross(X, np.array([0, 0, 1]))
-                    Y /= np.linalg.norm(Y)
-                    Z = np.cross(X, Y)
-
-                    default_stiffness = 5000
-                    default_stiffness_rot = 100
-                    stiffness_matrix_full = np.eye(6) * default_stiffness_rot
-
-                    if action_stiffnesses is None:
-                        raw_k = default_stiffness
-                    else:
-                        raw_k = action_stiffnesses[id][i]
-                    _, floored_k = apply_press_stiffness_floor(raw_k, stiffness_floor)
-                    target_stiffness = float(floored_k[0])
-                    raw_steps.append(float(np.asarray(raw_k, dtype=np.float64)))
-                    floored_steps.append(target_stiffness)
-
-                    M = np.diag(
-                        [target_stiffness, default_stiffness, default_stiffness]
-                    )
-                    S = np.array([X, Y, Z]).T
-                    stiffness_matrix = S @ M @ np.linalg.inv(S)
-                    stiffness_matrix_full[:3, :3] = stiffness_matrix
-
-                    if (
-                        control_para["test_nominal_target"]
-                        and control_para["test_nominal_target_stiffness"] > 0
-                    ):
-                        stiffness_matrix_full[:3, :3] = (
-                            np.eye(3) * control_para["test_nominal_target_stiffness"]
-                        )
-
-                    ts_stiffnesses[:, 6 * i : 6 * i + 6] = stiffness_matrix_full
-
-                outputs_ts_nominal_targets[id] = ts_targets_nominal
-                if control_para["test_nominal_target"]:
-                    outputs_ts_targets[id] = ts_targets_nominal
-                else:
-                    outputs_ts_targets[id] = ts_targets_virtual
-                outputs_ts_stiffnesses[id] = ts_stiffnesses
-                stiffness_trace[id] = (
-                    np.asarray(raw_steps, dtype=np.float64),
-                    np.asarray(floored_steps, dtype=np.float64),
-                )
+                stiffness_trace[id] = (raw_k, floored_k)
 
             # the "now" when the observation is taken
             action_start_time_s = obs_raw["robot_time_stamps_0"][-1]

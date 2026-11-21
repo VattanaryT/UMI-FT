@@ -2217,3 +2217,102 @@ class MoldAwareRuntime:
         target = Rp_to_SE3(r_d, x_s)
         vt = Rp_to_SE3(r_d, x_s + delta_n[:, None] * n)
         return target, vt
+
+
+def compliance_command(
+    nominal_se3: np.ndarray,
+    virtual_se3: np.ndarray,
+    stiffness,
+    measured_pose7: np.ndarray,
+    stiffness_floor: Optional[float] = None,
+    test_nominal_target: bool = False,
+    test_nominal_target_stiffness: float = -1.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Scheduled pose and 6x6 stiffness for one arm.
+
+    Same assembly the runner used inline. The soft axis is the virtual target
+    minus the nominal pose, in the measured tool frame. Learned stiffness is
+    on that axis, 5000 N/m on the other two translations, 100 on rotation.
+    ``stiffness_floor`` is the ``UMIFT_STIFFNESS_FLOOR`` value (None leaves the
+    press gain unchanged). ``test_nominal_target`` schedules the nominal pose.
+    A positive ``test_nominal_target_stiffness`` replaces the translational block.
+    """
+    from PyriteEnvSuites.env_runners.stiffness_floor import apply_press_stiffness_floor
+    from PyriteUtility.spatial_math import spatial_utilities as su
+
+    nominal_se3 = np.asarray(nominal_se3).reshape(-1, 4, 4)
+    virtual_se3 = np.asarray(virtual_se3).reshape(-1, 4, 4)
+    measured_pose7 = np.asarray(measured_pose7).reshape(7)
+    n = int(virtual_se3.shape[0])
+    SE3_TW = su.SE3_inv(su.pose7_to_SE3(measured_pose7))
+    ts_targets_nominal = su.SE3_to_pose7(nominal_se3)
+    ts_targets_virtual = su.SE3_to_pose7(virtual_se3)
+
+    ts_stiffnesses = np.zeros([6, 6 * n])
+    raw_steps = []
+    floored_steps = []
+    for i in range(n):
+        SE3_target = nominal_se3[i].reshape([4, 4])
+        SE3_virtual_target = virtual_se3[i].reshape([4, 4])
+
+        # stiffness: 1. convert vt to tool frame
+        SE3_TVt = SE3_TW @ SE3_virtual_target
+        SE3_Ttarget = SE3_TW @ SE3_target
+
+        # stiffness: 2. compute stiffness matrix in the tool frame
+        compliance_direction_tool = (
+            SE3_TVt[:3, 3] - SE3_Ttarget[:3, 3]
+        ).reshape(3)
+
+        if np.linalg.norm(compliance_direction_tool) < 0.001:  #
+            compliance_direction_tool = np.array([1.0, 0.0, 0.0])
+
+        compliance_direction_tool /= np.linalg.norm(
+            compliance_direction_tool
+        )
+        X = compliance_direction_tool
+        Y = np.cross(X, np.array([0, 0, 1]))
+        Y /= np.linalg.norm(Y)
+        Z = np.cross(X, Y)
+
+        default_stiffness = 5000
+        default_stiffness_rot = 100
+        stiffness_matrix_full = np.eye(6) * default_stiffness_rot
+
+        if stiffness is None:
+            raw_k = default_stiffness
+        else:
+            raw_k = stiffness[i]
+        _, floored_k = apply_press_stiffness_floor(raw_k, stiffness_floor)
+        target_stiffness = float(floored_k[0])
+        raw_steps.append(float(np.asarray(raw_k, dtype=np.float64)))
+        floored_steps.append(target_stiffness)
+
+        M = np.diag(
+            [target_stiffness, default_stiffness, default_stiffness]
+        )
+        S = np.array([X, Y, Z]).T
+        stiffness_matrix = S @ M @ np.linalg.inv(S)
+        stiffness_matrix_full[:3, :3] = stiffness_matrix
+
+        if (
+            test_nominal_target
+            and test_nominal_target_stiffness > 0
+        ):
+            stiffness_matrix_full[:3, :3] = (
+                np.eye(3) * test_nominal_target_stiffness
+            )
+
+        ts_stiffnesses[:, 6 * i : 6 * i + 6] = stiffness_matrix_full
+
+    if test_nominal_target:
+        scheduled = ts_targets_nominal
+    else:
+        scheduled = ts_targets_virtual
+    return (
+        ts_targets_nominal,
+        scheduled,
+        ts_stiffnesses,
+        np.asarray(raw_steps, dtype=np.float64),
+        np.asarray(floored_steps, dtype=np.float64),
+    )

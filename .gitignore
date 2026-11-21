@@ -20,6 +20,9 @@ intermediate_umi_output/
 figs/
 UMIFT_Data/surface_frames_scripts/eval/
 
+# closed-loop sim traces. The *.py files stay tracked.
+closedloop_sim/out/
+
 # miscellaneous
 output.log
 scripts/profile_data_loader.py 
