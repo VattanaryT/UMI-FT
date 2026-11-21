@@ -88,6 +88,8 @@ class UmiFTDataset(BaseImageDataset):
             action_type = "pose9"
         elif shape_meta["action"]["shape"][0] == 10 and shape_meta.get("reduced_r4"):
             action_type = "r4_10"
+        elif shape_meta["action"]["shape"][0] == 8 and shape_meta.get("heading_tilt"):
+            action_type = "r4_heading8"
         elif (
             shape_meta["action"]["shape"][0] == 10
             or shape_meta["action"]["shape"][0] == 20
@@ -132,6 +134,10 @@ class UmiFTDataset(BaseImageDataset):
             action_to_action_sample = action21_to_action_sample
         elif action_type == "r4_10":
             action_to_action_sample = action_r4_10_to_action_sample
+        elif action_type == "r4_heading8":
+            from heading_tilt import action_heading8_to_action_sample
+
+            action_to_action_sample = action_heading8_to_action_sample
         else:
             raise RuntimeError("unsupported")
         self.action_to_action_sample = action_to_action_sample
@@ -215,6 +221,12 @@ class UmiFTDataset(BaseImageDataset):
                 replay_buffer["data"][ep]["action"] = action_r4_10_from_action27(
                     replay_buffer["data"][ep]["action"]
                 )
+            elif self.action_type == "r4_heading8":
+                from heading_tilt import action_heading8_from_raw
+
+                action, times = action_heading8_from_raw(replay_buffer_raw["data"][ep])
+                replay_buffer["data"][ep]["action"] = action
+                replay_buffer["data"][ep]["action_time_stamps"] = times
             else:
                 raise RuntimeError("unsupported")
             # print(f"episode {ep}")
@@ -238,6 +250,10 @@ class UmiFTDataset(BaseImageDataset):
             action_to_action_sample = action21_to_action_sample
         elif self.action_type == "r4_10":
             action_to_action_sample = action_r4_10_to_action_sample
+        elif self.action_type == "r4_heading8":
+            from heading_tilt import action_heading8_to_action_sample
+
+            action_to_action_sample = action_heading8_to_action_sample
         else:
             raise RuntimeError("unsupported")
 
@@ -335,10 +351,21 @@ class UmiFTDataset(BaseImageDataset):
             assert AL in (21, 27), f"unexpected per-arm action dim {AL}"
         elif self.action_type == "r4_10":
             AL = 10
+        elif self.action_type == "r4_heading8":
+            AL = 8
         else:
             raise RuntimeError("unsupported")
 
         for i in range(len(self.id_list)):
+            if self.action_type == "r4_heading8":
+                sparse_action_normalizers.append(
+                    get_range_normalizer_from_stat(
+                        array_to_stats(
+                            data_cache_sparse["action"][..., i * AL : i * AL + AL]
+                        )
+                    )
+                )
+                continue
             sparse_action_normalizers.append(
                 get_range_normalizer_from_stat(
                     array_to_stats(

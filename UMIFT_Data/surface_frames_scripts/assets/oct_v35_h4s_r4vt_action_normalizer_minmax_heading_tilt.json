@@ -1,0 +1,79 @@
+{
+  "columns": [
+    "v1",
+    "v2",
+    "delta_n",
+    "stiffness",
+    "sin_psi",
+    "cos_psi",
+    "tilt_a",
+    "tilt_b"
+  ],
+  "kept_rows": 34112,
+  "carried_e_long_samples": 0,
+  "crown_normal_y": -0.9524618347190997,
+  "mesh_normals_outward_on_crown": true,
+  "long_axis": [
+    0.9997762446124849,
+    -0.009688296556575373,
+    0.018804191511168175
+  ],
+  "tilt_p995_rad": 1.3348019318357058,
+  "tilt_p995_deg": 76.47851718009494,
+  "labels_clipped": false,
+  "runtime_clip_rad": 1.3348019318357058,
+  "runtime_slew_deg": 3.0,
+  "gt_decode_no_clip": {
+    "0": {
+      "n": 14016,
+      "geodesic_deg_median": 4.1646560312633487e-07,
+      "geodesic_deg_p90": 1.408879923513727e-06,
+      "geodesic_deg_max": 3.438428985875635e-06,
+      "dropped_twist_deg_median": 4.976309600577582e-08,
+      "dropped_twist_deg_p90": 2.2060383193727563e-07,
+      "dropped_twist_deg_max": 1.946567533696688e-06
+    },
+    "9": {
+      "n": 11350,
+      "geodesic_deg_median": 5.191364402272075e-07,
+      "geodesic_deg_p90": 1.4478643465994242e-06,
+      "geodesic_deg_max": 3.419136897217641e-06,
+      "dropped_twist_deg_median": 5.653877263172304e-08,
+      "dropped_twist_deg_p90": 6.577384298281206e-07,
+      "dropped_twist_deg_max": 2.19692787880838e-06
+    },
+    "31": {
+      "n": 10754,
+      "geodesic_deg_median": 5.760555476119634e-07,
+      "geodesic_deg_p90": 1.5041672538193805e-06,
+      "geodesic_deg_max": 3.4244606674834078e-06,
+      "dropped_twist_deg_median": 4.186160291188599e-08,
+      "dropped_twist_deg_p90": 1.9895862015789975e-07,
+      "dropped_twist_deg_max": 1.9994019666209743e-06
+    }
+  },
+  "normalizer": "/home/boeing/umi_ft_ws/worktrees/UMI-FT-causal_foot/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_heading_tilt.pkl",
+  "sha256": "71bd4cdc7be5a066e786d0b1fb9be526e01d6a6ff1e4ad7dd9c6280ac3709f84",
+  "source": "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_causal_foot/acp_replay_buffer.zarr",
+  "min": [
+    -0.46726012229919434,
+    -0.45852845907211304,
+    -0.13141006231307983,
+    200.0,
+    -0.23320227586198228,
+    -0.9999999999973824,
+    -1.8621921691331642,
+    -1.09920741330382
+  ],
+  "max": [
+    0.4358590245246887,
+    0.43813854455947876,
+    0.022551093250513077,
+    3000.0,
+    0.9999992404772049,
+    0.9999999998384002,
+    1.5253382267793585,
+    1.2617983748059636
+  ],
+  "pack": "swing_twist"
+}

@@ -1,0 +1,24 @@
+# October causal-foot action as 8 dims: v1, v2, δn, stiffness, sin ψ, cos ψ, a, b.
+# (a, b) is the tilt rotvec in the frame after Rz(ψ). ψ is from the mold long axis.
+# Labels are not clipped. Runtime clip is the p99.5 tilt magnitude in the zarr attrs.
+# Field-jump ΔR masking stays off. Episodes 35 and 44 stay excluded.
+# sin ψ and cos ψ both use identity scale. The 557e4d25 pickle is unchanged.
+defaults:
+  - umift_oct_fixb_r4vt_h4s
+  - _self_
+
+name: OCT-V35-FIXB-R4VT-HEADING-TILT-8-SC
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_heading_tilt/acp_replay_buffer.zarr
+
+dataset:
+  _target_: fixb_heading_tilt_dataset.UmiFTDatasetHeadingTilt
+  reduced_r4: false
+  mask_delta_R_after_field_jumps: false
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-causal_foot/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_heading_tilt_swing_sc.pkl
+  action_normalizer_sha256: e93b87561e762c2d7f1549a883eb18d45e6d50d929df463c43fce4817444e2f5
+
+shape_meta:
+  heading_tilt: true
+  action:
+    shape: [8]
