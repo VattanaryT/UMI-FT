@@ -714,6 +714,118 @@ def foot_walk_mode() -> str:
     return "legacy"
 
 
+LEAD_IN_SPEED_MPS = 0.12
+OBS_IMAGE_LAG_S = 0.050
+
+
+def lead_in_seconds() -> float:
+    """Seconds of scripted outbound motion before the policy. Unset is zero."""
+    raw = os.environ.get("UMIFT_LEAD_IN_S", "").strip()
+    if raw == "":
+        return 0.0
+    seconds = float(raw)
+    if seconds < 0.0:
+        raise ValueError(f"UMIFT_LEAD_IN_S={raw!r} is negative.")
+    return seconds
+
+
+def lead_in_goal_pose7(field, start_pose7: np.ndarray, seconds: float, speed_mps: float = LEAD_IN_SPEED_MPS) -> np.ndarray:
+    """Same orientation, translated along +t2 at the demo pace.
+
+    +t2 is the positive v2 direction at the median demo start. ``speed_mps``
+    is the outbound pace of those demos, about 0.10 to 0.14 m/s.
+    """
+    start = np.asarray(start_pose7, dtype=np.float64).reshape(7).copy()
+    queried = field.query(start[:3].reshape(1, 3))
+    frame = np.asarray(queried["R"], dtype=np.float64).reshape(3, 3)
+    tangent = frame[:, 1]
+    length = float(np.linalg.norm(tangent))
+    if length < 1e-8:
+        raise RuntimeError("The mold frame has no t2 at the lead-in start.")
+    start[:3] = start[:3] + tangent / length * float(speed_mps) * float(seconds)
+    return start
+
+
+def lead_in_poses(
+    field,
+    start_pose7: np.ndarray,
+    seconds: float,
+    dt: float = 1.0 / 15.0,
+    speed_mps: float = LEAD_IN_SPEED_MPS,
+) -> np.ndarray:
+    """Outbound samples along +t2, holding the start pose's offset from the mesh.
+
+    The TCP stays at that clearance instead of taking the straight chord, which
+    crosses the stringer. Returns ``(N, 7)`` including the start pose.
+    """
+    start = np.asarray(start_pose7, dtype=np.float64).reshape(7).copy()
+    queried = field.query(start[:3].reshape(1, 3))
+    foot = np.asarray(queried["x_s"], dtype=np.float64).reshape(3)
+    frame = np.asarray(queried["R"], dtype=np.float64).reshape(3, 3)
+    local = frame.T @ (start[:3] - foot)
+    count = max(1, int(round(float(seconds) / float(dt))))
+    poses = [start]
+    for _ in range(count):
+        foot, frame = _walk_on_surface(field, foot, frame, np.array([0.0, speed_mps]), dt)
+        pose = start.copy()
+        pose[:3] = foot + frame @ local
+        poses.append(pose)
+    return np.stack(poses)
+
+
+def align_obs_enabled() -> bool:
+    """Pose and wrench windows end at the newest image time when this is on."""
+    return os.environ.get("UMIFT_ALIGN_OBS_TO_IMAGE", "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+def align_obs_to_image(obs_raw: dict, id_list=(0,)) -> None:
+    """Trim pose and wrench so the newest sample is the image time.
+
+    The index is ``searchsorted`` on that stream, the same call the training
+    sampler uses. A sample more than 50 ms from the image raises. Unset, this
+    returns without reading the buffers.
+    """
+    if not align_obs_enabled():
+        return
+    for rid in id_list:
+        rgb_key = f"rgb_time_stamps_{rid}"
+        if rgb_key not in obs_raw:
+            continue
+        rgb_t = np.asarray(obs_raw[rgb_key], dtype=np.float64).reshape(-1)
+        if len(rgb_t) == 0:
+            continue
+        query = float(rgb_t[-1])
+        pairs = (
+            (f"ts_pose_fb_{rid}", f"robot_time_stamps_{rid}"),
+            (f"wrench_left_{rid}", f"wrench_time_stamps_{rid}"),
+            (f"wrench_{rid}", f"wrench_time_stamps_{rid}"),
+        )
+        seen = set()
+        for value_key, time_key in pairs:
+            if value_key not in obs_raw or time_key not in obs_raw or time_key in seen:
+                continue
+            times = np.asarray(obs_raw[time_key], dtype=np.float64).reshape(-1)
+            values = np.asarray(obs_raw[value_key])
+            if len(times) == 0 or len(values) == 0:
+                continue
+            idx = int(np.searchsorted(times, query))
+            idx = min(max(idx, 0), len(times) - 1)
+            lag = abs(float(times[idx]) - query)
+            if lag > OBS_IMAGE_LAG_S:
+                raise RuntimeError(
+                    f"[align] {value_key} is {lag * 1e3:.0f} ms from the newest "
+                    f"image at {query:.3f} s. The limit is {OBS_IMAGE_LAG_S * 1e3:.0f} ms."
+                )
+            obs_raw[value_key] = values[: idx + 1]
+            obs_raw[time_key] = times[: idx + 1]
+            seen.add(time_key)
+
+
 def foot_climb_enabled() -> bool:
     """The fillet-climb chord is off unless ``UMIFT_FOOT_CLIMB`` is set.
 
@@ -972,6 +1084,10 @@ def _integrate_causal_tcp(
     advances by ``tcp_step`` when that is the known full displacement (tangent
     and normal), otherwise by the command ``x_d``. The tangent is added to
     ``x_d`` once. ``dt`` is the value the caller passes (1/15 on the runner).
+
+    ``UMIFT_FOOT_WALK=geodesic`` keeps the causal placement on the first step
+    and then walks ``v_par`` across triangles. That walk does not pull small
+    steps back by ``LEAD_M``. The landed tangent is held through a normal spin.
     """
     tracker = _causal_foot_for(field)
     v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
@@ -994,8 +1110,12 @@ def _integrate_causal_tcp(
     frames = np.zeros((count, 3, 3), dtype=np.float64)
     commanded = np.zeros((count, 3), dtype=np.float64)
     quiet = np.zeros(count, dtype=bool)
+    geodesic = foot_walk_mode() == "geodesic"
     for k in range(count):
-        x, rotation = tracker.step(tcp_state, prev)
+        if geodesic and prev is not None:
+            x, rotation = _walk_on_surface(field, prev[0], prev[1], v_par[k], dt[k])
+        else:
+            x, rotation = tracker.step(tcp_state, prev)
         xs[k] = x
         frames[k] = rotation
         commanded[k] = _command_tangential(x, rotation, v_par[k], delta_n[k], dt[k])

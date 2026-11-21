@@ -2488,6 +2488,31 @@ def main():
                 "so the lookback is this pose."
             )
             time.sleep(POLICY_LOOKBACK_S)
+        if r4vt and mold_runtime is not None and mold_T_fixture_from_base is not None:
+            from mold_aware_runtime import LEAD_IN_SPEED_MPS, lead_in_poses, lead_in_seconds
+
+            lead_s = lead_in_seconds()
+            if lead_s > 0.0:
+                current = np.asarray(
+                    env.get_observation_from_buffer()["ts_pose_fb_0"][-1],
+                    dtype=np.float64,
+                ).reshape(7)
+                current_fix = pose7_change_frame(current, mold_T_fixture_from_base)
+                poses_fix = lead_in_poses(mold_runtime.field, current_fix, lead_s)
+                base_from_fix = np.linalg.inv(mold_T_fixture_from_base)
+                poses_base = np.stack(
+                    [pose7_change_frame(pose, base_from_fix) for pose in poses_fix]
+                )
+                print(
+                    f"[lead-in] {lead_s:.1f} s along +t2 at "
+                    f"{LEAD_IN_SPEED_MPS * 100:.0f} cm/s before the policy."
+                )
+                stamps = np.linspace(0.0, lead_s, len(poses_base))
+                env.schedule_controls(
+                    pose7_cmd=poses_base.T,
+                    timestamps=(stamps + env.current_hardware_time_s) * 1000,
+                )
+                time.sleep(lead_s + 0.3)
         while not killer.kill_now:
             horizon_initial_time_s = env.current_hardware_time_s
             printOrNot(vbs_h1, "Starting new horizon at ", horizon_initial_time_s)
@@ -2576,6 +2601,10 @@ def main():
                     obs_raw[f"rgb_time_stamps_{id}"] = obs_raw[
                         f"ultrawide_time_stamps_{id}"
                     ]
+            if mold_runtime is not None:
+                from mold_aware_runtime import align_obs_to_image
+
+                align_obs_to_image(obs_raw, id_list)
             # import pdb; pdb.set_trace()
 
             # Mold-aware: fill mold_* from tip in *fixture* frame (field frame).
