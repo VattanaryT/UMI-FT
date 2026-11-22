@@ -247,6 +247,17 @@ def _open_episode(zarr_path: Path, episode: int):
     return zarr.open(str(zarr_path), "r")["data"][f"episode_{episode}"]
 
 
+def _action10_rows(group, indices: np.ndarray) -> np.ndarray:
+    """``[v1, v2, δn, stiffness, ΔR]`` from the causal-foot streams."""
+    idx = np.asarray(indices, dtype=np.int64)
+    out = np.zeros((len(idx), 10), dtype=np.float64)
+    out[:, 0:2] = np.asarray(group["fixb_v_par_0"][idx], dtype=np.float64).reshape(-1, 2)
+    out[:, 2] = np.asarray(group["fixb_delta_n_0"][idx], dtype=np.float64).reshape(-1)
+    out[:, 3] = np.asarray(group["stiffness_0"][idx], dtype=np.float64).reshape(-1)
+    out[:, 4:10] = np.asarray(group["fixb_delta_R_rot6d_0"][idx], dtype=np.float64).reshape(-1, 6)
+    return out
+
+
 def _action_rows(group, indices: np.ndarray, with_delta_r: bool) -> np.ndarray:
     idx = np.asarray(indices, dtype=np.int64)
     robot_t = np.asarray(group["robot_time_stamps_0"][idx], dtype=np.float64).reshape(-1)
@@ -410,8 +421,9 @@ def _windows(robot_t, rgb_t, exec_h: int):
 def pushed_action_chunks(arm: str, episode: int, exec_h: int):
     """Actions the runner ensembler receives for one episode.
 
-    r4vt: round-tripped action27, one (64, 27) array per window. These are the
-    arrays ``FixBActionEnsembler.push`` gets. r1rel: relative action21 against
+    r4vt: one (64, D) array per window, the arrays ``FixBActionEnsembler.push``
+    gets. D is 10 when the normalizer is the causal-foot pickle
+    (v1, v2, δn, stiffness, ΔR) and 27 otherwise. r1rel: relative action21 against
     the demo TCP at the window start, the array ``action21_postprocess`` gets
     before the pose ensembler. Windows step by ``exec_h`` RGB frames.
     """
@@ -430,10 +442,14 @@ def pushed_action_chunks(arm: str, episode: int, exec_h: int):
     demo = np.asarray(group["ts_pose_fb_0"], dtype=np.float64)
     actions = []
     windows = _windows(robot_t, rgb_t, exec_h)
+    pack10 = arm == "r4vt" and int(scale.shape[0]) == 10
     for indices in windows:
-        action = roundtrip_action(
-            _action_rows(group, indices, with_delta_r=with_delta_r), scale, offset
+        rows = (
+            _action10_rows(group, indices)
+            if pack10
+            else _action_rows(group, indices, with_delta_r=with_delta_r)
         )
+        action = roundtrip_action(rows, scale, offset)
         if arm == "r1rel":
             base = su.pose7_to_SE3(demo[int(indices[0])].reshape(1, 7))[0]
             relative = action21_to_action_sample(action, np.zeros((0,)), [0], [base])["sparse"]

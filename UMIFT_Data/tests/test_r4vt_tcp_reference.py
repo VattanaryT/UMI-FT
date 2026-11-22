@@ -295,6 +295,91 @@ def test_geodesic_walk_follows_the_folded_surface(monkeypatch):
     assert decoded["x_s"][1] == pytest.approx([1.0, 0.2, 0.3], abs=1e-5)
 
 
+def test_geodesic_causal_foot_keeps_the_small_step(monkeypatch):
+    """Causal r4vt still walks the mesh. A short step is not pulled back."""
+    from fixb_field import orthonormal_frames
+    from mold_aware_runtime import LEAD_M, integrate_tcp_foot
+
+    monkeypatch.setenv("UMIFT_FOOT_WALK", "geodesic")
+
+    class _Jump:
+        def step(self, tcp, prev):
+            del prev
+            return np.asarray(tcp, dtype=np.float64).reshape(3), np.eye(3)
+
+    class _Fold:
+        def __init__(self):
+            self.vertices = np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0]]
+            )
+            self.faces = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+            flat = orthonormal_frames(np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+            wall = orthonormal_frames(np.array([0.0, 0.0, 1.0]), np.array([-1.0, 0.0, 0.0]))
+            self.frames = np.stack([flat, flat, flat, wall])
+            self._causal_foot = _Jump()
+
+        def query(self, p):
+            points = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+            frame = orthonormal_frames(np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+            frames = np.broadcast_to(frame, (len(points), 3, 3)).copy()
+            return {"x_s": points.copy(), "R": frames, "sd": np.zeros(len(points))}
+
+    decoded = integrate_tcp_foot(
+        _Fold(),
+        np.array([0.5, 0.2, 0.0]),
+        np.array([[0.15, 0.0], [0.15, 0.0]]),
+        np.zeros(2),
+        np.full(2, 1.0 / 15.0),
+    )
+    step = float(np.linalg.norm(decoded["x_s"][1] - decoded["x_s"][0]))
+    assert step == pytest.approx(0.15 / 15.0, abs=1e-4)
+    assert step < LEAD_M
+    assert not np.any(decoded["foot_cap"])
+
+
+def test_lead_in_moves_along_t2(monkeypatch):
+    from mold_aware_runtime import LEAD_IN_SPEED_MPS, lead_in_goal_pose7, lead_in_seconds
+
+    monkeypatch.delenv("UMIFT_LEAD_IN_S", raising=False)
+    assert lead_in_seconds() == 0.0
+    monkeypatch.setenv("UMIFT_LEAD_IN_S", "3")
+
+    class _Field:
+        def query(self, p):
+            frame = np.eye(3)
+            return {"R": np.broadcast_to(frame, (len(p), 3, 3)).copy()}
+
+    start = np.array([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
+    goal = lead_in_goal_pose7(_Field(), start, lead_in_seconds())
+    assert goal[1] == pytest.approx(LEAD_IN_SPEED_MPS * 3.0)
+    assert goal[0] == pytest.approx(0.0)
+    assert goal[3:] == pytest.approx(start[3:])
+
+
+def test_align_obs_trims_to_the_image_and_checks_lag(monkeypatch):
+    from mold_aware_runtime import align_obs_to_image
+
+    monkeypatch.delenv("UMIFT_ALIGN_OBS_TO_IMAGE", raising=False)
+    raw = {
+        "rgb_time_stamps_0": np.array([0.0, 0.10]),
+        "ts_pose_fb_0": np.arange(6, dtype=np.float64).reshape(3, 2),
+        "robot_time_stamps_0": np.array([0.0, 0.10, 0.20]),
+        "wrench_left_0": np.ones((3, 6)),
+        "wrench_time_stamps_0": np.array([0.0, 0.10, 0.20]),
+    }
+    align_obs_to_image(raw)
+    assert len(raw["robot_time_stamps_0"]) == 3
+    monkeypatch.setenv("UMIFT_ALIGN_OBS_TO_IMAGE", "1")
+    align_obs_to_image(raw)
+    assert raw["robot_time_stamps_0"][-1] == pytest.approx(0.10)
+    assert raw["ts_pose_fb_0"].shape[0] == 2
+    assert raw["wrench_time_stamps_0"][-1] == pytest.approx(0.10)
+    raw["robot_time_stamps_0"] = np.array([0.0])
+    raw["ts_pose_fb_0"] = np.zeros((1, 2))
+    with pytest.raises(RuntimeError, match="ms from the newest image"):
+        align_obs_to_image(raw)
+
+
 def test_a_far_tcp_is_approached_one_gate_at_a_time():
     """A TCP 80 mm away is walked toward. The foot does not jump to it."""
     from fixb_tcp_track import GATE_M
@@ -629,7 +714,7 @@ def test_new_face_at_chunk_start_stays_on_the_held_sheet():
     assert decoded["R_field"][0, :, 2] @ np.array([0.0, 0.0, 1.0]) == pytest.approx(1.0)
 
 
-def test_vt_ramps_in_and_a_later_25mm_step_holds():
+def test_vt_ramps_in_and_a_later_25mm_step_is_clipped():
     runtime = _runtime()
     tcp = np.array([0.0, 0.0, 0.0])
     dt = np.array([1.0 / 15.0])
@@ -639,8 +724,23 @@ def test_vt_ramps_in_and_a_later_25mm_step_holds():
     assert moved == pytest.approx(allow, abs=1e-6)
     runtime._vt_elapsed_s = VT_RAMP_S
     second = runtime.decode_chunk(_action(-0.05), tcp, np.eye(3), dt)
-    assert np.allclose(second["x_d"][0], first["x_d"][0], atol=1e-8)
+    clipped = float(np.linalg.norm(second["x_d"][0] - first["x_d"][0]))
+    assert clipped == pytest.approx(r4_safety_limits().max_step_m, abs=1e-6)
     assert bool(second["clamp_step"][0])
+
+
+def test_10d_action_fills_constant_slots_and_decodes_delta_r():
+    ten = np.zeros((1, 10), dtype=np.float64)
+    ten[0, 0:3] = [0.1, -0.2, -0.03]
+    ten[0, 3] = 400.0
+    ten[0, 4:10] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    runtime = _runtime()
+    decoded = runtime.decode_chunk(
+        ten, np.zeros(3), np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+    )
+    assert decoded["stiffness"][0] == pytest.approx(400.0)
+    assert np.allclose(decoded["R_d"][0], decoded["R_field"][0], atol=1e-6)
+    assert decoded["raw"].shape[-1] == 27
 
 
 E30_LOG = Path("/home/boeing/data/control_log/checkpoints_e30_rollout0_1794958462")
@@ -741,16 +841,16 @@ def test_bench_lift_is_fixture_up():
 
 
 def test_runner_keeps_standard_bc_stiffness_path():
-    """Stiffness still comes from VT − nominal in the runner. No second builder."""
-    runner = (
-        Path(__file__).resolve().parents[2]
-        / "PyriteEnvSuites"
-        / "env_runners"
-        / "umift_env_runner.py"
+    """Stiffness still comes from VT − nominal. The runner calls that one function."""
+    root = Path(__file__).resolve().parents[2]
+    runner = (root / "PyriteEnvSuites/env_runners/umift_env_runner.py").read_text()
+    command = (
+        root / "UMIFT_Data/surface_frames_scripts/mold_aware_runtime.py"
     ).read_text()
-    assert "compliance_direction_tool" in runner
-    assert "default_stiffness = 5000" in runner
-    assert "outputs_ts_targets[id] = ts_targets_virtual" in runner
+    assert "compliance_command(" in runner
+    assert "outputs_ts_targets[id]" in runner
+    assert "compliance_direction_tool" in command
+    assert "default_stiffness = 5000" in command
     assert "UMIFT_ABORT_ON_MEASURED_MESH_DISTANCE" in runner
     assert "UMIFT_ENABLE_DELTA_N_FLOOR" in runner
     assert "UMIFT_BENCH_LIFT_M" in runner

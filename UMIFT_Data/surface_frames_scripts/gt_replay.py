@@ -12,13 +12,49 @@ import numpy as np
 import replay_gt
 
 
+def _cpu_numpy(value):
+    """Copy a normalizer tensor to host memory before numpy sees it.
+
+    A checkpoint normalizer lives on CUDA. ``np.asarray`` on that tensor
+    raises TypeError. Call this on every tensor the replay loader reads.
+    """
+    if hasattr(value, "detach"):
+        value = value.detach()
+    if hasattr(value, "cpu"):
+        value = value.cpu()
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return np.asarray(value)
+
+
+def _normalizer_width(normalizer) -> int | None:
+    params = getattr(normalizer, "params_dict", None)
+    if params is None:
+        return None
+    scale = params["scale"] if "scale" in params else params["action"]["scale"]
+    return int(_cpu_numpy(scale).reshape(-1).shape[0])
+
+
 def apply_normalizer(normalizer, action: np.ndarray) -> np.ndarray:
     """Round-trip one chunk through the checkpoint action normalizer."""
     values = np.asarray(action, dtype=np.float32)
     out = normalizer.unnormalize(normalizer.normalize(values))
-    if hasattr(out, "detach"):
-        out = out.detach().cpu().numpy()
-    return np.asarray(out, dtype=np.float64)
+    return _cpu_numpy(out).astype(np.float64, copy=False)
+
+
+def demo_tcp_disp(robot_t, rgb_t, position: np.ndarray) -> np.ndarray:
+    """Displacement of the demo TCP from each robot sample to the next control step.
+
+    Same array the sim gate stores on ``tcp_disp`` and passes as ``_tcp_step``.
+    """
+    from fixb_labels import interp_rows, next_control_times
+
+    position = np.asarray(position, dtype=np.float64).reshape(-1, 3)
+    arrived = next_control_times(
+        np.asarray(robot_t, dtype=np.float64).reshape(-1),
+        np.asarray(rgb_t, dtype=np.float64).reshape(-1),
+    )
+    return interp_rows(arrived, np.asarray(robot_t, dtype=np.float64).reshape(-1), position) - position
 
 
 class GtReplay:
@@ -26,8 +62,16 @@ class GtReplay:
 
     def __init__(self, arm: str, episode: int, exec_h: int, normalizer=None):
         actions, windows = replay_gt.pushed_action_chunks(arm, int(episode), int(exec_h))
-        if normalizer is not None:
-            actions = [apply_normalizer(normalizer, action) for action in actions]
+        if normalizer is not None and actions:
+            width = _normalizer_width(normalizer)
+            label_width = int(actions[0].shape[-1])
+            if width == label_width:
+                actions = [apply_normalizer(normalizer, action) for action in actions]
+            else:
+                print(
+                    f"[gt-replay] checkpoint normalizer is {width}-d, "
+                    f"labels are {label_width}-d; using the replay normalizer only"
+                )
         self.arm = arm
         self.episode = int(episode)
         self.exec_h = int(exec_h)
@@ -40,6 +84,9 @@ class GtReplay:
         group = replay_gt._open_episode(zarr_path, self.episode)
         self.demo = np.asarray(group["ts_pose_fb_0"], dtype=np.float64)
         self.start_pose7 = self.demo[0].copy()
+        robot_t = np.asarray(group["robot_time_stamps_0"], dtype=np.float64).reshape(-1)
+        rgb_t = np.asarray(group["rgb_time_stamps_0"], dtype=np.float64).reshape(-1)
+        self.tcp_disp = demo_tcp_disp(robot_t, rgb_t, self.demo[:, :3])
 
     def reset(self) -> None:
         self.k = 0
@@ -51,6 +98,11 @@ class GtReplay:
 
     def current(self):
         return self.actions[self.k], self.windows[self.k]
+
+    def tcp_step(self, n: int) -> np.ndarray:
+        """Demo TCP displacement for the next n executed steps, in metres."""
+        taken = np.asarray(self.windows[self.k][: int(n)], dtype=np.int64)
+        return np.asarray(self.tcp_disp, dtype=np.float64)[taken]
 
     def advance(self) -> None:
         self.k += 1

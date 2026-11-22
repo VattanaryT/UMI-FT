@@ -181,11 +181,16 @@ class ModelPredictiveController:
         self.id_list = id_list
 
         action_type = "pose9"  # "pose9" or "pose9pose9s1"
-        if shape_meta["action"]["shape"][0] == 9:
+        action_shape = int(shape_meta["action"]["shape"][0])
+        r4_10 = action_shape == 10 and "robot0_mold_geom" in shape_meta.get("obs", {})
+        if action_shape == 9:
             action_type = "pose9"
-        elif shape_meta["action"]["shape"][0] == 10:
+        elif r4_10:
+            # v1, v2, δn, stiffness, ΔR. Expanded to 27 before the SE3 postprocess.
+            action_type = "pose9pose9s1a2"
+        elif action_shape == 10:
             action_type = "pose9g1"
-        elif shape_meta["action"]["shape"][0] == 19:
+        elif action_shape == 19:
             action_type = "pose9pose9s1"
         elif shape_meta["action"]["shape"][0] == 38:
             action_type = "pose9pose9s1"
@@ -298,6 +303,13 @@ class ModelPredictiveController:
                 raw_action = result["sparse"][0].detach().to("cpu").numpy()
             else:
                 raw_action = result["action"][0].detach().to("cpu").numpy()
+            if (
+                raw_action.shape[-1] == 10
+                and "robot0_mold_geom" in self.shape_meta.get("obs", {})
+            ):
+                from mold_aware_runtime import expand_r4_action
+
+                raw_action = expand_r4_action(raw_action)
             self.last_raw_action = raw_action
 
             action = self.action_postprocess(

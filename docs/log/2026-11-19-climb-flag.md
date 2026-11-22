@@ -2,7 +2,7 @@
 date: 2026-11-19
 stream: frame
 branch: smooth_frame
-commit: uncommitted
+commit: 861ecd2
 status: done
 artifacts:
   - /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_smooth_tcp_track_clean/acp_replay_buffer.zarr

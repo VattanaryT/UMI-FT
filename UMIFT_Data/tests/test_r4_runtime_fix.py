@@ -14,6 +14,7 @@ from mold_aware_runtime import (  # noqa: E402
     SafetyLimits,
     fixb_decode_dt,
     r4_safety_limits,
+    read_bench_dn_floor_m,
 )
 
 RUNNER = (
@@ -69,6 +70,29 @@ def test_action_blend_averages_overlapping_velocity():
     blended = ensembler.pop(1)
     assert np.isclose(blended[0, 0], 2.0)
     assert np.isclose(blended[0, 2], -0.06)
+
+
+def test_bench_dn_floor_defaults_to_5mm_and_honors_9mm():
+    assert read_bench_dn_floor_m({}) == -0.005
+    assert read_bench_dn_floor_m({"UMIFT_BENCH_DN_FLOOR_MM": "-9"}) == -0.009
+    try:
+        read_bench_dn_floor_m({"UMIFT_BENCH_DN_FLOOR_MM": "9"})
+    except ValueError as exc:
+        assert "9" in str(exc)
+    else:
+        raise AssertionError("a positive floor must be rejected")
+    action = np.zeros((3, 27))
+    action[:, 2] = [-0.15, -0.009, -0.004]
+    action[:, 21:27] = EYE6
+    runtime = _runtime(
+        r4_safety_limits(enable_delta_n_floor=True, max_press_depth_m=0.009)
+    )
+    _v, delta_n, _stiff, _eoat, _raw, clamp = runtime.unpack_fixb_action(action)
+    assert np.allclose(delta_n, [-0.009, -0.009, -0.004])
+    assert np.array_equal(clamp, [True, False, False])
+    assert "read_bench_dn_floor_m" in RUNNER.read_text()
+    runtime_src = (SCRIPTS / "mold_aware_runtime.py").read_text()
+    assert "UMIFT_BENCH_DN_FLOOR_MM" in runtime_src
 
 
 def test_r4_drops_delta_n_floor_and_aborts_on_measured_tcp():

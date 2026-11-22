@@ -26,6 +26,7 @@ DEFAULT_META = DEFAULT_FIELD.with_name("fixb_meta.json")
 
 
 def rot6d_rows_to_R(r6: np.ndarray) -> np.ndarray:
+    """Gram-Schmidt. Columns of the result are the rotation's axes."""
     a1 = r6[..., 0:3]
     a2 = r6[..., 3:6]
     b1 = a1 / np.clip(np.linalg.norm(a1, axis=-1, keepdims=True), 1e-9, None)
@@ -33,6 +34,28 @@ def rot6d_rows_to_R(r6: np.ndarray) -> np.ndarray:
     b2 = b2 / np.clip(np.linalg.norm(b2, axis=-1, keepdims=True), 1e-9, None)
     b3 = np.cross(b1, b2)
     return np.stack([b1, b2, b3], axis=-2)
+
+
+# Identity rot6d: the first two columns of I. The 10-d action drops these slots.
+_IDENTITY_ROT6 = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64)
+
+
+def expand_r4_action(action: np.ndarray) -> np.ndarray:
+    """10-d ``[v1, v2, δn, stiffness, ΔR]`` → the 27-d layout.
+
+    Dropped slots are the constant identity rotations, the unused virtual
+    target, and the gripper and grasp force. A 27-d action is returned as-is.
+    """
+    action = np.asarray(action, dtype=np.float64)
+    if action.shape[-1] != 10:
+        return action
+    out = np.zeros(action.shape[:-1] + (27,), dtype=np.float64)
+    out[..., 0:3] = action[..., 0:3]
+    out[..., 3:9] = _IDENTITY_ROT6
+    out[..., 12:18] = _IDENTITY_ROT6
+    out[..., 18] = action[..., 3]
+    out[..., 21:27] = action[..., 4:10]
+    return out
 
 
 def Rp_to_SE3(R: np.ndarray, p: np.ndarray) -> np.ndarray:
@@ -136,11 +159,28 @@ def fixb_decode_dt(
     return np.full(int(n_steps), step_s, dtype=np.float64)
 
 
+def read_bench_dn_floor_m(environ=None) -> float:
+    """Signed δn floor in meters. ``UMIFT_BENCH_DN_FLOOR_MM`` defaults to −5.
+
+    Negative is into the mold. The bench flag decides whether the floor is applied.
+    """
+    source = os.environ if environ is None else environ
+    text = str(source.get("UMIFT_BENCH_DN_FLOOR_MM", "")).strip()
+    mm = -5.0 if text == "" else float(text)
+    if not np.isfinite(mm) or mm > 0.0:
+        shown = text or "-5"
+        raise ValueError(
+            f"UMIFT_BENCH_DN_FLOOR_MM={shown} must be a finite floor <= 0"
+        )
+    return float(mm) / 1000.0
+
+
 def r4_safety_limits(
     max_tcp_penetration_m: float = 0.020,
     wrench_hold_n: float = 90.0,
     abort_on_measured_mesh_distance: bool = False,
     enable_delta_n_floor: bool = False,
+    max_press_depth_m: float = 0.005,
 ) -> SafetyLimits:
     """r4vt limits. The δn floor stays off unless a bench replay asks for it.
 
@@ -148,8 +188,10 @@ def r4_safety_limits(
 
     Abort on measured TCP depth. Hold, then abort, on force. The measured-mesh
     flag skips the commanded-depth abort and checks the TCP instead.
+    ``max_press_depth_m`` is how far the bench floor may press, default 5 mm.
     """
     return SafetyLimits(
+        max_press_depth_m=float(max_press_depth_m),
         enable_delta_n_floor=bool(enable_delta_n_floor),
         enable_tcp_penetration_abort=True,
         max_tcp_penetration_m=float(max_tcp_penetration_m),
@@ -183,6 +225,31 @@ FIXTURE_UP = np.array([0.0, -1.0, 0.0])
 CAM_TABLE_MARGIN_M = 0.0
 # Replay only. A commanded tool this far from the label orientation is held.
 ORI_LABEL_HOLD_DEG = 25.0
+# Off unless UMIFT_RESET_TCP_TO_MEASURED is set. A carried TCP farther than
+# this from the measured TCP is dropped and the tracker starts at the measurement.
+TCP_RESET_GAP_M = 0.015
+
+
+def tcp_reset_enabled() -> bool:
+    return os.environ.get("UMIFT_RESET_TCP_TO_MEASURED", "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+def reset_carried_tcp(tcp_state: np.ndarray, measured: np.ndarray) -> np.ndarray:
+    """Keep the carried TCP. With the flag on, a gap over 15 mm uses the measurement."""
+    carried = np.asarray(tcp_state, dtype=np.float64).reshape(3)
+    measured = np.asarray(measured, dtype=np.float64).reshape(3)
+    if not tcp_reset_enabled():
+        return carried
+    gap = float(np.linalg.norm(carried - measured))
+    if gap <= TCP_RESET_GAP_M:
+        return carried
+    print(f"[mold][tcp] reset internal TCP to measured, gap {gap * 1e3:.1f} mm")
+    return measured.copy()
 
 
 def _import_frame_conventions():
@@ -648,6 +715,118 @@ def foot_walk_mode() -> str:
     return "legacy"
 
 
+LEAD_IN_SPEED_MPS = 0.12
+OBS_IMAGE_LAG_S = 0.050
+
+
+def lead_in_seconds() -> float:
+    """Seconds of scripted outbound motion before the policy. Unset is zero."""
+    raw = os.environ.get("UMIFT_LEAD_IN_S", "").strip()
+    if raw == "":
+        return 0.0
+    seconds = float(raw)
+    if seconds < 0.0:
+        raise ValueError(f"UMIFT_LEAD_IN_S={raw!r} is negative.")
+    return seconds
+
+
+def lead_in_goal_pose7(field, start_pose7: np.ndarray, seconds: float, speed_mps: float = LEAD_IN_SPEED_MPS) -> np.ndarray:
+    """Same orientation, translated along +t2 at the demo pace.
+
+    +t2 is the positive v2 direction at the median demo start. ``speed_mps``
+    is the outbound pace of those demos, about 0.10 to 0.14 m/s.
+    """
+    start = np.asarray(start_pose7, dtype=np.float64).reshape(7).copy()
+    queried = field.query(start[:3].reshape(1, 3))
+    frame = np.asarray(queried["R"], dtype=np.float64).reshape(3, 3)
+    tangent = frame[:, 1]
+    length = float(np.linalg.norm(tangent))
+    if length < 1e-8:
+        raise RuntimeError("The mold frame has no t2 at the lead-in start.")
+    start[:3] = start[:3] + tangent / length * float(speed_mps) * float(seconds)
+    return start
+
+
+def lead_in_poses(
+    field,
+    start_pose7: np.ndarray,
+    seconds: float,
+    dt: float = 1.0 / 15.0,
+    speed_mps: float = LEAD_IN_SPEED_MPS,
+) -> np.ndarray:
+    """Outbound samples along +t2, holding the start pose's offset from the mesh.
+
+    The TCP stays at that clearance instead of taking the straight chord, which
+    crosses the stringer. Returns ``(N, 7)`` including the start pose.
+    """
+    start = np.asarray(start_pose7, dtype=np.float64).reshape(7).copy()
+    queried = field.query(start[:3].reshape(1, 3))
+    foot = np.asarray(queried["x_s"], dtype=np.float64).reshape(3)
+    frame = np.asarray(queried["R"], dtype=np.float64).reshape(3, 3)
+    local = frame.T @ (start[:3] - foot)
+    count = max(1, int(round(float(seconds) / float(dt))))
+    poses = [start]
+    for _ in range(count):
+        foot, frame = _walk_on_surface(field, foot, frame, np.array([0.0, speed_mps]), dt)
+        pose = start.copy()
+        pose[:3] = foot + frame @ local
+        poses.append(pose)
+    return np.stack(poses)
+
+
+def align_obs_enabled() -> bool:
+    """Pose and wrench windows end at the newest image time when this is on."""
+    return os.environ.get("UMIFT_ALIGN_OBS_TO_IMAGE", "").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
+def align_obs_to_image(obs_raw: dict, id_list=(0,)) -> None:
+    """Trim pose and wrench so the newest sample is the image time.
+
+    The index is ``searchsorted`` on that stream, the same call the training
+    sampler uses. A sample more than 50 ms from the image raises. Unset, this
+    returns without reading the buffers.
+    """
+    if not align_obs_enabled():
+        return
+    for rid in id_list:
+        rgb_key = f"rgb_time_stamps_{rid}"
+        if rgb_key not in obs_raw:
+            continue
+        rgb_t = np.asarray(obs_raw[rgb_key], dtype=np.float64).reshape(-1)
+        if len(rgb_t) == 0:
+            continue
+        query = float(rgb_t[-1])
+        pairs = (
+            (f"ts_pose_fb_{rid}", f"robot_time_stamps_{rid}"),
+            (f"wrench_left_{rid}", f"wrench_time_stamps_{rid}"),
+            (f"wrench_{rid}", f"wrench_time_stamps_{rid}"),
+        )
+        seen = set()
+        for value_key, time_key in pairs:
+            if value_key not in obs_raw or time_key not in obs_raw or time_key in seen:
+                continue
+            times = np.asarray(obs_raw[time_key], dtype=np.float64).reshape(-1)
+            values = np.asarray(obs_raw[value_key])
+            if len(times) == 0 or len(values) == 0:
+                continue
+            idx = int(np.searchsorted(times, query))
+            idx = min(max(idx, 0), len(times) - 1)
+            lag = abs(float(times[idx]) - query)
+            if lag > OBS_IMAGE_LAG_S:
+                raise RuntimeError(
+                    f"[align] {value_key} is {lag * 1e3:.0f} ms from the newest "
+                    f"image at {query:.3f} s. The limit is {OBS_IMAGE_LAG_S * 1e3:.0f} ms."
+                )
+            obs_raw[value_key] = values[: idx + 1]
+            obs_raw[time_key] = times[: idx + 1]
+            seen.add(time_key)
+
+
 def foot_climb_enabled() -> bool:
     """The fillet-climb chord is off unless ``UMIFT_FOOT_CLIMB`` is set.
 
@@ -867,6 +1046,103 @@ def _walk_on_surface(field, foot, frame, v_par, dt):
     return point, landed
 
 
+def _command_tangential(foot, frame, v_par, delta_n, dt) -> np.ndarray:
+    """foot + (v1·t1 + v2·t2)·dt + δn·n_out. Frame z is the inward normal."""
+    frame = np.asarray(frame, dtype=np.float64).reshape(3, 3)
+    tang = frame[:, :2] @ np.asarray(v_par, dtype=np.float64).reshape(2) * float(dt)
+    outward = -frame[:, 2]
+    return np.asarray(foot, dtype=np.float64).reshape(3) + tang + float(delta_n) * outward
+
+
+def _causal_foot_for(field):
+    foot = getattr(field, "_causal_foot", None)
+    if foot is not None:
+        return foot
+    paths = getattr(field, "_causal_npz", None)
+    if paths is None:
+        return None
+    from causal_foot import CausalFoot
+
+    foot = CausalFoot(paths[0], paths[1])
+    field._causal_foot = foot
+    return foot
+
+
+def _integrate_causal_tcp(
+    field,
+    p0,
+    v_par,
+    delta_n,
+    dt,
+    prev_x,
+    prev_R,
+    tcp_carry,
+    tcp_step,
+) -> Dict[str, np.ndarray]:
+    """Foot from the causal tracker at an internal TCP.
+
+    The TCP starts at the measurement. Later chunks keep it. Each step it
+    advances by ``tcp_step`` when that is the known full displacement (tangent
+    and normal), otherwise by the command ``x_d``. The tangent is added to
+    ``x_d`` once. ``dt`` is the value the caller passes (1/15 on the runner).
+
+    ``UMIFT_FOOT_WALK=geodesic`` keeps the causal placement on the first step
+    and then walks ``v_par`` across triangles. That walk does not pull small
+    steps back by ``LEAD_M``. The landed tangent is held through a normal spin.
+    """
+    tracker = _causal_foot_for(field)
+    v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
+    delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
+    dt = np.asarray(dt, dtype=np.float64).reshape(-1)
+    count = len(delta_n)
+    measured = np.asarray(p0, dtype=np.float64).reshape(3)
+    prev = None
+    if prev_x is not None and prev_R is not None:
+        prev = (
+            np.asarray(prev_x, dtype=np.float64).reshape(3),
+            np.asarray(prev_R, dtype=np.float64).reshape(3, 3),
+        )
+    if prev is None or tcp_carry is None:
+        tcp_state = measured.copy()
+    else:
+        tcp_state = reset_carried_tcp(tcp_carry, measured)
+    step = None if tcp_step is None else np.asarray(tcp_step, dtype=np.float64).reshape(-1, 3)
+    xs = np.zeros((count, 3), dtype=np.float64)
+    frames = np.zeros((count, 3, 3), dtype=np.float64)
+    commanded = np.zeros((count, 3), dtype=np.float64)
+    quiet = np.zeros(count, dtype=bool)
+    geodesic = foot_walk_mode() == "geodesic"
+    for k in range(count):
+        if geodesic and prev is not None:
+            x, rotation = _walk_on_surface(field, prev[0], prev[1], v_par[k], dt[k])
+        else:
+            x, rotation = tracker.step(tcp_state, prev)
+        xs[k] = x
+        frames[k] = rotation
+        commanded[k] = _command_tangential(x, rotation, v_par[k], delta_n[k], dt[k])
+        if step is not None and k < len(step):
+            tcp_state = tcp_state + step[k]
+        else:
+            tcp_state = commanded[k]
+        prev = (x, rotation)
+    outward = -frames[:, :, 2]
+    return {
+        "x_s": xs,
+        "x_d": commanded,
+        "R": frames,
+        "n_out": outward,
+        "face_held": quiet,
+        "hop_hold": quiet,
+        "foot_reanchor": quiet,
+        "foot_cap": quiet,
+        "hop_streak": np.array(0),
+        "reject_streak": np.array(0),
+        "step_reject": quiet,
+        "ray_recovery": quiet,
+        "tcp_carry": tcp_state,
+    }
+
+
 def integrate_tcp_foot(
     field,
     p0: np.ndarray,
@@ -882,6 +1158,8 @@ def integrate_tcp_foot(
     step_allow: np.ndarray | None = None,
     reject_streak: int = 0,
     R_tool: np.ndarray | None = None,
+    tcp_carry: np.ndarray | None = None,
+    tcp_step: np.ndarray | None = None,
 ) -> Dict[str, np.ndarray]:
     """Track the measured TCP, and slide the foot by ``v_par``.
 
@@ -894,8 +1172,13 @@ def integrate_tcp_foot(
     refused. The press offset along
     the normal is not a lead.
     ``cap_origin`` is unused. ``hop_streak`` and ``step_allow`` are kept so
-    older callers do not break.
+    older callers do not break. A smooth r4vt field uses the causal tracker
+    instead of this walk.
     """
+    if _causal_foot_for(field) is not None:
+        return _integrate_causal_tcp(
+            field, p0, v_par, delta_n, dt, prev_x, prev_R, tcp_carry, tcp_step
+        )
     v_par = np.asarray(v_par, dtype=np.float64).reshape(-1, 2)
     delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1)
     dt = np.asarray(dt, dtype=np.float64).reshape(-1)
@@ -998,7 +1281,7 @@ def blend_action_rows(actions, starts, steps, decay_m: float = 0.01) -> np.ndarr
     """
     from fixb_labels import so3_to_rot6d_rows
 
-    actions = [np.asarray(a, dtype=np.float64) for a in actions]
+    actions = [expand_r4_action(np.asarray(a, dtype=np.float64)) for a in actions]
     starts = [int(s) for s in starts]
     horizon = actions[0].shape[0]
     width = actions[0].shape[1]
@@ -1167,6 +1450,9 @@ class MoldAwareRuntime:
     # Last commanded foot. The next replan holds this face and this point.
     _cmd_foot: Optional[np.ndarray] = None
     _cmd_R: Optional[np.ndarray] = None
+    # Internal TCP for the causal tracker. Not reset from the measurement.
+    _cmd_tcp: Optional[np.ndarray] = None
+    _tcp_step: Optional[np.ndarray] = None
     _cmd_Rd: Optional[np.ndarray] = None
     _cmd_vt: Optional[np.ndarray] = None
     _vt_elapsed_s: float = 0.0
@@ -1206,6 +1492,7 @@ class MoldAwareRuntime:
                 from fixb_smooth_field import SmoothFrameField
 
                 mold = SmoothFrameField(field_path, side)
+                mold._causal_npz = (field_path, side)
         return cls(
             field=mold,
             R_off=np.asarray(meta["R_off"], dtype=np.float64),
@@ -1235,6 +1522,8 @@ class MoldAwareRuntime:
         self._cmd_R = None
         self._cmd_Rd = None
         self._cmd_vt = None
+        self._cmd_tcp = None
+        self._tcp_step = None
         self._vt_elapsed_s = 0.0
         self._hop_hold_streak = 0
         self._reject_streak = 0
@@ -1247,6 +1536,8 @@ class MoldAwareRuntime:
         self._cmd_R = None
         self._cmd_Rd = None
         self._cmd_vt = None
+        self._cmd_tcp = None
+        self._tcp_step = None
         self._vt_elapsed_s = 0.0
         self._hop_hold_streak = 0
         self._reject_streak = 0
@@ -1577,26 +1868,26 @@ class MoldAwareRuntime:
 
     def _limit_commanded_vt(
         self,
+        x_d: np.ndarray,
         x_s: np.ndarray,
         normal: np.ndarray,
-        delta_n: np.ndarray,
         dt: np.ndarray,
         p0: np.ndarray,
     ):
-        """Ramp the virtual target in, then hold a step longer than 25 mm.
+        """Clip a step longer than 25 mm. Do not rebuild the point on the normal.
 
-        For the first ``VT_RAMP_S`` seconds the offset is scaled by elapsed time
-        and the VT may move at most that fraction of ``max_step_m`` from the
-        previous command (the measured TCP, on the first call). After the ramp,
-        a longer step keeps the last safe VT.
+        ``x_d`` is already ``foot + v·dt + δn·n``. The first ``VT_RAMP_S``
+        seconds may move at most that fraction of ``max_step_m``. A longer
+        step is shortened along the same direction. It is not held in place.
         """
-        x_s = np.asarray(x_s, dtype=np.float64)
-        normal = np.asarray(normal, dtype=np.float64)
+        desired = np.asarray(x_d, dtype=np.float64).reshape(-1, 3)
+        x_s = np.asarray(x_s, dtype=np.float64).reshape(-1, 3)
+        normal = np.asarray(normal, dtype=np.float64).reshape(-1, 3)
         normal = normal / np.clip(np.linalg.norm(normal, axis=-1, keepdims=True), 1e-9, None)
-        delta_n = np.asarray(delta_n, dtype=np.float64).reshape(-1).copy()
         dt = np.asarray(dt, dtype=np.float64).reshape(-1)
-        steps = len(delta_n)
-        x_d = np.zeros((steps, 3), dtype=np.float64)
+        steps = len(desired)
+        out = np.zeros((steps, 3), dtype=np.float64)
+        delta_n = np.zeros(steps, dtype=np.float64)
         hit = np.zeros(steps, dtype=bool)
         if self._cmd_vt is None:
             prev = np.asarray(p0, dtype=np.float64).reshape(3).copy()
@@ -1606,23 +1897,19 @@ class MoldAwareRuntime:
         for i in range(steps):
             self._vt_elapsed_s += float(dt[i])
             scale = 1.0 if VT_RAMP_S <= 0 else min(1.0, self._vt_elapsed_s / VT_RAMP_S)
-            desired = x_s[i] + float(delta_n[i]) * scale * normal[i]
-            delta = desired - prev
+            delta = desired[i] - prev
             dist = float(np.linalg.norm(delta))
             allow = full * scale
-            if scale >= 1.0 and dist > full:
-                vt = prev.copy()
-                hit[i] = True
-            elif dist > allow and dist > 1e-12:
-                vt = prev + delta * (allow / dist)
+            if dist > allow and dist > 1e-12:
+                point = prev + delta * (allow / dist)
                 hit[i] = True
             else:
-                vt = desired
-            delta_n[i] = float(np.dot(vt - x_s[i], normal[i]))
-            x_d[i] = x_s[i] + delta_n[i] * normal[i]
-            prev = x_d[i].copy()
+                point = desired[i]
+            out[i] = point
+            delta_n[i] = float(np.dot(point - x_s[i], normal[i]))
+            prev = point.copy()
         self._cmd_vt = prev.copy()
-        return x_d, delta_n, hit
+        return out, delta_n, hit
 
     def decode_chunk(
         self,
@@ -1655,6 +1942,8 @@ class MoldAwareRuntime:
         self.last_foot_reanchor = np.zeros(H, dtype=bool)
         self.last_foot_cap = np.zeros(H, dtype=bool)
         self.last_ori_hold = np.zeros(H, dtype=bool)
+        raw_action = expand_r4_action(np.asarray(raw_action, dtype=np.float64))
+        H = raw_action.shape[0]
 
         if self.run_type == "r1_world_world":
             pos = raw_action[:, 0:3].astype(np.float64)
@@ -1729,7 +2018,12 @@ class MoldAwareRuntime:
             step_allow=label_step,
             reject_streak=self._reject_streak,
             R_tool=np.asarray(R0, dtype=np.float64).reshape(3, 3),
+            tcp_carry=self._cmd_tcp,
+            tcp_step=self._tcp_step,
         )
+        self._tcp_step = None
+        if "tcp_carry" in dec:
+            self._cmd_tcp = np.asarray(dec["tcp_carry"], dtype=np.float64).reshape(3).copy()
         self._hop_hold_streak = int(np.asarray(dec["hop_streak"]).reshape(-1)[0])
         self._reject_streak = int(np.asarray(dec["reject_streak"]).reshape(-1)[0])
         self.last_step_reject = np.asarray(dec["step_reject"], dtype=bool).reshape(H)
@@ -1831,7 +2125,7 @@ class MoldAwareRuntime:
         if apply_safety:
             held_vt = None if self._cmd_vt is None else np.asarray(self._cmd_vt, dtype=np.float64).reshape(3).copy()
             x_d, delta_n, step_hit = self._limit_commanded_vt(
-                x_s, n_out, delta_n, dt, p0
+                x_d, x_s, n_out, dt, p0
             )
             self.last_clamp_step = step_hit
             if np.any(step_hit):
@@ -1924,3 +2218,102 @@ class MoldAwareRuntime:
         target = Rp_to_SE3(r_d, x_s)
         vt = Rp_to_SE3(r_d, x_s + delta_n[:, None] * n)
         return target, vt
+
+
+def compliance_command(
+    nominal_se3: np.ndarray,
+    virtual_se3: np.ndarray,
+    stiffness,
+    measured_pose7: np.ndarray,
+    stiffness_floor: Optional[float] = None,
+    test_nominal_target: bool = False,
+    test_nominal_target_stiffness: float = -1.0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Scheduled pose and 6x6 stiffness for one arm.
+
+    Same assembly the runner used inline. The soft axis is the virtual target
+    minus the nominal pose, in the measured tool frame. Learned stiffness is
+    on that axis, 5000 N/m on the other two translations, 100 on rotation.
+    ``stiffness_floor`` is the ``UMIFT_STIFFNESS_FLOOR`` value (None leaves the
+    press gain unchanged). ``test_nominal_target`` schedules the nominal pose.
+    A positive ``test_nominal_target_stiffness`` replaces the translational block.
+    """
+    from PyriteEnvSuites.env_runners.stiffness_floor import apply_press_stiffness_floor
+    from PyriteUtility.spatial_math import spatial_utilities as su
+
+    nominal_se3 = np.asarray(nominal_se3).reshape(-1, 4, 4)
+    virtual_se3 = np.asarray(virtual_se3).reshape(-1, 4, 4)
+    measured_pose7 = np.asarray(measured_pose7).reshape(7)
+    n = int(virtual_se3.shape[0])
+    SE3_TW = su.SE3_inv(su.pose7_to_SE3(measured_pose7))
+    ts_targets_nominal = su.SE3_to_pose7(nominal_se3)
+    ts_targets_virtual = su.SE3_to_pose7(virtual_se3)
+
+    ts_stiffnesses = np.zeros([6, 6 * n])
+    raw_steps = []
+    floored_steps = []
+    for i in range(n):
+        SE3_target = nominal_se3[i].reshape([4, 4])
+        SE3_virtual_target = virtual_se3[i].reshape([4, 4])
+
+        # stiffness: 1. convert vt to tool frame
+        SE3_TVt = SE3_TW @ SE3_virtual_target
+        SE3_Ttarget = SE3_TW @ SE3_target
+
+        # stiffness: 2. compute stiffness matrix in the tool frame
+        compliance_direction_tool = (
+            SE3_TVt[:3, 3] - SE3_Ttarget[:3, 3]
+        ).reshape(3)
+
+        if np.linalg.norm(compliance_direction_tool) < 0.001:  #
+            compliance_direction_tool = np.array([1.0, 0.0, 0.0])
+
+        compliance_direction_tool /= np.linalg.norm(
+            compliance_direction_tool
+        )
+        X = compliance_direction_tool
+        Y = np.cross(X, np.array([0, 0, 1]))
+        Y /= np.linalg.norm(Y)
+        Z = np.cross(X, Y)
+
+        default_stiffness = 5000
+        default_stiffness_rot = 100
+        stiffness_matrix_full = np.eye(6) * default_stiffness_rot
+
+        if stiffness is None:
+            raw_k = default_stiffness
+        else:
+            raw_k = stiffness[i]
+        _, floored_k = apply_press_stiffness_floor(raw_k, stiffness_floor)
+        target_stiffness = float(floored_k[0])
+        raw_steps.append(float(np.asarray(raw_k, dtype=np.float64)))
+        floored_steps.append(target_stiffness)
+
+        M = np.diag(
+            [target_stiffness, default_stiffness, default_stiffness]
+        )
+        S = np.array([X, Y, Z]).T
+        stiffness_matrix = S @ M @ np.linalg.inv(S)
+        stiffness_matrix_full[:3, :3] = stiffness_matrix
+
+        if (
+            test_nominal_target
+            and test_nominal_target_stiffness > 0
+        ):
+            stiffness_matrix_full[:3, :3] = (
+                np.eye(3) * test_nominal_target_stiffness
+            )
+
+        ts_stiffnesses[:, 6 * i : 6 * i + 6] = stiffness_matrix_full
+
+    if test_nominal_target:
+        scheduled = ts_targets_nominal
+    else:
+        scheduled = ts_targets_virtual
+    return (
+        ts_targets_nominal,
+        scheduled,
+        ts_stiffnesses,
+        np.asarray(raw_steps, dtype=np.float64),
+        np.asarray(floored_steps, dtype=np.float64),
+    )

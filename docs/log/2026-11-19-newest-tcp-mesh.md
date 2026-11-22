@@ -2,7 +2,7 @@
 date: 2026-11-19
 stream: frame
 branch: smooth_frame
-commit: uncommitted
+commit: 861ecd2
 status: done
 artifacts:
   - /home/boeing/data/control_log/checkpoints_e-1_rollout0_1795077439

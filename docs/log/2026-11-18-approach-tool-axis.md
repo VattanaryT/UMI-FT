@@ -2,7 +2,7 @@
 date: 2026-11-18
 stream: frame
 branch: smooth_frame
-commit: uncommitted
+commit: 861ecd2
 status: done
 artifacts:
   - /home/boeing/data/control_log/gt_replay_ep40_1795065961
