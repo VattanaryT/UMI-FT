@@ -1,0 +1,25 @@
+{
+  "10ad6ae": {
+    "dec_ep0_safe_xs": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep0_safe_xd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep0_safe_Rd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep0_safe_triggers": "The ramp reports max_step. 10ad6ae aborted on commanded mesh distance. 6f11c15 matches frame_continuity.",
+    "dec_ep9_raw_xs": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. 6f11c15 matches frame_continuity.",
+    "dec_ep9_raw_xd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. 6f11c15 matches frame_continuity.",
+    "dec_ep9_raw_Rd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. 6f11c15 matches frame_continuity.",
+    "dec_ep9_safe_xs": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep9_safe_xd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep9_safe_Rd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep9_safe_triggers": "The ramp reports max_step. 10ad6ae aborted on commanded mesh distance. 6f11c15 matches frame_continuity.",
+    "dec_ep31_raw_xs": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. 6f11c15 matches frame_continuity.",
+    "dec_ep31_raw_xd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. 6f11c15 matches frame_continuity.",
+    "dec_ep31_raw_Rd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. 6f11c15 matches frame_continuity.",
+    "dec_ep31_safe_xs": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep31_safe_xd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep31_safe_Rd": "frame_continuity foot: TCP query, 10 mm first-foot cap, 5 degree face hold. Virtual-target ramp holds the step. 6f11c15 matches frame_continuity.",
+    "dec_ep31_safe_triggers": "The ramp reports max_step. 10ad6ae aborted on commanded mesh distance. 6f11c15 matches frame_continuity."
+  },
+  "smooth_frame": {"_skip": "not merged"},
+  "sim_harness": {"_skip": "not merged"},
+  "runner_causal_foot": {"_skip": "not merged"}
+}
