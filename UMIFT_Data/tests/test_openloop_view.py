@@ -170,14 +170,15 @@ def test_r4vt_labels_match_normal_offset_and_tool_rotation():
         f"episode 0 tangential VT offset median={offset['median_m']:.6f} m "
         f"max={offset['max_m']:.6f} m"
     )
-    runtime = ol.make_r4_runtime(FixBMoldField(FIELD), dry_run=False)
+    field = FixBMoldField(FIELD)
     idx = np.linspace(0, m - 1, 12).astype(int)
     normal_err = []
     parallel = []
     rot_err = []
     for i in idx:
+        # decode_chunk keeps the foot. A new runtime re-queries this label sample.
+        runtime = ol.make_r4_runtime(field, dry_run=False)
         action = ol.r4vt_action_row(v_par[i : i + 1], delta_n[i : i + 1], dR[i])
-        # Anchor on the label foot so R(x_s) is the frame ΔR was written in.
         dec = ol.decode_r4vt(runtime, action, x_s[i], R_tool[i], np.array([0.0]))
         lhs = float(ol.normal_offset(dec["x_d"], dec["x_s"], dec["n"])[0])
         rhs = float(np.sum((p_vt[i] - x_s[i]) * n[i]))
