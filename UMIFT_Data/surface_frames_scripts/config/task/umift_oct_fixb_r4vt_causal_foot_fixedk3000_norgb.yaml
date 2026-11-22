@@ -1,0 +1,10 @@
+# Fixed-k causal foot with wrist RGB removed from the policy observation.
+# raw.rgb_0 and sample.obs.sparse.rgb_0 stay, so the query clock and the
+# episode store match the camera run. F/T, TCP pose, and mold features stay.
+defaults:
+  - umift_oct_fixb_r4vt_causal_foot_fixedk3000
+  - _self_
+
+name: OCT-V35-FIXB-R4VT-CAUSAL-FOOT-FIXEDK3000-NORGB-10
+
+drop_rgb_inputs: true

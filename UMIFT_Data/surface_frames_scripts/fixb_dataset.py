@@ -361,12 +361,43 @@ def _pin_r4_10(sparse_normalizer, scale, offset, src, digest: str):
     return sparse_normalizer
 
 
+def _pin_action_dims(sparse_normalizer, scale, offset, src, digest: str, n: int, role: str):
+    """Replace every action dim from an n-d file. Does not change the 10-d pin."""
+    if scale.numel() != n or offset.numel() != n:
+        raise RuntimeError(f"{role} file action dim {scale.numel()}, expected {n}")
+    online = sparse_normalizer.params_dict["action"]["scale"].detach().float().cpu().reshape(-1)
+    if online.numel() != n:
+        raise RuntimeError(f"{role} online action dim {online.numel()}, expected {n}")
+    before = torch.max(torch.abs(online - scale)).item()
+    stats = {}
+    for key in ("min", "max", "mean", "std"):
+        values = src["input_stats"][key].detach().float().cpu().reshape(-1)
+        if values.numel() != n:
+            raise RuntimeError(f"{role} input_stats[{key}] dim {values.numel()}")
+        stats[key] = values.numpy()
+    sparse_normalizer["action"] = SingleFieldLinearNormalizer.create_manual(
+        scale=scale.numpy(),
+        offset=offset.numpy(),
+        input_stats_dict=stats,
+    )
+    got = sparse_normalizer.params_dict["action"]["scale"].detach().float().cpu().reshape(-1)
+    if torch.max(torch.abs(got - scale)).item() != 0:
+        raise RuntimeError(f"{role} scale mismatch after pin")
+    print(
+        f"[shared-normalizer] role={role} sha256={digest[:12]} "
+        f"online_vs_file_max|scale|_before_pin={before:.3g} "
+        f"δn scale={float(scale[2]):.6g} offset={float(offset[2]):.6g}"
+    )
+    return sparse_normalizer
+
+
 def apply_shared_action_normalizer(sparse_normalizer, path: str, sha256: str, role: str):
     """Pin a versioned r2/r4 action normalizer.
 
     role r2: replace all 21 action dims.
     role r4: dims 0:21 from the file, dims 21:27 identity (ΔR).
     role r4_10: replace all 10 dims, including ΔR.
+    role r4_heading8: replace all 8 dims (v1, v2, δn, stiffness, sin ψ, cos ψ, a, b).
     role r1: dims 18:21 only (stiffness, gripper, grasp force). Pose dims 0:18
     stay the online r1 fit.
     """
@@ -383,6 +414,8 @@ def apply_shared_action_normalizer(sparse_normalizer, path: str, sha256: str, ro
     o = src["offset"].detach().float().cpu().reshape(-1)
     if role == "r4_10":
         return _pin_r4_10(sparse_normalizer, s, o, src, digest)
+    if role == "r4_heading8":
+        return _pin_action_dims(sparse_normalizer, s, o, src, digest, 8, "r4_heading8")
     if s.numel() != 21 or o.numel() != 21:
         raise RuntimeError(f"shared normalizer action dim {s.numel()}, expected 21")
     dst = sparse_normalizer.params_dict["action"]
