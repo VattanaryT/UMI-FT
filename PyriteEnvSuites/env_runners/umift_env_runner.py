@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -230,17 +231,38 @@ def _segment_inside_safe_zone(start_xyz, goal_xyz, safe_zone, n: int = 25) -> bo
     return True
 
 
+def _camera_poses_clear(poses_base, T_fixture_from_base, normal, offset) -> bool:
+    """True when every D405 housing corner stays above the flange plane."""
+    if normal is None:
+        return True
+    from fixb_labels import pose7_to_Rp
+    from mold_aware_runtime import CAM_TABLE_MARGIN_M, d405_housing_corners_in_tcp
+
+    T = np.asarray(T_fixture_from_base, dtype=np.float64).reshape(4, 4)
+    R, p = pose7_to_Rp(np.asarray(poses_base, dtype=np.float64).reshape(-1, 7))
+    Rf = np.einsum("ij,njk->nik", T[:3, :3], R)
+    pf = (T[:3, :3] @ p.T).T + T[:3, 3]
+    corners = d405_housing_corners_in_tcp()
+    pts = np.einsum("nij,kj->nki", Rf, corners) + pf[:, None, :]
+    clearance = float(offset) - np.einsum("nki,i->nk", pts, np.asarray(normal, dtype=np.float64))
+    return bool(np.all(clearance >= CAM_TABLE_MARGIN_M))
+
+
 def approach_start_pose(
     env,
     start_pose7: np.ndarray,
     field,
     T_fixture_from_base: np.ndarray,
     hardware_config_path: str,
+    table_normal=None,
+    table_offset=None,
 ) -> bool:
-    """Move to 5 cm above the start along the mold normal, then down to it.
+    """Move to 5 cm back along the tool axis, then straight down that axis.
 
-    Both waits are on the caller. Returns False when the pose is unreachable
-    or outside the workcell, without moving.
+    The hover used to be 5 cm along the mold normal. On the smooth field that
+    normal points into the mold, so the descent started inside the part.
+    Both waits are on the caller. Returns False without moving when the pose
+    is unreachable, outside the workcell, or a D405 corner meets the flange.
     """
     start = np.asarray(start_pose7, dtype=np.float64).reshape(7)
     start_fix = pose7_change_frame(start, T_fixture_from_base)
@@ -251,9 +273,12 @@ def approach_start_pose(
             f"[approach] Start is {sd * 1e3:.0f} mm from the mold. Not moving."
         )
         return False
-    normal = np.asarray(queried["R"], dtype=np.float64).reshape(3, 3)[:, 2]
+    from fixb_labels import pose7_to_Rp
+
+    tool_R, _ = pose7_to_Rp(start_fix.reshape(1, 7))
+    tool_z = np.asarray(tool_R, dtype=np.float64).reshape(3, 3)[:, 2]
     hover_fix = start_fix.copy()
-    hover_fix[:3] = start_fix[:3] + APPROACH_HOVER_M * normal
+    hover_fix[:3] = start_fix[:3] - APPROACH_HOVER_M * tool_z
     hover = pose7_change_frame(hover_fix, np.linalg.inv(T_fixture_from_base))
     safe_zone = read_cartesian_safe_zone(hardware_config_path)
     if safe_zone is None:
@@ -271,9 +296,14 @@ def approach_start_pose(
     if not _segment_inside_safe_zone(hover[:3], start[:3], safe_zone):
         print_red("[approach] The descent leaves the safe zone. Not moving.")
         return False
+    to_hover = su.pose7_interp(current, hover, np.linspace(0.0, 1.0, 25))
+    descent = su.pose7_interp(hover, start, np.linspace(0.0, 1.0, 25))
+    if not _camera_poses_clear(np.vstack([to_hover, descent]), T_fixture_from_base, table_normal, table_offset):
+        print_red("[approach] A D405 corner meets the flange on this path. Not moving.")
+        return False
     print(
-        "[approach] moveL to 5 cm above the start along the mold normal, "
-        f"at most {APPROACH_SPEED_MPS * 100:.0f} cm/s."
+        "[approach] moveL to 5 cm back along the tool axis, "
+        f"at most {APPROACH_SPEED_MPS * 100:.0f} cm/s, then straight down that axis."
     )
     try:
         _slow_move_l(env, hover)
@@ -968,6 +998,18 @@ def log_horizon(
         "timestamps_s",
         data=timestamps[:exe] + action_start_time_s,
     )
+    for src, name in (
+        ("_mold_cmd_v", "v_par"),
+        ("_mold_cmd_dn", "delta_n"),
+        ("_mold_cmd_foot", "foot"),
+    ):
+        if src in obs_raw and obs_raw[src] is not None:
+            action_log.create_dataset(name, data=np.asarray(obs_raw[src])[:exe])
+    for key in ("wrench_left_0", "wrench_0"):
+        if key in obs_raw:
+            wrench = np.asarray(obs_raw[key][-1], dtype=np.float64).reshape(-1)
+            action_log.create_dataset("wrench", data=wrench[:6])
+            break
 
     obs_policy_group = horizon_log.create_group("obs_policy")
     obs_sampled = controller.sample_sparse_obs(obs_task["obs"])
@@ -1000,6 +1042,51 @@ def log_horizon(
         )
         if log_policy_vision:
             log_raw_vision_to_obs_inference(obs_inference, obs_raw, robot_id)
+
+
+def print_loaded_action_normalizer(policy) -> None:
+    """Print the action normalizer stored in the checkpoint, and compare a pickle."""
+    params = policy.sparse_normalizer.params_dict["action"]
+    scale = params["scale"].detach().float().cpu().numpy().reshape(-1)
+    offset = params["offset"].detach().float().cpu().numpy().reshape(-1)
+    blob = np.concatenate([scale, offset]).astype(np.float64).tobytes()
+    digest = hashlib.sha256(blob).hexdigest()
+    print(
+        f"[normalizer] ckpt action dim {scale.size} "
+        f"scale[:3]={np.array2string(scale[:3], precision=4)} "
+        f"offset[:3]={np.array2string(offset[:3], precision=4)} "
+        f"scale_offset_sha {digest[:16]}"
+    )
+    expect = os.environ.get("UMIFT_ACTION_NORMALIZER", "").strip()
+    if not expect:
+        return
+    path = Path(expect)
+    expect_sha = os.environ.get("UMIFT_ACTION_NORMALIZER_SHA", "").strip()
+    file_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    with path.open("rb") as handle:
+        saved = pickle.load(handle)
+    src = saved.params_dict["action"]
+    file_scale = src["scale"].detach().float().cpu().numpy().reshape(-1)
+    file_offset = src["offset"].detach().float().cpu().numpy().reshape(-1)
+    if file_scale.size == 21 and scale.size == 27:
+        # r4 pin: the pickle is the 21 shared dims. ΔR stays identity.
+        match = (
+            np.allclose(file_scale, scale[:21])
+            and np.allclose(file_offset, offset[:21])
+            and np.allclose(scale[21:], 1.0)
+            and np.allclose(offset[21:], 0.0)
+        )
+    else:
+        match = (
+            file_scale.shape == scale.shape
+            and np.allclose(file_scale, scale)
+            and np.allclose(file_offset, offset)
+        )
+    sha_ok = (not expect_sha) or file_sha == expect_sha
+    print(
+        f"[normalizer] file {path.name} sha {file_sha} "
+        f"sha_ok={sha_ok} matches_ckpt={match}"
+    )
 
 
 def main():
@@ -1085,6 +1172,8 @@ def main():
         "record_rollout_cameras": True,
         "orbbec_v4l_device": DEFAULT_ORBBEC_V4L,
     }
+    if os.environ.get("UMIFT_MAX_DURATION_S", "").strip():
+        control_para["max_duration_s"] = float(os.environ["UMIFT_MAX_DURATION_S"])
     pipeline_para = {
         # Layup: D405 rgb (manip_server) + depth (pyrealsense2) + UR5e wrist FT.
         "use_layup_env": True,
@@ -1165,8 +1254,10 @@ def main():
         checkpoint_folder_path + pipeline_para["ckpt_path"]
     )
     print("Loading policy: ", ckpt_full_path)
+    print(f"[rollout] max_duration_s={control_para['max_duration_s']}")
     device = torch.device(control_para["device"])
     policy, shape_meta = load_policy(str(ckpt_full_path), device)
+    print_loaded_action_normalizer(policy)
 
     # Mold-aware / Fix B: detect run type from checkpoint task name.
     mold_runtime = None
@@ -1195,6 +1286,7 @@ def main():
         from mold_aware_runtime import (
             FixBActionEnsembler,
             MoldAwareRuntime,
+            camera_table_from_flange,
             fixb_decode_dt,
             infer_run_type,
             r4_safety_limits,
@@ -1230,6 +1322,10 @@ def main():
             limits=r4_limits,
         )
         mold_T_fixture_from_base = load_workcell_extrinsics().T_fixture_from_right_base
+        _cam_n, _cam_off, _cam_base_y = camera_table_from_flange(
+            Path(control_para["mold_aware_field_npz"]), mold_T_fixture_from_base
+        )
+        mold_runtime.set_table_plane(_cam_n, _cam_off)
         # Depth stays at set_depth_to_zero (default True). These policies have a
         # depth input, but inference feeds zeros and does not open the depth stream.
         control_para["periodic_scan_enabled"] = False
@@ -1239,10 +1335,46 @@ def main():
             f"[mold] enabled run_type={mold_run_type} dry_run={mold_runtime.dry_run} "
             f"field={control_para['mold_aware_field_npz']}"
         )
+        _side = Path(control_para["mold_aware_field_npz"]).with_name(
+            "fixb_smooth_frames.npz"
+        )
+        _field = mold_runtime.field
+        print(
+            f"[mold] field_class={type(_field).__name__} "
+            f"orientation_z_inward={bool(getattr(_field, 'orientation_z_inward', False))} "
+            f"sidecar={_side} exists={_side.is_file()}"
+        )
         if r4vt:
             from jump_guard import MAX_CONSECUTIVE_HOLDS, MAX_STEP_DEG, MAX_STEP_MM, TargetJumpGuard
 
             r4_jump_guard = TargetJumpGuard()
+            from fixb_tcp_track import GATE_M
+            from mold_aware_runtime import (
+                CAM_TABLE_MARGIN_M,
+                HOP_HOLD_LIMIT,
+                ORI_LABEL_HOLD_DEG,
+                RD_SLEW_AFTER_RAMP_DEG,
+                VT_RAMP_S,
+            )
+
+            print(
+                f"[mold] first-step limits: rd_slew="
+                f"{mold_runtime.limits.enable_rd_slew} "
+                f"{mold_runtime.limits.max_rd_slew_deg:.0f} deg/step for {VT_RAMP_S:.0f}s "
+                f"then {RD_SLEW_AFTER_RAMP_DEG:.0f} deg/step, "
+                f"start foot=mesh closest point, "
+                f"every step=label tracker within {GATE_M * 1000:.0f} mm, "
+                f"press-axis re-anchor after {HOP_HOLD_LIMIT} rejects, "
+                f"camera table=flange edge at base Y {_cam_base_y * 1000:.1f} mm, "
+                f"camera margin={CAM_TABLE_MARGIN_M * 1000:.0f} mm, "
+                f"replay orientation hold={ORI_LABEL_HOLD_DEG:.0f} deg, "
+                f"mesh limit={mold_runtime.limits.max_distance_from_mesh_m * 1000:.0f} mm, "
+                f"foot step=label tracker, "
+                f"face_hold="
+                f"{'off' if getattr(_field, 'orientation_z_inward', False) else 'on'}, "
+                f"vt_ramp={VT_RAMP_S:.0f} s, "
+                f"max_step_hold={mold_runtime.limits.max_step_m * 1000:.0f} mm"
+            )
             print(
                 f"[mold] r4vt action blend, "
                 f"dn_floor={mold_runtime.limits.enable_delta_n_floor} "
@@ -1777,6 +1909,7 @@ def main():
             gt_replay.reset()
         if r4_jump_guard is not None:
             r4_jump_guard.reset()
+        approach_logged = False
         if r4vt:
             if gt_replay is not None and mold_T_fixture_from_base is not None:
                 from mold_aware_runtime import shift_fixture_up
@@ -1802,13 +1935,20 @@ def main():
             pose_txt = " ".join(f"{float(v):.5f}" for v in np.asarray(start_base).reshape(7))
             print(f"[r4vt] start pose (right_base, {pose_note}): {pose_txt}")
             approached = False
+            approach_logged = False
             if mold_runtime is not None and mold_T_fixture_from_base is not None:
+                # The descent is open-loop. Start the episode log first so the
+                # bump, if there is one, is in robot_data.
+                env.start_saving_data_for_a_new_episode()
+                approach_logged = True
                 approached = approach_start_pose(
                     env,
                     start_base,
                     mold_runtime.field,
                     mold_T_fixture_from_base,
                     pipeline_para["hardware_config_path"],
+                    table_normal=mold_runtime._table_normal,
+                    table_offset=mold_runtime._table_offset,
                 )
             if approached:
                 input("At the start pose. Press Enter to begin.")
@@ -1846,7 +1986,8 @@ def main():
             input("Press Enter to start the episode.")
 
         # env.start_saving_data_for_a_new_episode(pipeline_para["episode_data_save_path"])
-        env.start_saving_data_for_a_new_episode()
+        if not (r4vt and approach_logged):
+            env.start_saving_data_for_a_new_episode()
 
         log = None
         horizon_count = 0
@@ -2242,7 +2383,22 @@ def main():
                         * control_para["slow_down_factor"],
                         dtype=np.float64,
                     )
-                decoded = mold_runtime.decode_chunk(raw_a, p0[0], R0[0], dt)
+                label_R = None
+                if gt_replay is not None and r4vt:
+                    from mold_aware_runtime import ORI_LABEL_HOLD_DEG
+
+                    label_idx = np.asarray(
+                        gt_replay.windows[gt_replay.k][: raw_a.shape[0]]
+                    )
+                    label_R, _label_p = _pose7_to_Rp(gt_replay.demo[label_idx])
+                decoded = mold_runtime.decode_chunk(
+                    raw_a, p0[0], R0[0], dt, label_R=label_R
+                )
+                if label_R is not None and np.any(decoded["ori_hold"]):
+                    print_yellow(
+                        f"[mold][hold] orientation > {ORI_LABEL_HOLD_DEG:.0f} deg "
+                        f"from the label on {int(np.sum(decoded['ori_hold']))} steps"
+                    )
                 R_d_fixture = np.asarray(decoded["R_d"], dtype=np.float64).copy()
                 # Fixture +Y is down. Lift the commanded foot and the virtual
                 # target along −Y so a free-space bench stays off the table.
@@ -2291,6 +2447,15 @@ def main():
                     mj = decoded.get("mesh_jump_hold")
                     if mj is not None and bool(mj[i]):
                         flags.append("mesh_jump_hold")
+                    hop = decoded.get("hop_hold")
+                    if hop is not None and bool(hop[i]):
+                        flags.append("hop_hold")
+                    cap = decoded.get("foot_cap")
+                    if cap is not None and bool(cap[i]):
+                        flags.append("foot_cap")
+                    reanchor = decoded.get("foot_reanchor")
+                    if reanchor is not None and bool(reanchor[i]):
+                        flags.append("reanchor")
                     ep_n_action_steps += 1
                     if flags:
                         ep_n_clamp_steps += 1
@@ -2391,6 +2556,9 @@ def main():
                 action_sparse_vt_mats = [vt]
                 action_stiffnesses = [decoded["stiffness"]]
                 action_eoat = [decoded["eoat"]]
+                obs_raw["_mold_cmd_v"] = np.asarray(decoded["v_par"], dtype=np.float64)
+                obs_raw["_mold_cmd_dn"] = np.asarray(decoded["delta_n"], dtype=np.float64)
+                obs_raw["_mold_cmd_foot"] = np.asarray(decoded["x_s"], dtype=np.float64)
                 # stash for control log
                 obs_raw["_mold_decode_x_d"] = decoded["x_d"]
                 obs_raw["_mold_decode_x_s"] = decoded["x_s"]

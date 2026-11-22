@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "surface_frames_scripts"
@@ -63,7 +64,58 @@ def test_equal_prediction_is_zero_error():
     table = ol.episode_error_table(pred, label, force, bad, long, valid)
     for dim, groups in table["mae"].items():
         for group, value in groups.items():
-            assert value == 0.0, (dim, group, value)
+            if group == "return_yaw":
+                assert value is None, (dim, group, value)
+            else:
+                assert value == 0.0, (dim, group, value)
+    assert table["n"]["near_identity"] == 8
+    assert table["n"]["return_yaw"] == 0
+
+
+def test_delta_r_modes_follow_the_label():
+    eye = np.eye(3)
+    yaw = np.diag([-1.0, -1.0, 1.0])
+    label = np.zeros((2, 27))
+    pred = np.zeros((2, 27))
+    label[0, 21:27] = ol.rot6d_of_rotation(eye)
+    label[1, 21:27] = ol.rot6d_of_rotation(yaw)
+    pred[0, 21:27] = label[0, 21:27]
+    pred[1, 21:27] = ol.rot6d_of_rotation(eye)
+    valid = np.ones(2, dtype=bool)
+    zeros = np.zeros(2, dtype=np.float64)
+    table = ol.episode_error_table(pred, label, zeros, zeros.astype(bool), zeros.astype(bool), valid)
+    assert table["n"]["near_identity"] == 1
+    assert table["n"]["return_yaw"] == 1
+    assert table["mae"]["delta_R_deg"]["near_identity"] == 0.0
+    got = table["mae"]["delta_R_deg"]["return_yaw"]
+    assert abs(got - 180.0) < 1e-4
+
+
+def test_horizon_error_keeps_the_tail_out_of_the_exec_window():
+    width = 8
+    horizon = 6
+    label = np.zeros((1, width, 27))
+    pred = np.zeros((1, width, 27))
+    eye = np.eye(3)
+    yaw = np.diag([-1.0, -1.0, 1.0])
+    for k in range(horizon):
+        label[0, k, 21:27] = ol.rot6d_of_rotation(eye)
+        pred[0, k, 21:27] = ol.rot6d_of_rotation(eye)
+    for k in range(horizon, width):
+        label[0, k, 21:27] = ol.rot6d_of_rotation(yaw)
+        pred[0, k, 21:27] = ol.rot6d_of_rotation(eye)
+        pred[0, k, 2] = 0.01
+    pred_pos = np.zeros((1, width, 3))
+    label_pos = np.zeros((1, width, 3))
+    label_pos[0, horizon:, 0] = 0.01
+    table = ol.chunk_horizon_errors(pred, label, pred_pos, label_pos, np.array([width]), horizon)
+    assert table["horizon"] == horizon
+    assert table["exec"]["position_mm"]["all"] == 0.0
+    assert table["exec"]["delta_R_deg"]["near_identity"] == 0.0
+    assert table["exec"]["delta_R_deg"]["return_yaw"] is None
+    assert abs(table["full"]["position_mm"]["all"] - 2.5) < 1e-6
+    assert abs(table["full"]["delta_R_deg"]["return_yaw"] - 180.0) < 1e-4
+    assert abs(table["full"]["delta_n"]["return_yaw"] - 0.01) < 1e-9
 
 
 def test_delta_r_is_geodesic_not_rot6d_difference():
@@ -208,6 +260,27 @@ def test_viewer_reads_r4vt_export():
     assert val["runs"][0]["error"]["n"]["valid"] > 0
 
 
+def test_span_toggle_changes_the_drawn_chunk():
+    import numpy as np
+    from view_openloop import cursor_payload, episode_payload, load_export
+
+    loaded = load_export(Path("/mnt/data/umidata/ft/open_loop_exports/r4vt_e66520fae9ae"))
+    run = episode_payload([loaded], 0)["runs"][0]
+    assert len(run["pred_full"]) > len(run["pred_exec"])
+    assert run["ckpt"]
+    assert run["epoch"] == 185
+    blob = loaded["episodes"][0]
+    query = int(np.argmax(blob["n_valid"]))
+    short = cursor_payload([loaded], 0, query, span="exec")["runs"][0]
+    long = cursor_payload([loaded], 0, query, span="full")["runs"][0]
+    assert len(long["future"]) > len(short["future"])
+    assert len(short["future"]) == 6
+    assert len(short["future_R"]) == len(short["future"])
+    assert len(long["future_R"]) == len(long["future"])
+    assert len(long["label_R"]) == len(long["label_xyz"])
+    assert len(long["label_xyz"]) > len(short["future"])
+
+
 def test_frames_overlay_is_off_unless_asked():
     from view_openloop import cursor_payload, episode_payload, load_export, load_frames_npz
 
@@ -269,3 +342,86 @@ def test_frames_only_episode_and_switch_time():
     assert payload["frames"]["dR_old"]
     cursor = cursor_payload([], 4, payload["path_i"][0], frames=frames)
     assert cursor["frame"]["x_new"]
+
+
+def test_region_bins_match_the_tilt_split():
+    up = np.array([[0.0, -1.0, 0.0]])
+    fillet = Rotation.from_rotvec([np.radians(40.0), 0.0, 0.0]).apply(up)
+    wall = Rotation.from_rotvec([np.radians(70.0), 0.0, 0.0]).apply(up)
+    codes = ol.region_code(np.vstack([up, fillet, wall]))
+    assert list(codes) == [0, 1, 2]
+    assert ol.REGION_NAMES == ("crown", "fillet", "wall")
+
+
+def test_region_errors_follow_the_query_label_foot():
+    pred = np.zeros((2, 4, 27))
+    label = np.zeros((2, 4, 27))
+    eye = ol.rot6d_of_rotation(np.eye(3))
+    pred[:, :, 21:27] = eye
+    label[:, :, 21:27] = eye
+    pred[0, :, 2] = 0.01
+    pred[1, :, 2] = -0.03
+    yaw = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])
+    pred[1, :, 21:27] = ol.rot6d_of_rotation(yaw)
+    table = ol.region_action_errors(pred, label, np.array([4, 4]), np.array([0, 2]), horizon=6)
+    assert table["exec"]["crown"]["delta_n_mm"] == 10.0
+    assert table["exec"]["wall"]["delta_n_mm"] == 30.0
+    assert table["exec"]["fillet"]["n"] == 0
+    assert table["full"]["wall"]["delta_R_deg"] == 90.0
+    assert table["exec"]["crown"]["n"] == 4
+
+
+def test_label_virtual_target_is_the_foot_plus_delta_n():
+    from view_openloop import checkpoint_label, label_virtual_target, PAGE
+
+    foot = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]])
+    normal = np.array([[0.0, -1.0, 0.0], [0.0, 0.0, 1.0]])
+    got = label_virtual_target(foot, normal, np.array([0.02, -0.01]))
+    assert np.allclose(got[0], [0.0, -0.02, 0.0])
+    assert np.allclose(got[1], [1.0, 0.0, -0.01])
+    marked = checkpoint_label({"role": "r1rel", "checkpoint_epoch": 195, "val_loss": 0.152}, "r1rel")
+    assert "tool pose" in marked
+    assert "tool pose" not in checkpoint_label({"role": "r4vt", "checkpoint_epoch": 55, "val_loss": 0.030}, "r4vt")
+    assert 'id="geomFoot"' in PAGE
+    assert 'id="onlySel"' in PAGE
+    assert "dnSegments" in PAGE
+    from view_openloop import foot_path_breaks
+    gap = foot_path_breaks([0, 2, 4, 20], [False, False, False, False])
+    assert list(gap) == [False, False, True, False]
+    flagged = foot_path_breaks([0, 2, 4], [False, True, False])
+    assert list(flagged) == [True, True, False]
+    from view_openloop import table_keep
+    order = table_keep(np.array([0.3, 0.0, 0.2, 0.1]), {"query_stride": 1})
+    assert list(order) == [1]
+    kept = table_keep(np.array([0.0, 0.1, 0.2, 0.3]), {"query_stride": 4})
+    assert list(kept) == [0, 1, 2, 3]
+
+
+def test_openloop_page_has_region_filter():
+    from view_openloop import PAGE
+
+    assert 'id="regFillet"' in PAGE
+    assert 'id="regWall"' in PAGE
+    assert "regionFilter" in PAGE
+
+
+def test_saved_export_region_uses_the_label_foot_normal():
+    zarr = pytest.importorskip("zarr")
+    export = Path(
+        "/mnt/data/umidata/ft/open_loop_exports/r4vt_smooth_e0030_43335222_release/episode_0.npz"
+    )
+    dataset = Path(
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/"
+        "r4vt_smooth_frame/acp_replay_buffer.zarr"
+    )
+    if not export.is_file() or not dataset.is_dir():
+        pytest.skip("released smooth export is not on this machine")
+    from view_openloop import query_region_names
+
+    blob = np.load(export)
+    names = query_region_names(blob, 0, str(dataset))
+    idx = ol.query_anchor_index(blob["query_rgb_idx"], blob["robot_time_s"], blob["rgb_time_s"])
+    normal = np.asarray(zarr.open(str(dataset), "r")["data"]["episode_0"]["mold_normal_0"])
+    codes = ol.region_code(normal[idx])
+    assert names[0] == ol.REGION_NAMES[int(codes[0])]
+    assert set(names) <= set(ol.REGION_NAMES)

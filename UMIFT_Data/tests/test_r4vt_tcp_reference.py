@@ -15,6 +15,7 @@ from mold_aware_runtime import (  # noqa: E402
     FOOT_CAP_M,
     VT_RAMP_S,
     MoldAwareRuntime,
+    d405_housing_corners_in_tcp,
     r4_safety_limits,
     shift_fixture_up,
 )
@@ -162,32 +163,159 @@ def test_episode0_nominal_tracks_tcp_foot():
     assert press > 10
 
 
-def test_foot_cannot_ratchet_more_than_10mm_per_replan_without_contact():
-    """A hovering TCP and a fast tangent command cannot walk the foot."""
+def test_v_par_leads_along_the_mesh_and_stops_at_the_tcp_gate():
+    """A fast slide keeps going past 6 mm and stops at the 20 mm lead."""
+    from fixb_tcp_track import GATE_M
+    from mold_aware_runtime import LEAD_M
+
     runtime = _runtime()
-    hover = np.array([0.0, 0.0, 0.03])
-    action = _action(0.0, steps=4)
-    action[:, 0] = 1.0
-    first = runtime.decode_chunk(
-        action, hover, np.eye(3), np.full(4, 1.0 / 15.0), apply_safety=False
+    steps = 8
+    action = _action(0.0, steps=steps)
+    action[:, 0] = 0.5
+    tcp = np.zeros(3)
+    decoded = runtime.decode_chunk(
+        action, tcp, np.eye(3), np.full(steps, 1.0 / 15.0), apply_safety=False
     )
-    steps = np.linalg.norm(np.diff(first["x_s"], axis=0), axis=1)
-    assert np.all(steps <= FOOT_CAP_M + 1e-9)
-    assert np.allclose(first["x_s"], 0.0)
+    gap = np.linalg.norm(decoded["x_s"] - tcp, axis=1)
+    moved = np.linalg.norm(np.diff(decoded["x_s"], axis=0), axis=1)
+    assert decoded["x_s"][0, 0] == pytest.approx(0.0)
+    assert decoded["x_s"][1, 0] == pytest.approx(GATE_M, abs=1e-4)
+    assert decoded["x_s"][2, 0] == pytest.approx(2 * GATE_M, abs=1e-4)
+    assert np.all(decoded["x_s"][:, 1] == pytest.approx(0.0, abs=1e-8))
+    assert np.all(moved <= GATE_M + 1e-4)
+    assert gap.max() == pytest.approx(LEAD_M, abs=1e-4)
+    assert gap[-1] == pytest.approx(LEAD_M, abs=1e-4)
 
-    jumped = np.array([0.08, 0.0, 0.03])
-    second = runtime.decode_chunk(
-        _action(0.0), jumped, np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
-    )
-    hop = np.linalg.norm(second["x_s"][0] - first["x_s"][-1])
-    assert hop <= FOOT_CAP_M + 1e-9
 
-    near = np.array([0.005, 0.0, 0.03])
-    third = runtime.decode_chunk(
-        _action(0.0), near, np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+def test_fast_20mm_tcp_step_is_limited_by_the_label_gate():
+    """A 20 mm lead is allowed. The foot does not hop to that TCP."""
+    runtime = _runtime()
+    runtime.decode_chunk(
+        _action(0.0), np.zeros(3), np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
     )
-    assert np.linalg.norm(third["x_s"][0] - second["x_s"][0]) <= FOOT_CAP_M + 1e-9
-    assert np.allclose(third["x_s"][0], [0.005, 0.0, 0.0])
+    steps = 4
+    decoded = runtime.decode_chunk(
+        _action(0.0, steps=steps),
+        np.array([0.020, 0.0, 0.02]),
+        np.eye(3),
+        np.full(steps, 1.0 / 15.0),
+        apply_safety=False,
+    )
+    assert np.allclose(decoded["x_s"], 0.0, atol=1e-6)
+    assert not np.allclose(decoded["x_s"][0], [0.020, 0.0, 0.0])
+
+
+def _frame_at_angle(angle_deg: float) -> np.ndarray:
+    angle = np.deg2rad(angle_deg)
+    outward = np.array([0.0, -np.cos(angle), np.sin(angle)])
+    z_col = -outward
+    t1 = np.array([1.0, 0.0, 0.0])
+    t2 = np.cross(z_col, t1)
+    return np.column_stack([t1, t2, z_col])
+
+
+def test_uphill_v_par_takes_the_chord_that_clears_the_fillet(monkeypatch):
+    """A 2 mm piece stays on the wall. The 8 mm chord lands on the fillet."""
+    from mold_aware_runtime import integrate_tcp_foot
+
+    class _Fillet:
+        def query(self, p):
+            points = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+            frames = np.stack([
+                _frame_at_angle(60.0 if point[0] < 0.008 else 30.0) for point in points
+            ])
+            return {"x_s": points.copy(), "R": frames, "sd": np.zeros(len(points))}
+
+    v = np.array([[0.02, 0.0], [0.02, 0.0]])
+    dt = np.full(2, 1.0 / 15.0)
+    held = integrate_tcp_foot(_Fillet(), np.zeros(3), v, np.zeros(2), dt)
+    assert held["x_s"][1, 0] == pytest.approx(0.02 / 15.0, abs=1e-6)
+    monkeypatch.setenv("UMIFT_FOOT_CLIMB", "1")
+    decoded = integrate_tcp_foot(_Fillet(), np.zeros(3), v, np.zeros(2), dt)
+    assert decoded["x_s"][0, 0] == pytest.approx(0.0)
+    # The short step lands first. The chord is 8 mm from there.
+    assert decoded["x_s"][1, 0] == pytest.approx(0.02 / 15.0 + 0.008, abs=1e-6)
+
+
+def test_climb_does_not_hop_to_the_other_sheet(monkeypatch):
+    """A chord whose normal has flipped is refused. The short step stands."""
+    from mold_aware_runtime import integrate_tcp_foot
+
+    monkeypatch.setenv("UMIFT_FOOT_CLIMB", "1")
+
+    class _Flip:
+        def query(self, p):
+            points = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+            frames = np.stack([
+                _frame_at_angle(60.0 if point[0] < 0.008 else 170.0) for point in points
+            ])
+            return {"x_s": points.copy(), "R": frames, "sd": np.zeros(len(points))}
+
+    decoded = integrate_tcp_foot(
+        _Flip(),
+        np.zeros(3),
+        np.array([[0.02, 0.0], [0.02, 0.0]]),
+        np.zeros(2),
+        np.full(2, 1.0 / 15.0),
+    )
+    assert decoded["x_s"][1, 0] == pytest.approx(0.02 / 15.0, abs=1e-6)
+
+
+def test_geodesic_walk_follows_the_folded_surface(monkeypatch):
+    """A step off the first triangle continues on the next one, not through space."""
+    from fixb_field import orthonormal_frames
+    from mold_aware_runtime import integrate_tcp_foot
+
+    monkeypatch.setenv("UMIFT_FOOT_WALK", "geodesic")
+
+    class _Fold:
+        def __init__(self):
+            self.vertices = np.array(
+                [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 0.0, 1.0]]
+            )
+            self.faces = np.array([[0, 1, 2], [1, 3, 2]], dtype=np.int64)
+            flat = orthonormal_frames(np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+            wall = orthonormal_frames(np.array([0.0, 0.0, 1.0]), np.array([-1.0, 0.0, 0.0]))
+            self.frames = np.stack([flat, flat, flat, wall])
+
+        def query(self, p):
+            points = np.asarray(p, dtype=np.float64).reshape(-1, 3)
+            frame = orthonormal_frames(np.array([1.0, 0.0, 0.0]), np.array([0.0, 0.0, 1.0]))
+            frames = np.broadcast_to(frame, (len(points), 3, 3)).copy()
+            return {"x_s": points.copy(), "R": frames, "sd": np.zeros(len(points))}
+
+    decoded = integrate_tcp_foot(
+        _Fold(),
+        np.array([0.5, 0.2, 0.0]),
+        np.array([[12.0, 0.0], [12.0, 0.0]]),
+        np.zeros(2),
+        np.full(2, 1.0 / 15.0),
+    )
+    assert decoded["x_s"][0] == pytest.approx([0.5, 0.2, 0.0], abs=1e-6)
+    assert decoded["x_s"][1] == pytest.approx([1.0, 0.2, 0.3], abs=1e-5)
+
+
+def test_a_far_tcp_is_approached_one_gate_at_a_time():
+    """A TCP 80 mm away is walked toward. The foot does not jump to it."""
+    from fixb_tcp_track import GATE_M
+    from mold_aware_runtime import HOP_HOLD_LIMIT
+
+    runtime = _runtime()
+    runtime.decode_chunk(
+        _action(0.0), np.zeros(3), np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+    )
+    steps = HOP_HOLD_LIMIT + 1
+    decoded = runtime.decode_chunk(
+        _action(0.0, steps=steps),
+        np.array([0.08, 0.0, 0.03]),
+        np.eye(3),
+        np.full(steps, 1.0 / 15.0),
+        apply_safety=False,
+    )
+    moved = np.linalg.norm(np.diff(np.vstack([np.zeros(3), decoded["x_s"]]), axis=0), axis=1)
+    assert np.all(moved <= GATE_M + 1e-6)
+    assert decoded["x_s"][-1, 0] == pytest.approx(GATE_M * steps, abs=1e-6)
+    assert not np.any(decoded["foot_reanchor"])
 
 
 def test_rd_slew_caps_three_degrees_across_replans():
@@ -218,15 +346,17 @@ def test_rd_slew_caps_three_degrees_across_replans():
 
 def test_face_hold_keeps_frame_and_command_past_five_degrees():
     class _Tilted(_Flat):
-        def track_step(self, p, p_prev, x_prev, R_prev):
-            hit = self.query(p)
+        def query(self, p):
+            hit = super().query(p)
+            if not getattr(self, "_armed", False):
+                self._armed = True
+                return hit
             tilt = np.radians(30.0)
             cosine, sine = np.cos(tilt), np.sin(tilt)
-            turned = np.array(
+            hit["R"][:] = np.array(
                 [[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]]
             )
-            hit["R"][:] = turned
-            return hit["x_s"], hit["R"]
+            return hit
 
     runtime = MoldAwareRuntime(
         field=_Tilted(),
@@ -252,6 +382,71 @@ def test_face_hold_keeps_frame_and_command_past_five_degrees():
     assert "face_hold" in runtime.last_triggers
 
 
+def test_open_loop_query_lands_on_the_label_foot():
+    """A carried foot must not move query 0. Each raw window re-queries the TCP."""
+    zarr = pytest.importorskip("zarr")
+    smooth = Path(
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/"
+        "r4vt_smooth_frame/acp_replay_buffer.zarr"
+    )
+    meta = Path(
+        "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb/shared/fixb_meta.json"
+    )
+    if not smooth.exists() or not FIELD.exists() or not meta.exists():
+        pytest.skip("smooth r4vt zarr or mold field is not on this machine")
+    from export_openloop import decode_raw_motion
+
+    group = zarr.open(str(smooth), "r")["data"]["episode_0"]
+    _tool_r, tcp = pose7_to_Rp(np.asarray(group["ts_pose_fb_0"], dtype=np.float64))
+    foot = np.asarray(group["mold_x_s_0"], dtype=np.float64)
+    robot_t = np.asarray(group["robot_time_stamps_0"], dtype=np.float64).reshape(-1)
+    rgb_t = np.asarray(group["rgb_time_stamps_0"], dtype=np.float64).reshape(-1)
+    # Two windows whose label feet are the fresh TCP query, and far apart.
+    chosen = []
+    runtime = MoldAwareRuntime.from_assets(
+        "r4_world_fixb_tilt",
+        field_path=FIELD,
+        meta_path=meta,
+        dry_run=False,
+        limits=r4_safety_limits(),
+    )
+    for rgb_id in range(0, len(rgb_t), 40):
+        q = int(np.clip(np.searchsorted(robot_t, rgb_t[rgb_id]), 0, len(robot_t) - 1))
+        runtime.release_command_foot()
+        decoded = runtime.decode_chunk(
+            _action(0.0), tcp[q], np.eye(3), np.array([1.0 / 15.0]), apply_safety=False
+        )
+        if np.linalg.norm(decoded["x_s"][0] - foot[q]) > 1e-3:
+            continue
+        if chosen and np.linalg.norm(foot[q] - foot[chosen[0]]) < 0.05:
+            continue
+        chosen.append(q)
+        if len(chosen) == 2:
+            break
+    assert len(chosen) == 2
+
+    runtime.decode_chunk(
+        _action(0.0),
+        tcp[chosen[0]] + np.array([0.25, 0.0, 0.0]),
+        np.eye(3),
+        np.array([1.0 / 15.0]),
+        apply_safety=False,
+    )
+    assert np.linalg.norm(runtime._cmd_foot - foot[chosen[0]]) > 0.05
+    preds = np.zeros((2, 1, 27), dtype=np.float64)
+    preds[:, :, 21:27] = EYE6
+    pos, _rot, _foot, _normal = decode_raw_motion(
+        "r4vt",
+        runtime,
+        preds,
+        tcp[chosen],
+        np.broadcast_to(np.eye(3), (2, 3, 3)).copy(),
+        np.zeros((2, 1)),
+    )
+    err = np.linalg.norm(pos[:, 0] - foot[chosen], axis=1)
+    assert np.all(err < 1e-3), err
+
+
 def _geodesic_deg(a, b) -> float:
     from scipy.spatial.transform import Rotation
 
@@ -271,14 +466,167 @@ def test_first_orientation_slews_from_the_measured_tool():
     assert bool(decoded["rd_slew"][0])
 
 
-def test_first_foot_stays_within_10mm_of_the_tcp():
+def test_start_31mm_off_the_mesh_stays_on_the_closest_point():
+    """The foot is the TCP's closest point. A stationary TCP does not slide the foot."""
     runtime = _runtime()
-    tcp = np.array([0.0, 0.0, 0.03])
+    tcp = np.array([0.0, 0.0, 0.031])
+    steps = 6
     decoded = runtime.decode_chunk(
-        _action(0.0), tcp, np.eye(3), np.array([1.0 / 15.0])
+        _action(0.0, steps=steps), tcp, np.eye(3), np.full(steps, 1.0 / 15.0), apply_safety=True
     )
-    assert np.linalg.norm(decoded["x_s"][0] - tcp) <= FOOT_CAP_M + 1e-9
-    assert decoded["x_s"][0, 2] == pytest.approx(0.02)
+    assert decoded["x_s"][0, 2] == pytest.approx(0.0)
+    assert np.linalg.norm(decoded["x_s"][0] - tcp) == pytest.approx(0.031)
+    assert np.allclose(decoded["x_s"], 0.0, atol=1e-6)
+    assert not np.any(decoded["hop_hold"])
+
+
+def test_tcp_past_the_flange_plane_is_not_a_table_trip():
+    runtime = _runtime()
+    runtime.set_table_plane(np.array([0.0, 1.0, 0.0]), -0.02)
+    runtime.decode_chunk(
+        _action(0.0), np.array([0.0, 0.05, 0.01]), np.eye(3), np.array([1.0 / 15.0])
+    )
+    assert "table_plane" not in runtime.last_triggers
+    assert "mesh_far" not in runtime.last_triggers
+
+
+def test_orientation_past_25_degrees_holds_the_previous():
+    from mold_aware_runtime import ORI_LABEL_HOLD_DEG, hold_orientation_near_label
+
+    angle = np.radians(40.0)
+    cosine, sine = np.cos(angle), np.sin(angle)
+    tipped = np.array([[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]])
+    out, held = hold_orientation_near_label(
+        tipped.reshape(1, 3, 3), np.eye(3).reshape(1, 3, 3), np.eye(3), ORI_LABEL_HOLD_DEG
+    )
+    assert bool(held[0])
+    assert np.allclose(out[0], np.eye(3))
+    near = hold_orientation_near_label(
+        np.eye(3).reshape(1, 3, 3), np.eye(3).reshape(1, 3, 3), np.eye(3), ORI_LABEL_HOLD_DEG
+    )[1]
+    assert not bool(near[0])
+
+
+def test_replay_holds_orientation_before_the_flange_check():
+    """A 40° command that crosses the plane is held to the label first.
+
+    The flange check then sees the held tool and does not abort. Without the
+    label, the same command still trips.
+    """
+    from fixb_labels import so3_to_rot6d_rows
+
+    limits = r4_safety_limits()
+    limits.enable_rd_slew = False
+    runtime = _runtime(limits)
+    angle = np.radians(40.0)
+    cosine, sine = np.cos(angle), np.sin(angle)
+    tipped = np.array([[1.0, 0.0, 0.0], [0.0, cosine, -sine], [0.0, sine, cosine]])
+    corners = d405_housing_corners_in_tcp()
+    y_held = float((corners @ np.array([0.0, 1.0, 0.0])).max())
+    y_tipped = float((corners @ tipped.T @ np.array([0.0, 1.0, 0.0])).max())
+    assert y_tipped > y_held + 1e-4
+    runtime.set_table_plane(np.array([0.0, 1.0, 0.0]), (y_held + y_tipped) / 2.0)
+    action = _action(0.0)
+    action[:, 21:27] = so3_to_rot6d_rows(tipped.reshape(1, 3, 3))
+    tcp = np.zeros(3)
+    held = runtime.decode_chunk(
+        action, tcp, np.eye(3), np.array([1.0 / 15.0]), label_R=np.eye(3).reshape(1, 3, 3)
+    )
+    assert "camera_table" not in runtime.last_triggers
+    assert bool(held["ori_hold"][0])
+    assert np.allclose(held["R_d"][0], np.eye(3), atol=1e-8)
+
+    tripped = _runtime(limits)
+    tripped.set_table_plane(np.array([0.0, 1.0, 0.0]), (y_held + y_tipped) / 2.0)
+    tripped.decode_chunk(action, tcp, np.eye(3), np.array([1.0 / 15.0]))
+    assert "camera_table" in tripped.last_triggers
+
+
+def test_wrist_camera_through_the_table_holds():
+    limits = r4_safety_limits()
+    limits.table_y_m = 0.0
+    runtime = _runtime(limits)
+    # Tool +z points up, so the housing behind the tip hangs below the TCP.
+    up = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
+    tcp = np.array([0.0, -0.05, 0.0])
+    R_out, x_out = runtime._hold_if_camera_hits_table(
+        up.reshape(1, 3, 3), tcp.reshape(1, 3), np.eye(3), tcp, None
+    )
+    assert "camera_table" in runtime.last_triggers
+    assert np.allclose(R_out[0], np.eye(3))
+    assert np.allclose(x_out[0], tcp)
+
+
+def test_camera_uses_the_level_plane_not_fixture_y():
+    runtime = _runtime()
+    lowest = float(d405_housing_corners_in_tcp()[:, 1].max())
+    # Lowest corner is 30 mm above fixture Y=0, and 30 mm through a plane at -60 mm.
+    tcp = np.array([0.0, -0.030 - lowest, 0.0])
+    runtime.set_table_plane(np.array([0.0, 1.0, 0.0]), -0.060)
+    runtime._hold_if_camera_hits_table(
+        np.eye(3).reshape(1, 3, 3), tcp.reshape(1, 3), np.eye(3), tcp, None
+    )
+    assert "camera_table" in runtime.last_triggers
+
+
+def test_tcp_far_from_the_mesh_flags():
+    runtime = _runtime()
+    runtime.decode_chunk(
+        _action(0.0), np.array([0.0, 0.0, 0.25]), np.eye(3), np.array([1.0 / 15.0])
+    )
+    assert "mesh_far" in runtime.last_triggers
+
+
+def test_old_far_pose_in_the_window_does_not_abort():
+    """The approach can be >100 mm off. Only the newest measured TCP counts."""
+    limits = r4_safety_limits(abort_on_measured_mesh_distance=True)
+    runtime = _runtime(limits)
+    p = np.array([[0.0, 0.0, 0.15], [0.0, 0.0, 0.031]])
+    x = np.zeros_like(p)
+    runtime.note_measured_mesh_distance(p, x)
+    assert "max_distance_from_mesh" not in runtime.last_hard_triggers
+    still_far = _runtime(limits)
+    still_far.note_measured_mesh_distance(p[::-1], x[::-1])
+    assert still_far.last_hard_triggers == ["max_distance_from_mesh"]
+
+
+def test_capped_foot_is_projected_back_onto_the_mesh():
+    from mold_aware_runtime import _cap_onto_mesh
+
+    tcp = np.array([0.0, 0.0, 0.031])
+    foot = np.array([0.0, 0.0, 0.0])
+    capped, _frame, limited = _cap_onto_mesh(_Flat(), foot, np.eye(3), tcp)
+    assert limited
+    assert capped[2] == pytest.approx(0.0)
+    assert np.linalg.norm(capped - tcp) > FOOT_CAP_M
+
+
+def test_new_face_at_chunk_start_stays_on_the_held_sheet():
+    """The label gate refuses a flipped normal, so the foot does not follow it."""
+
+    class _Flip(_Flat):
+        def query(self, p):
+            hit = super().query(p)
+            if not getattr(self, "_armed", False):
+                self._armed = True
+                return hit
+            hit["R"][:, :, 1] = np.array([0.0, -1.0, 0.0])
+            hit["R"][:, :, 2] = np.array([0.0, 0.0, -1.0])
+            return hit
+
+    runtime = MoldAwareRuntime(
+        field=_Flip(),
+        R_off=np.eye(3),
+        run_type="r4_world_fixb_tilt",
+        limits=r4_safety_limits(),
+        dry_run=False,
+    )
+    runtime.decode_chunk(_action(0.0), np.zeros(3), np.eye(3), np.array([1.0 / 15.0]))
+    decoded = runtime.decode_chunk(
+        _action(0.0), np.array([0.08, 0.0, 0.0]), np.eye(3), np.array([1.0 / 15.0])
+    )
+    assert np.allclose(decoded["x_s"][0], 0.0)
+    assert decoded["R_field"][0, :, 2] @ np.array([0.0, 0.0, 1.0]) == pytest.approx(1.0)
 
 
 def test_vt_ramps_in_and_a_later_25mm_step_holds():
@@ -300,6 +648,27 @@ ORANGE = Path(
     "/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/PyriteConfig/tasks/umift/"
     "layup_workcell_extrinsics_20261116_orange.yaml"
 )
+
+
+def test_runner_tracker_matches_the_stored_label_frame():
+    """The runner's tracker on the label foot path reproduces the stored frame."""
+    zarr = pytest.importorskip("zarr")
+    side = FIELD.with_name("fixb_smooth_frames.npz")
+    zarr_path = FIELD.parents[1] / "r4vt_smooth_tcp_track_clean" / "acp_replay_buffer.zarr"
+    if not FIELD.is_file() or not side.is_file() or not zarr_path.is_dir():
+        pytest.skip("smooth field or track-clean zarr is missing")
+    from scipy.spatial.transform import Rotation
+    from fixb_smooth_field import SmoothFrameField
+    from mold_aware_runtime import rot6d_rows_to_R, track_feet
+
+    field = SmoothFrameField(FIELD, side)
+    group = zarr.open(str(zarr_path), "r")["data"]["episode_40"]
+    feet = np.asarray(group["mold_x_s_0"], dtype=np.float64)
+    stored = rot6d_rows_to_R(np.asarray(group["mold_R_field_rot6d_0"]))
+    _x, got, _held = track_feet(field, feet)
+    rel = np.einsum("nij,njk->nik", np.transpose(stored, (0, 2, 1)), got)
+    ang = np.degrees(np.linalg.norm(Rotation.from_matrix(rel).as_rotvec(), axis=1))
+    assert float(ang.max()) < 1.0
 
 
 def test_e30_rollout_first_command_is_rate_limited():

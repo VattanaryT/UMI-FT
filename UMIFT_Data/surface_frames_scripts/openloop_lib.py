@@ -136,6 +136,124 @@ def relative_command_rot_deg(pred_action, label_action) -> np.ndarray:
     return geodesic_deg(rp, rl)
 
 
+def indexed_positions(xyz: np.ndarray, index: np.ndarray) -> np.ndarray:
+    """xyz[index], nan where index is negative. index is (Q, H)."""
+    xyz = np.asarray(xyz, dtype=np.float64)
+    index = np.asarray(index, dtype=np.int64)
+    out = np.full(index.shape + (3,), np.nan, dtype=np.float64)
+    known = index >= 0
+    out[known] = xyz[index[known]]
+    return out
+
+
+# Same bins as the tilt summary. Angle of mold_normal_0 from up [0, -1, 0].
+REGION_UP = np.array([0.0, -1.0, 0.0])
+REGION_NAMES = ("crown", "fillet", "wall")
+
+
+def query_anchor_index(query_rgb_idx, robot_t, rgb_t) -> np.ndarray:
+    """Robot sample of each query. mold_x_s_0 there is the label foot."""
+    rgb = np.asarray(query_rgb_idx, dtype=np.int64)
+    robot_t = np.asarray(robot_t, dtype=np.float64)
+    rgb_t = np.asarray(rgb_t, dtype=np.float64)
+    rgb = np.clip(rgb, 0, max(len(rgb_t) - 1, 0))
+    return np.clip(np.searchsorted(robot_t, rgb_t[rgb]), 0, max(len(robot_t) - 1, 0))
+
+
+def region_code(normal: np.ndarray) -> np.ndarray:
+    """0 crown <25°, 1 fillet 25–55°, 2 wall ≥55°. ``normal`` is (..., 3)."""
+    normal = np.asarray(normal, dtype=np.float64)
+    length = np.linalg.norm(normal, axis=-1, keepdims=True)
+    unit = normal / np.clip(length, 1e-12, None)
+    ang = np.degrees(np.arccos(np.clip(unit @ REGION_UP, -1.0, 1.0)))
+    code = np.ones(ang.shape, dtype=np.int64)
+    code[ang < 25.0] = 0
+    code[ang >= 55.0] = 2
+    return code
+
+
+def region_action_errors(pred, label, n_valid, region, horizon: int = 6) -> dict:
+    """δn and ΔR MAE by the query's region. Every step of a query shares that code.
+
+    ``region`` is (Q,) with 0 crown, 1 fillet, 2 wall.
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    label = np.asarray(label, dtype=np.float64)
+    n_valid = np.asarray(n_valid, dtype=np.int64).reshape(-1)
+    region = np.asarray(region, dtype=np.int64).reshape(-1)
+    step = np.arange(pred.shape[1])[None, :]
+    valid = step < n_valid[:, None]
+    head = valid & (step < int(horizon))
+    dn = pred[..., 2] - label[..., 2]
+    dR = delta_r_deg(pred, label)
+    out = {}
+    for span, mask in (("exec", head), ("full", valid)):
+        out[span] = {}
+        for code, name in enumerate(REGION_NAMES):
+            take = mask & (region[:, None] == code)
+            out[span][name] = {
+                "n": int(np.sum(take & np.isfinite(dn))),
+                "delta_n_mm": None if not np.any(take) else _mae(dn * 1e3, take),
+                "delta_R_deg": None if not np.any(take) else _mae(dR, take),
+            }
+    return out
+
+
+def chunk_horizon_errors(
+    pred,
+    label,
+    pred_pos,
+    label_pos,
+    n_valid,
+    horizon: int = 6,
+) -> dict:
+    """MAE on the first ``horizon`` valid steps, and on the whole valid chunk.
+
+    ``pred`` and ``label`` are (Q, H, D). Positions are (Q, H, 3) decoded xyz.
+    Pass positions as None to skip position. ΔR modes use the label rotation:
+    under 45° is near identity, over 135° is the return yaw.
+    """
+    pred = np.asarray(pred, dtype=np.float64)
+    label = np.asarray(label, dtype=np.float64)
+    n_valid = np.asarray(n_valid, dtype=np.int64).reshape(-1)
+    _q, width, dim = pred.shape
+    step = np.arange(width)[None, :]
+    valid = step < n_valid[:, None]
+    head = valid & (step < int(horizon))
+    if dim >= 27:
+        label_R = rot6d_rows_to_R(label[..., 21:27])
+        label_ang = geodesic_deg(label_R, np.broadcast_to(np.eye(3), label_R.shape))
+        modes = {
+            "all": np.ones(pred.shape[:2], dtype=bool),
+            "near_identity": label_ang < 45.0,
+            "return_yaw": label_ang > 135.0,
+        }
+        series = {
+            "delta_n": pred[..., 2] - label[..., 2],
+            "delta_R_deg": delta_r_deg(pred, label),
+        }
+    else:
+        modes = {"all": np.ones(pred.shape[:2], dtype=bool)}
+        series = {}
+    if pred_pos is not None:
+        series = {
+            "position_mm": np.linalg.norm(
+                np.asarray(pred_pos, dtype=np.float64) - np.asarray(label_pos, dtype=np.float64),
+                axis=-1,
+            )
+            * 1e3,
+            **series,
+        }
+
+    def pack(mask: np.ndarray) -> dict:
+        return {
+            name: {mode: _mae(err, mask & take) for mode, take in modes.items()}
+            for name, err in series.items()
+        }
+
+    return {"horizon": int(horizon), "exec": pack(head), "full": pack(valid)}
+
+
 def _mae(err, mask) -> float | None:
     err = np.asarray(err, dtype=np.float64).reshape(-1)
     mask = np.asarray(mask, dtype=bool).reshape(-1)
@@ -194,6 +312,17 @@ def episode_error_table(pred, label, force_n, bad_span, long_dt, valid) -> dict:
     counts = {group: int(np.sum(mask)) for group, mask in groups.items()}
     counts["valid"] = int(np.sum(valid))
     counts["long_dt"] = int(np.sum(valid & long))
+    if "delta_R_deg" in per_dim:
+        # Mode is the label's own ΔR, not the error. A return stroke stays near 180°.
+        label_R = rot6d_rows_to_R(label[:, 21:27])
+        label_ang = geodesic_deg(label_R, np.broadcast_to(np.eye(3), label_R.shape))
+        near = valid & (label_ang < 45.0)
+        back = valid & (label_ang > 135.0)
+        err = per_dim["delta_R_deg"]
+        table["delta_R_deg"]["near_identity"] = _mae(err, near)
+        table["delta_R_deg"]["return_yaw"] = _mae(err, back)
+        counts["near_identity"] = int(np.sum(near))
+        counts["return_yaw"] = int(np.sum(back))
     return {"mae": table, "n": counts}
 
 

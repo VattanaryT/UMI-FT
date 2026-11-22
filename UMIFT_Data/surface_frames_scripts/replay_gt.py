@@ -50,9 +50,17 @@ R1REL_ZARR = DATA / "r1rel_world" / "acp_replay_buffer.zarr"
 FIELD_NPZ = DATA / "shared" / "fixb_field.npz"
 LONG_DT = DATA / "shared" / "long_dt_gt_100ms.npz"
 ASSETS = Path(__file__).resolve().parent / "assets"
-R4VT_NORMALIZER = ASSETS / "oct_v35_h4s_r4vt_action_normalizer_minmax_exbad.pkl"
+R4VT_NORMALIZER = Path(
+    os.environ.get(
+        "UMIFT_R4VT_NORMALIZER",
+        str(ASSETS / "oct_v35_h4s_r4vt_action_normalizer_minmax_exbad.pkl"),
+    )
+)
 R1REL_NORMALIZER = ASSETS / "oct_v35_h4s_r1rel_odom_action_pose_normalizer_2c20fba56851.pkl"
-R4VT_SHA = "ac13d3fd7b647541d093688896ff43f1edb3a025397b6037da01dfffb6707bee"
+R4VT_SHA = os.environ.get(
+    "UMIFT_R4VT_NORMALIZER_SHA",
+    "ac13d3fd7b647541d093688896ff43f1edb3a025397b6037da01dfffb6707bee",
+)
 R1REL_SHA = "2c20fba56851f59ec7d1a652d4e08a979ec9f7a8ea46368737df984475a0cf05"
 EXPORT_ROOT = Path("/mnt/data/umidata/ft/replay_exports")
 
@@ -164,6 +172,14 @@ def blend_executed(chunks, execution_horizon: int, decay_m: float = DECAY_M) -> 
 def _pose_R(pose7: np.ndarray) -> np.ndarray:
     mats = su.pose7_to_SE3(np.asarray(pose7, dtype=np.float64).reshape(-1, 7))
     return mats[..., :3, :3]
+
+
+def _label_frame(action: np.ndarray, tool_R: np.ndarray) -> np.ndarray:
+    """R_field = R_tool @ ΔRᵀ. Replay seeds a fresh window with this."""
+    from mold_aware_runtime import rot6d_rows_to_R
+
+    dR = rot6d_rows_to_R(np.asarray(action, dtype=np.float64).reshape(-1, 27)[:1, 21:27])[0]
+    return np.asarray(tool_R, dtype=np.float64).reshape(3, 3) @ dR.T
 
 
 def _inplane(points: np.ndarray, foot: np.ndarray, normal: np.ndarray) -> np.ndarray:
@@ -282,9 +298,28 @@ def r1rel_chunk_errors(episode: int = 0, rgb_id: int = 100) -> dict:
 def _mold_field():
     global _FIELD
     if _FIELD is None:
-        from fixb_field import FixBMoldField
+        use_smooth = os.environ.get("UMIFT_R4VT_SMOOTH", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        side = FIELD_NPZ.with_name("fixb_smooth_frames.npz")
+        if use_smooth:
+            from fixb_smooth_field import SmoothFrameField
 
-        _FIELD = FixBMoldField(FIELD_NPZ)
+            if not side.is_file():
+                raise SystemExit(f"smooth sidecar missing: {side}")
+            _FIELD = SmoothFrameField(FIELD_NPZ, side)
+            print(f"[replay] SmoothFrameField sidecar {side}", flush=True)
+        else:
+            from fixb_field import FixBMoldField
+
+            _FIELD = FixBMoldField(FIELD_NPZ)
+            print(f"[replay] FixBMoldField {FIELD_NPZ}", flush=True)
+        print(
+            f"[replay] normalizer {R4VT_NORMALIZER} sha {R4VT_SHA}",
+            flush=True,
+        )
     return _FIELD
 
 
@@ -750,13 +785,15 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
     dt_exec = fixb_decode_dt(exec_h, 1, RUNNER_DT_S)
     for k, indices in enumerate(windows):
         head = int(indices[0])
+        tool0 = _pose_R(demo[head])[0]
         runtime.release_command_foot()
         decoded = runtime.decode_chunk(
             actions[k],
             demo[head, :3],
-            _pose_R(demo[head])[0],
+            tool0,
             dt_chunk,
             apply_safety=False,
+            frame_seed=_label_frame(actions[k], tool0),
         )
         pose, stiff = _nominal_pose(None, None, "r4vt", decoded)
         chunks.append({"pose7": pose, "nominal_pose7": pose, "stiffness": stiff})
@@ -781,13 +818,15 @@ def action_blend_episode(episode: int, exec_h: int, dt_s: float = 1.0 / 15.0) ->
                 }
             )
         ensembler.push(k * int(exec_h), actions[k])
+        blended_action = ensembler.pop(exec_h)
         runtime.release_command_foot()
         action_decoded = runtime.decode_chunk(
-            ensembler.pop(exec_h),
+            blended_action,
             demo[head, :3],
-            _pose_R(demo[head])[0],
+            tool0,
             dt_exec,
             apply_safety=False,
+            frame_seed=_label_frame(blended_action, tool0),
         )
         x_g, R_g, _field_g, aborted = jump_guard.apply(
             action_decoded["x_d"],
@@ -984,24 +1023,28 @@ def _format_action_blend(report: dict) -> str:
     return "\n".join(lines)
 
 
-def write_runner_replay(out: Path, episodes, horizon: int) -> None:
+def write_runner_replay(out: Path, episodes, horizon: int, arm: str = "both") -> None:
     """r4vt action blend and r1rel pose blend, the runner's H-step path."""
     out = Path(out)
     if out.exists():
         raise SystemExit(f"refusing to overwrite {out}")
-    r4 = out / "r4vt"
-    r1 = out / "r1rel"
-    r4.mkdir(parents=True)
-    r1.mkdir(parents=True)
+    if arm in ("both", "r4vt"):
+        r4 = out / "r4vt"
+        r4.mkdir(parents=True)
+    if arm in ("both", "r1rel"):
+        r1 = out / "r1rel"
+        r1.mkdir(parents=True)
     for episode in episodes:
-        report = action_blend_episode(int(episode), int(horizon))
-        path = r4 / f"episode_{int(episode)}_h{int(horizon)}.json"
-        path.write_text(json.dumps(report, indent=2) + "\n")
-        print(_format_action_blend(report), flush=True)
-        report = replay_episode("r1rel", int(episode), exec_horizons=(int(horizon),))
-        path = r1 / f"episode_{int(episode)}.json"
-        path.write_text(json.dumps(report, indent=2) + "\n")
-        print(format_report(report), flush=True)
+        if arm in ("both", "r4vt"):
+            report = action_blend_episode(int(episode), int(horizon))
+            path = r4 / f"episode_{int(episode)}_h{int(horizon)}.json"
+            path.write_text(json.dumps(report, indent=2) + "\n")
+            print(_format_action_blend(report), flush=True)
+        if arm in ("both", "r1rel"):
+            report = replay_episode("r1rel", int(episode), exec_horizons=(int(horizon),))
+            path = r1 / f"episode_{int(episode)}.json"
+            path.write_text(json.dumps(report, indent=2) + "\n")
+            print(format_report(report), flush=True)
     print(f"wrote {out}")
 
 
@@ -1011,11 +1054,12 @@ def main(argv=None) -> None:
     parser.add_argument("--episodes", type=int, nargs="+", default=[0, 9])
     parser.add_argument("--horizon", type=int, default=6)
     parser.add_argument("--out", type=Path, default=None)
+    parser.add_argument("--arm", choices=("both", "r4vt", "r1rel"), default="both")
     args = parser.parse_args(argv)
     if args.mode == "runner":
         if args.out is None:
             raise SystemExit("runner mode needs --out")
-        write_runner_replay(args.out, args.episodes, args.horizon)
+        write_runner_replay(args.out, args.episodes, args.horizon, args.arm)
         return
     write_exports(tuple(args.episodes))
 
