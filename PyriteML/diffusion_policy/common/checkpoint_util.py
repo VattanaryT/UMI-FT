@@ -2,6 +2,16 @@ import os
 from typing import Dict, Optional
 
 
+def epoch_is_due(epoch: int, every: int, selected=None) -> bool:
+    """True when this epoch should checkpoint or validate.
+
+    `selected` is an explicit epoch list. When it is set, `every` is not used.
+    """
+    if selected is not None:
+        return int(epoch) in {int(item) for item in selected}
+    return int(every) > 0 and int(epoch) % int(every) == 0
+
+
 class TopKCheckpointManager:
     def __init__(
         self,

@@ -23,6 +23,9 @@ UMIFT_Data/surface_frames_scripts/eval/
 # closed-loop sim traces. The *.py files stay tracked.
 closedloop_sim/out/
 
+# thin-stringer open-loop exports (field, zarr, plots)
+openloop_thin_stringer/
+
 # miscellaneous
 output.log
 scripts/profile_data_loader.py 

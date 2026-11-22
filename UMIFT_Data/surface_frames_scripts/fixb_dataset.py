@@ -25,10 +25,7 @@ from diffusion_policy.common.sampler_umift import (
 )
 from diffusion_policy.dataset.umift_dataset import UmiFTDataset
 from diffusion_policy.model.common.normalizer import SingleFieldLinearNormalizer
-from PyriteConfig.tasks.umift.umift_type_conversions import (
-    action21_to_action_sample,
-    obs_to_obs_sample,
-)
+from PyriteConfig.tasks.umift.umift_type_conversions import obs_to_obs_sample
 from threadpoolctl import threadpool_limits
 
 from fixb_pose_jump import load_flags, log_pose_jump_mask, loss_weight_for_query
@@ -199,7 +196,13 @@ class UmiFTDatasetR4(UmiFTDataset):
     def _delta_R_weight_for_query(self, epi_id: int, rgb_id: int, H: int, D: int) -> np.ndarray:
         """(H,D) weights: 1 everywhere; 0 on dims 21:27 after a field jump since chunk start."""
         w = np.ones((H, D), dtype=np.float32)
-        if D < 27 or not self._r4_mask:
+        if not self._r4_mask:
+            return w
+        if D == 10:
+            cols = slice(4, 10)
+        elif D >= 27:
+            cols = slice(21, 27)
+        else:
             return w
         key = f"episode_{int(epi_id)}"
         jump = self._r4_field_jump.get(key)
@@ -223,7 +226,7 @@ class UmiFTDatasetR4(UmiFTDataset):
             lo = a0 + 1
             hi = a_t + 1
             if lo < hi and np.any(jump[lo:hi]):
-                w[t, 21:27] = 0.0
+                w[t, cols] = 0.0
         return w
 
     def _log_delta_R_mask_fraction(self, train: bool) -> dict:
@@ -232,10 +235,12 @@ class UmiFTDatasetR4(UmiFTDataset):
         n_masked = 0
         H = int(self.shape_meta["sample"]["action"]["sparse"]["horizon"])
         D = int(self.shape_meta["action"]["shape"][0])
+        cols = slice(4, 10) if D == 10 else slice(21, 27)
         for epi_id, rgb_id in self.sampler.indices:
             w = self._delta_R_weight_for_query(epi_id, rgb_id, H, D)
             n_steps += H
-            n_masked += int(np.sum(w[:, 21:27] == 0.0) // 6)  # count masked timesteps
+            if D == 10 or D >= 27:
+                n_masked += int(np.sum(w[:, cols] == 0.0) // 6)
         frac = float(n_masked / max(n_steps, 1))
         split = "train" if train else "val"
         stats = {
@@ -292,7 +297,7 @@ class UmiFTDatasetR4(UmiFTDataset):
             episode_mask=self.val_mask,
             action_padding=self.action_padding,
             obs_to_obs_sample=obs_to_obs_sample,
-            action_to_action_sample=action21_to_action_sample,
+            action_to_action_sample=self.action_to_action_sample,
             id_list=self.id_list,
             action_gap_threshold_mult=self.action_gap_threshold_mult,
             scan_pre_first_fill=self.scan_pre_first_fill,
@@ -326,11 +331,42 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def _pin_r4_10(sparse_normalizer, scale, offset, src, digest: str):
+    """Replace all 10 action dims, including ΔR. The file is 10-d."""
+    if scale.numel() != 10 or offset.numel() != 10:
+        raise RuntimeError(f"r4_10 file action dim {scale.numel()}, expected 10")
+    online = sparse_normalizer.params_dict["action"]["scale"].detach().float().cpu().reshape(-1)
+    if online.numel() != 10:
+        raise RuntimeError(f"r4_10 online action dim {online.numel()}, expected 10")
+    before = torch.max(torch.abs(online - scale)).item()
+    stats = {}
+    for key in ("min", "max", "mean", "std"):
+        values = src["input_stats"][key].detach().float().cpu().reshape(-1)
+        if values.numel() != 10:
+            raise RuntimeError(f"r4_10 input_stats[{key}] dim {values.numel()}")
+        stats[key] = values.numpy()
+    sparse_normalizer["action"] = SingleFieldLinearNormalizer.create_manual(
+        scale=scale.numpy(),
+        offset=offset.numpy(),
+        input_stats_dict=stats,
+    )
+    got = sparse_normalizer.params_dict["action"]["scale"].detach().float().cpu().reshape(-1)
+    if torch.max(torch.abs(got - scale)).item() != 0:
+        raise RuntimeError("r4_10 scale mismatch after pin")
+    print(
+        f"[shared-normalizer] role=r4_10 sha256={digest[:12]} "
+        f"online_vs_file_max|scale|_before_pin={before:.3g} "
+        f"δn scale={float(scale[2]):.6g} offset={float(offset[2]):.6g}"
+    )
+    return sparse_normalizer
+
+
 def apply_shared_action_normalizer(sparse_normalizer, path: str, sha256: str, role: str):
     """Pin a versioned r2/r4 action normalizer.
 
     role r2: replace all 21 action dims.
     role r4: dims 0:21 from the file, dims 21:27 identity (ΔR).
+    role r4_10: replace all 10 dims, including ΔR.
     role r1: dims 18:21 only (stiffness, gripper, grasp force). Pose dims 0:18
     stay the online r1 fit.
     """
@@ -345,6 +381,8 @@ def apply_shared_action_normalizer(sparse_normalizer, path: str, sha256: str, ro
     src = saved.params_dict["action"]
     s = src["scale"].detach().float().cpu().reshape(-1)
     o = src["offset"].detach().float().cpu().reshape(-1)
+    if role == "r4_10":
+        return _pin_r4_10(sparse_normalizer, s, o, src, digest)
     if s.numel() != 21 or o.numel() != 21:
         raise RuntimeError(f"shared normalizer action dim {s.numel()}, expected 21")
     dst = sparse_normalizer.params_dict["action"]
@@ -524,5 +562,6 @@ class UmiFTDatasetOctR4(UmiFTDatasetR4):
 
     def get_normalizer(self, **kwargs):
         sparse, dense = UmiFTDataset.get_normalizer(self, **kwargs)
-        apply_shared_action_normalizer(sparse, self._an_path, self._an_sha, "r4")
+        role = "r4_10" if self.action_type == "r4_10" else "r4"
+        apply_shared_action_normalizer(sparse, self._an_path, self._an_sha, role)
         return sparse, dense

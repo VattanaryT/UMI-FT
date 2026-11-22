@@ -208,7 +208,11 @@ training:
   # in epochs
   rollout_every: 10
   checkpoint_every: 10
+  # Explicit epochs. When set, checkpoint_every is not used.
+  checkpoint_at: null
   val_every: 5
+  # Explicit epochs. When set, val_every is not used.
+  val_at: null
   sample_every: 5 # debug 5
   # steps per epoch
   max_train_steps: null

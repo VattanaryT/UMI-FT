@@ -13,7 +13,10 @@ from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
 # from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
-from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
+from diffusion_policy.common.checkpoint_util import (
+    TopKCheckpointManager,
+    epoch_is_due,
+)
 from diffusion_policy.common.drop_scan_inputs import apply_drop_scan_inputs
 from diffusion_policy.common.json_logger import JsonLogger
 from diffusion_policy.common.pytorch_util import dict_apply
@@ -467,7 +470,15 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 #     step_log.update(runner_log)
 
                 # run validation
-                if (self.epoch % cfg.training.val_every) == 0 and len(val_dataloader) > 0 and accelerator.is_main_process:
+                if (
+                    epoch_is_due(
+                        self.epoch,
+                        cfg.training.val_every,
+                        OmegaConf.select(cfg, "training.val_at"),
+                    )
+                    and len(val_dataloader) > 0
+                    and accelerator.is_main_process
+                ):
                     with torch.no_grad():
                         val_losses = list()
                         val_r4_acc = {}
@@ -616,8 +627,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
                 # checkpoint
                 if (
-                    self.epoch % cfg.training.checkpoint_every
-                ) == 0 and accelerator.is_main_process:
+                    epoch_is_due(
+                        self.epoch,
+                        cfg.training.checkpoint_every,
+                        OmegaConf.select(cfg, "training.checkpoint_at"),
+                    )
+                    and accelerator.is_main_process
+                ):
                     # unwrap the model to save ckpt
                     model_ddp = self.model
                     self.model = accelerator.unwrap_model(self.model)
