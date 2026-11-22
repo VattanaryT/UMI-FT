@@ -1,6 +1,7 @@
 """Synthetic checks for the offline comparison driver. No checkpoints."""
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -31,7 +32,16 @@ class FlatField:
 
 
 def test_import_does_not_load_hardware():
-    assert not any("hardware_interfaces" in name for name in sys.modules)
+    # A fresh interpreter. The suite has already imported the robot bindings.
+    code = (
+        "import importlib.util, sys\n"
+        f"spec = importlib.util.spec_from_file_location('offline_compare_driver', {str(SCRIPT)!r})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "sys.modules['offline_compare_driver'] = mod\n"
+        "spec.loader.exec_module(mod)\n"
+        "assert not any('hardware_interfaces' in name for name in sys.modules)\n"
+    )
+    subprocess.check_call([sys.executable, "-c", code])
 
 
 def test_query_seed_ignores_other_queries():

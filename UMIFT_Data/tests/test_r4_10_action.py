@@ -1,5 +1,7 @@
 """10-d causal-foot action: column slice, passthrough, jump mask, normalizer pin."""
 
+from pathlib import Path
+
 import numpy as np
 import torch
 import zarr
@@ -16,10 +18,9 @@ from diffusion_policy.model.common.normalizer import (
 from fixb_dataset import UmiFTDatasetR4, apply_shared_action_normalizer
 
 
-NORM = (
-    "/home/boeing/umi_ft_ws/worktrees/UMI-FT-causal_foot/"
-    "UMIFT_Data/surface_frames_scripts/assets/"
-    "oct_v35_h4s_r4vt_action_normalizer_minmax_causal_foot.pkl"
+NORM = str(
+    Path(__file__).resolve().parents[1]
+    / "surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_causal_foot.pkl"
 )
 SHA = "14308b72d55600b4359dfa67d10aedab378e42ad26f2bbcac988eed4d97a1ac2"
 

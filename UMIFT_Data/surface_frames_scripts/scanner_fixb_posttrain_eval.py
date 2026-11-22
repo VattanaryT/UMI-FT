@@ -36,16 +36,17 @@ from scipy.spatial.transform import Rotation
 import zarr
 
 # open3d (via fixb_field) is only needed for decode/metrics, not training curves.
-FixBMoldField = integrate_fixb = heading_branch = pose7_to_Rp = None  # type: ignore
+FixBMoldField = integrate_fixb = heading_branch = pose7_to_Rp = rot6d_rows_to_R = None  # type: ignore
 
 
 def _ensure_fixb():
-    global FixBMoldField, integrate_fixb, heading_branch, pose7_to_Rp
+    global FixBMoldField, integrate_fixb, heading_branch, pose7_to_Rp, rot6d_rows_to_R
     if FixBMoldField is None:
         from fixb_field import FixBMoldField as _F, integrate_fixb as _I
         from fixb_labels import heading_branch as _H, pose7_to_Rp as _P
+        from mold_aware_runtime import rot6d_rows_to_R as _R6
 
-        FixBMoldField, integrate_fixb, heading_branch, pose7_to_Rp = _F, _I, _H, _P
+        FixBMoldField, integrate_fixb, heading_branch, pose7_to_Rp, rot6d_rows_to_R = _F, _I, _H, _P, _R6
 
 TOOL_Z = 2
 OFF_EDGE_M = 0.005
@@ -80,16 +81,6 @@ STEP_METRICS = (
     "rot_deg",
     "tilt_err_deg",
 )
-
-
-def rot6d_rows_to_R(r6: np.ndarray) -> np.ndarray:
-    a1 = r6[..., 0:3]
-    a2 = r6[..., 3:6]
-    b1 = a1 / np.clip(np.linalg.norm(a1, axis=-1, keepdims=True), 1e-9, None)
-    b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
-    b2 = b2 / np.clip(np.linalg.norm(b2, axis=-1, keepdims=True), 1e-9, None)
-    b3 = np.cross(b1, b2)
-    return np.stack([b1, b2, b3], axis=-2)
 
 
 def rot_angle_deg(Ra, Rb) -> np.ndarray:
@@ -136,6 +127,7 @@ def std(x) -> float:
 
 
 def decode(run, action, times, p0, R0, field, R_off):
+    _ensure_fixb()
     _, _, D = action.shape
     if run == "r1_world_world":
         return action[..., 0:3], rot6d_rows_to_R(action[..., 3:9])

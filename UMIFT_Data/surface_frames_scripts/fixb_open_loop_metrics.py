@@ -36,6 +36,7 @@ from scipy.spatial.transform import Rotation
 
 from fixb_field import FixBMoldField, integrate_fixb
 from fixb_labels import heading_branch, pose7_to_Rp
+from mold_aware_runtime import rot6d_rows_to_R
 
 TOOL_Z = 2
 STEP_METRICS = (
@@ -49,16 +50,6 @@ STEP_METRICS = (
     "tilt_err_deg",
 )
 RUNS = ("r1_world_world", "r2_world_fixb", "r3_surface_fixb", "r4_world_fixb_tilt")
-
-
-def rot6d_rows_to_R(r6: np.ndarray) -> np.ndarray:
-    a1 = r6[..., 0:3]
-    a2 = r6[..., 3:6]
-    b1 = a1 / np.clip(np.linalg.norm(a1, axis=-1, keepdims=True), 1e-9, None)
-    b2 = a2 - np.sum(b1 * a2, axis=-1, keepdims=True) * b1
-    b2 = b2 / np.clip(np.linalg.norm(b2, axis=-1, keepdims=True), 1e-9, None)
-    b3 = np.cross(b1, b2)
-    return np.stack([b1, b2, b3], axis=-2)
 
 
 def rot_angle_deg(Ra, Rb) -> np.ndarray:

@@ -133,7 +133,7 @@ def test_collect_vision_timeline_falls_back_to_obs_policy(monkeypatch, tmp_path)
     assert depth_times.size == 0
 
 
-def test_log_raw_vision_to_obs_inference(monkeypatch):
+def test_log_raw_vision_to_obs_inference(monkeypatch, tmp_path):
     monkeypatch.setenv("PYRITE_CHECKPOINT_FOLDERS", "/tmp")
     monkeypatch.setenv("PYRITE_HARDWARE_CONFIG_FOLDERS", "/tmp")
     monkeypatch.setenv("PYRITE_CONTROL_LOG_FOLDERS", "/tmp")
@@ -184,7 +184,7 @@ def test_log_raw_vision_to_obs_inference(monkeypatch):
 
     runner = importlib.import_module("PyriteEnvSuites.env_runners.umift_env_runner")
 
-    store = zarr.DirectoryStore(str(Path("/tmp") / "test_log_raw_vision.zarr"))
+    store = zarr.DirectoryStore(str(tmp_path / "test_log_raw_vision.zarr"))
     root = zarr.group(store=store)
     oi = root.create_group("obs_inference")
 
