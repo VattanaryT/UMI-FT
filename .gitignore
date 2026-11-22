@@ -18,7 +18,9 @@ intermediate_umi_output_gripper_test/
 intermediate_umi_output_before_detect_acuro/
 intermediate_umi_output/
 figs/
-UMIFT_Data/surface_frames_scripts/eval/
+# eval outputs stay local. The scripts are tracked.
+UMIFT_Data/surface_frames_scripts/eval/*
+!UMIFT_Data/surface_frames_scripts/eval/*.py
 
 # closed-loop sim traces. The *.py files stay tracked.
 closedloop_sim/out/
