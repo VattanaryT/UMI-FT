@@ -263,3 +263,139 @@ October Fix B yamls under `UMIFT_Data/surface_frames_scripts/config/task/`. Shor
 `standard_bc` task `umift_ss_v2` is not this table. It trains a source zarr with relative command and virtual-target poses, 21 dims, and no mold channels.
 
 Normalizer pickles: short runs `assets/oct_v35_r2r4_action_normalizer_1ddfa2b4331f.pkl`; h4s `assets/oct_v35_h4s_r2r4_action_normalizer_3b0863c14453.pkl`. r1rel has its own pickle, named in `umift_oct_fixb_r1rel.yaml`.
+
+## Commands
+
+Python commands use the `pyrite` conda env. None of these use the geodude-teleoperation `.venv` or the `geodude-teleop` conda env. `sbatch` is only installed on Hyak, so those commands go through `ssh`.
+
+Start every Python command from a new shell with:
+
+```bash
+source ~/miniforge3/etc/profile.d/conda.sh
+conda activate pyrite
+source /home/boeing/umi_ft_ws/worktrees/activate.sh UMI-FT-surface_frames
+```
+
+`activate.sh` cds into this worktree. The paths below are from there.
+
+### 1. Dataset episode and labels
+
+Env: `pyrite`. No required args. Optional: `--host` (default `127.0.0.1`), `--port` (default `8765`), `--bags-dir` (default `$UMIFT_OCT_BAGS`, else `stringer_v3.5/bags`).
+
+The zarrs are hardcoded: `stringer_v3.5`, `r4_world_fixb_tilt`, and the odom-corrected `r1rel` and `r4vt` buffers. The page shows `v1`, `v2`, `n`, and tilt. Left/right steps a frame. Up/down changes episode.
+
+```bash
+python UMIFT_Data/surface_frames_scripts/view_oct.py
+```
+
+Output: http://127.0.0.1:8765 . No file. Ctrl-C stops it.
+
+### 2. Open-loop viewer for a checkpoint
+
+Env: `pyrite`. Required: `--mesh`. One of `--ckpt` or `--export`. `--ckpt` opens every export under `/mnt/data/umidata/ft/open_loop_exports/` whose `settings.json` names that file. It does not run the policy. Optional: `--port` (default `8766`), `--frames_npz`.
+
+```bash
+python UMIFT_Data/surface_frames_scripts/view_openloop.py \
+  --ckpt /mnt/data/umidata/ft/training_outputs/oct_v35_h4s_odom_r4vt/checkpoints/epoch=0185-train_loss=0.011.ckpt \
+  --mesh /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/shared/fixb_field.npz
+```
+
+That checkpoint is named by `open_loop_exports/r4vt_e66520fae9ae` and `open_loop_exports/r4vt_e66520fae9ae_fixdt`. Output: http://127.0.0.1:8766 . No file.
+
+Heading-tilt on the same page. `--heading-tilt` adds the 8-d checkpoint (sin ψ, cos ψ, a, b) and a checkbox for causal-foot e199. Steps 1, 6, and 64 use the buttons on the heading bar. The first episode request runs both policies and is slow; later episodes are cached. This machine has no display, so the page is opened through an SSH tunnel.
+
+```bash
+python UMIFT_Data/surface_frames_scripts/view_openloop.py \
+  --ckpt /mnt/data/umidata/ft/training_outputs/oct_v35_h4s_odom_r4vt/checkpoints/epoch=0185-train_loss=0.011.ckpt \
+  --mesh /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/shared/fixb_field.npz \
+  --heading-tilt \
+  --host 127.0.0.1 --port 8766
+```
+
+From the laptop:
+
+```bash
+ssh -L 8766:127.0.0.1:8766 boeing@geodude-control
+```
+
+Then open http://127.0.0.1:8766 . The defaults are heading-tilt `.../43448962/checkpoints/latest.ckpt` and causal-foot `.../43390127/checkpoints/latest.ckpt`. Override with `--heading-ckpt` and `--causal-ckpt`.
+
+### 3. Heading-tilt open-loop page, steps 1 / 6 / 64
+
+Env: `pyrite`. No CLI args. Hardcoded: checkpoint `.../oct-v35-h4s-r4vt-heading-tilt_sc_e200_bs64_valtopk_43448962/checkpoints/latest.ckpt` (epoch 100), episodes 9 and 28, one query every 4 RGB frames (0.27 s), chunk steps 1, 6, and 64.
+
+```bash
+python UMIFT_Data/surface_frames_scripts/eval/heading_tilt_panel.py
+```
+
+Output: `UMIFT_Data/surface_frames_scripts/eval/heading_tilt_43448962_e100_ep9_ep28.html`. The interactive frames and the ψ / tilt / geodesic panel are the `--heading-tilt` bar in section 2.
+
+### 4. Open-loop metrics, steps 1 / 6 / 64
+
+Env: `pyrite`. No CLI args. Scores val episodes 9, 12, 28, 37, 41 at RGB stride 64, then the mean of the episode means. The four checkpoints are heading-tilt epoch 25, epoch 100 (`latest.ckpt`), epoch 199, and causal-foot job 43390127 `latest.ckpt`.
+
+```bash
+python UMIFT_Data/surface_frames_scripts/eval/heading_tilt_horizons.py
+```
+
+Output: `UMIFT_Data/surface_frames_scripts/eval/heading_tilt_43448962_horizons.json` and `heading_tilt_43448962_horizons.md`. A checkpoint that is not a readable zip is recorded as an error and the other rows are still written.
+
+### 5. Pull one checkpoint from Hyak
+
+No conda env. `-P` shows progress. This copies one file. The dry run of the epoch-25 file below completed and wrote nothing.
+
+```bash
+RUN=oct-v35-h4s-r4vt-heading-tilt_sc_e200_bs64_valtopk_43448962
+FILE=epoch=0025-val_loss=0.059.ckpt
+mkdir -p /mnt/data/umidata/ft/training_outputs/$RUN/checkpoints
+rsync -P \
+  vtevy@klone.hyak.uw.edu:/gscratch/scrubbed/vtevy/training_outputs/oct_v35_h4s_r4vt_heading_tilt_sc/$RUN/checkpoints/$FILE \
+  /mnt/data/umidata/ft/training_outputs/$RUN/checkpoints/$FILE
+```
+
+Output: `/mnt/data/umidata/ft/training_outputs/$RUN/checkpoints/$FILE`.
+
+### 6. Submit, check, and shrink a Hyak job
+
+No conda env. `sbatch` is not on this machine.
+
+Submit:
+
+```bash
+ssh vtevy@klone.hyak.uw.edu sbatch \
+  /gscratch/scrubbed/vtevy/UMI-FT-causal_foot/UMIFT_Data/surface_frames_scripts/fixb_train_oct_v35_r4vt_heading_tilt_sc_e200_klone.sbatch
+```
+
+That prints a job id. Check the queue, then the job. Memory in the update is an integer in MB. `scontrol show job` prints `MinMemoryNode` with a `G` suffix; do not copy the `G` into the update.
+
+```bash
+ssh vtevy@klone.hyak.uw.edu squeue -u vtevy
+ssh vtevy@klone.hyak.uw.edu scontrol show job JOBID
+ssh vtevy@klone.hyak.uw.edu scontrol update JobId=JOBID NumCPUs=8 MinMemoryNode=65536
+```
+
+`scontrol update` applies while the job is `PENDING`. Logs for a submitted job go to `/gscratch/scrubbed/vtevy/logs/fixb/<jobid>.out` and `.err`.
+
+### 7. Causal-foot runner dry run
+
+Env: `pyrite`. No robot. Replays recorded episodes 9, 28, and 41 through `decode_chunk` with the action blend. The checkpoint is the causal-foot job 43390127 `latest.ckpt`.
+
+```bash
+python UMIFT_Data/surface_frames_scripts/eval/causal_foot_runner_dry_run.py
+```
+
+Output: `UMIFT_Data/surface_frames_scripts/eval/causal_foot_runner_dry_run.json`.
+
+### 8. Tests
+
+Env: `pyrite`, after the shell preamble above. The surface-frames scripts are not on the default `PYTHONPATH`.
+
+```bash
+export PYTHONPATH="$UMIFT_ROOT/UMIFT_Data/surface_frames_scripts:$PYTHONPATH"
+export PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+python -m pytest PyriteML/tests PyriteUtility/tests UMIFT_Data/tests PyriteEnvSuites/tests \
+  --ignore=UMIFT_Data/tests/test_golden.py -q --tb=line
+python -m pytest UMIFT_Data/tests/test_golden.py -q --tb=line
+```
+
+Output is the pytest summary in the terminal. The run after the runner-path fix was 302 passed, 3 failed, then golden 1 passed. The three failures are `test_pin_replaces_every_dim_including_delta_r` (it opens the causal-foot normalizer under the removed `UMI-FT-causal_foot` worktree), `test_import_does_not_load_hardware`, and `test_log_raw_vision_to_obs_inference`.

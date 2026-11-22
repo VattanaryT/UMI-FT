@@ -11,6 +11,10 @@
     --mesh /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/shared/fixb_field.npz \\
     --frames_npz /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_frame_continuity_causal/train_episode_frames.npz
 
+--heading-tilt adds the 8-d heading-tilt checkpoint and causal-foot e199.
+Existing exports stay as they are. The new frames and the ψ panel appear only
+when that flag is set.
+
 Mesh loading, fixture-frame rounding, and bad-span shading are imported from
 view_oct. The camera, time slider, and plot shading in this page are the same
 JavaScript functions. They are copied here because they live inside view_oct's
@@ -918,6 +922,17 @@ td, th { border:1px solid #333; padding:3px 8px; }
 <div class="bar" id="ckptpath" style="color:#9ad;font-size:12px;padding-top:0"></div>
 <div id="view3d"></div>
 <div id="plots"></div>
+<div class="bar" id="headingBar" style="display:none">
+  <span>heading step</span>
+  <button id="hStep1" class="on">1</button>
+  <button id="hStep6">6</button>
+  <button id="hStep64">64</button>
+  <label><input id="hPred" type="checkbox" checked> heading pred</label>
+  <label><input id="hLabel" type="checkbox" checked> heading label</label>
+  <label><input id="hCausal" type="checkbox"> causal e199</label>
+  <span id="headingNote"></span>
+</div>
+<div id="headingPlots" style="display:none;height:32vh"></div>
 <table id="summary"></table>
 <div id="events"></div>
 <script>
@@ -926,6 +941,7 @@ const VIEWS = {
   top: {eye: {x: 0, y: -2.6, z: 0.02}, center: {x: 0, y: 0, z: 0}, up: {x: 0, y: 0, z: -1}},
   end: {eye: {x: 2.6, y: -0.45, z: 0.35}, center: {x: 0, y: 0, z: 0}, up: {x: 0, y: -1, z: 0}}
 };
+let metaHeading = false;
 let viewName = "side";
 let sceneBox = null;
 let mesh = null;
@@ -937,6 +953,10 @@ let span = "exec";
 let regionFilter = "all";
 let geomMode = "foot";
 let selectedLabel = "";
+let headingStep = "1";
+let showHeadingPred = true;
+let showHeadingLabel = true;
+let showCausal = false;
 let onlySelected = true;
 const REGION_COLOR = {crown: "#2ecc71", fillet: "#f4d03f", wall: "#e74c3c"};
 
@@ -1368,6 +1388,86 @@ async function jumpTo(ep, tRel) {
   document.getElementById("time").value = fi;
   await paintCursor();
 }
+function headingRow(t) {
+  const pack = data && data.heading;
+  if (!pack || !pack.t || !pack.t.length) return null;
+  let best = 0;
+  let dist = Infinity;
+  pack.t.forEach((time, i) => {
+    const d = Math.abs(time - t);
+    if (d < dist) { dist = d; best = i; }
+  });
+  return {i: best, step: pack.steps[headingStep]};
+}
+function headingAxes(t) {
+  const hit = headingRow(t);
+  if (!hit || !hit.step) return [];
+  const s = hit.step;
+  const i = hit.i;
+  const traces = [];
+  if (showHeadingPred && s.h_origin_p && s.h_origin_p[i] && s.h_R_p[i]) {
+    traces.push(axesAt(s.h_origin_p[i], s.h_R_p[i], "#ff4d6a", "heading pred", 6));
+  }
+  if (showHeadingLabel && s.h_origin_l && s.h_origin_l[i] && s.h_R_l[i]) {
+    traces.push(axesAt(s.h_origin_l[i], s.h_R_l[i], "#4aa3ff", "heading label", 4));
+  }
+  if (showCausal && s.c_origin_p && s.c_origin_p[i] && s.c_R_p[i]) {
+    traces.push(axesAt(s.c_origin_p[i], s.c_R_p[i], "#ff9f1a", "causal pred", 6));
+  }
+  if (showCausal && s.c_origin_l && s.c_origin_l[i] && s.c_R_l[i]) {
+    traces.push(axesAt(s.c_origin_l[i], s.c_R_l[i], "#3ddc97", "causal label", 4));
+  }
+  return traces;
+}
+function headingLine(x, y, name, color, dash) {
+  return {
+    x, y, name, type: "scatter", mode: "lines",
+    line: {color, width: 2, dash: dash || "solid"}
+  };
+}
+function paintHeading(t) {
+  const box = document.getElementById("headingPlots");
+  const pack = data && data.heading;
+  if (!pack || !pack.t || !pack.t.length || !pack.steps || !pack.steps[headingStep]) {
+    box.style.display = "none";
+    return;
+  }
+  box.style.display = "block";
+  const s = pack.steps[headingStep];
+  const plots = [
+    headingLine(pack.t, s.psi_h_l, "ψ label", "#4aa3ff"),
+    headingLine(pack.t, s.psi_h_p, "ψ pred", "#ff4d6a", "dash")
+  ];
+  const tilt = [
+    headingLine(pack.t, s.tilt_h_l, "tilt label", "#4aa3ff"),
+    headingLine(pack.t, s.tilt_h_p, "tilt pred", "#ff4d6a", "dash")
+  ];
+  const geo = [headingLine(pack.t, s.geo_h, "heading geodesic", "#ff4d6a")];
+  if (showCausal) {
+    plots.push(headingLine(pack.t, s.psi_c_l, "causal ψ label", "#3ddc97"));
+    plots.push(headingLine(pack.t, s.psi_c_p, "causal ψ pred", "#ff9f1a", "dash"));
+    tilt.push(headingLine(pack.t, s.tilt_c_l, "causal tilt label", "#3ddc97"));
+    tilt.push(headingLine(pack.t, s.tilt_c_p, "causal tilt pred", "#ff9f1a", "dash"));
+    geo.push(headingLine(pack.t, s.geo_c, "causal geodesic", "#ff9f1a", "dash"));
+  }
+  tilt.forEach(tr => { tr.xaxis = "x2"; tr.yaxis = "y2"; });
+  geo.forEach(tr => { tr.xaxis = "x3"; tr.yaxis = "y3"; });
+  const mark = {
+    type: "line", xref: "x", yref: "y domain", x0: t, x1: t, y0: 0, y1: 1,
+    line: {color: "#fff", width: 1}
+  };
+  Plotly.react("headingPlots", plots.concat(tilt, geo), {
+    paper_bgcolor: "#111", plot_bgcolor: "#1c1c1c", font: {color: "#ddd"},
+    margin: {l: 64, r: 16, t: 24, b: 28}, legend: {orientation: "h", y: 1.18},
+    shapes: [mark, Object.assign({}, mark, {xref: "x2", yref: "y2 domain"}), Object.assign({}, mark, {xref: "x3", yref: "y3 domain"})],
+    xaxis: {anchor: "y", domain: [0, 1]},
+    yaxis: {title: "ψ deg", domain: [0.70, 1], anchor: "x"},
+    xaxis2: {anchor: "y2", matches: "x", domain: [0, 1]},
+    yaxis2: {title: "tilt deg", domain: [0.36, 0.66], anchor: "x2"},
+    xaxis3: {anchor: "y3", matches: "x", title: "s", domain: [0, 1]},
+    yaxis3: {title: "geodesic deg", domain: [0, 0.32], anchor: "x3"}
+  }, {responsive: true});
+}
 async function paintCursor() {
   const picked0 = selectedRun();
   const slider = document.getElementById("time");
@@ -1440,6 +1540,7 @@ async function paintCursor() {
   if (data.frames && cursor.frame && shownFrame.new) {
     traces.push(axesAt(cursor.frame.x_new, cursor.frame.R_new, "#ff9f1a", "new frame", 6));
   }
+  headingAxes(t).forEach(tr => traces.push(tr));
   if (data.switches && data.switches.length) {
     const sx = [], sy = [], sz = [];
     data.switches.forEach(s => {
@@ -1482,6 +1583,7 @@ async function paintCursor() {
     document.getElementById("summary").innerHTML = "";
     document.getElementById("readout").textContent = t.toFixed(2) + " s";
     document.getElementById("time").value = fi;
+    paintHeading(t);
     bindPicks();
     return;
   }
@@ -1559,6 +1661,7 @@ async function paintCursor() {
   }
   document.getElementById("readout").textContent = readout;
   document.getElementById("time").value = fi;
+  paintHeading(t);
   bindPicks();
 }
 async function show() {
@@ -1590,6 +1693,9 @@ async function show() {
     box.appendChild(document.createTextNode(" " + run.label));
     toggles.appendChild(box);
   });
+  document.getElementById("headingBar").style.display = metaHeading ? "flex" : "none";
+  document.getElementById("headingNote").textContent = metaHeading ? "loading heading-tilt…" : "";
+  if (!data.heading) document.getElementById("headingPlots").style.display = "none";
   const frameToggles = document.getElementById("frame_toggles");
   frameToggles.innerHTML = "";
   if (data.frames) {
@@ -1606,6 +1712,16 @@ async function show() {
     });
   }
   await paintCursor();
+  if (metaHeading) loadHeading(episode);
+}
+async function loadHeading(episode) {
+  const pack = await (await fetch("/api/heading?ep=" + episode)).json();
+  if (!data || String(data.episode) !== String(episode)) return;
+  data.heading = pack;
+  const headingOn = !!(pack.t && pack.t.length);
+  document.getElementById("headingNote").textContent = pack.error || (headingOn ? "" : "no heading queries");
+  if (!headingOn) document.getElementById("headingPlots").style.display = "none";
+  paintCursor();
 }
 document.getElementById("time").oninput = () => { fi = +document.getElementById("time").value; paintCursor(); };
 document.getElementById("ep").onchange = () => show();
@@ -1619,6 +1735,19 @@ function setSpan(next) {
   document.getElementById("spanFull").classList.toggle("on", span === "full");
   if (data) paintCursor();
 }
+function setHeadingStep(step) {
+  headingStep = step;
+  ["1", "6", "64"].forEach(name => {
+    document.getElementById("hStep" + name).classList.toggle("on", name === step);
+  });
+  if (data) paintCursor();
+}
+document.getElementById("hStep1").onclick = () => setHeadingStep("1");
+document.getElementById("hStep6").onclick = () => setHeadingStep("6");
+document.getElementById("hStep64").onclick = () => setHeadingStep("64");
+document.getElementById("hPred").onchange = (ev) => { showHeadingPred = ev.target.checked; if (data) paintCursor(); };
+document.getElementById("hLabel").onchange = (ev) => { showHeadingLabel = ev.target.checked; if (data) paintCursor(); };
+document.getElementById("hCausal").onchange = (ev) => { showCausal = ev.target.checked; if (data) paintCursor(); };
 document.getElementById("spanExec").onclick = () => setSpan("exec");
 document.getElementById("spanFull").onclick = () => setSpan("full");
 function setGeom(next) {
@@ -1661,6 +1790,7 @@ document.addEventListener("keydown", (ev) => {
 (async function init() {
   const meta = await (await fetch("/api/meta")).json();
   mesh = meta.mesh;
+  metaHeading = !!meta.heading;
   const ep = document.getElementById("ep");
   ep.innerHTML = meta.episodes.map(e => {
     const split = meta.splits && meta.splits[String(e)];
@@ -1699,6 +1829,7 @@ class Handler(BaseHTTPRequestHandler):
     exports: list = []
     mesh = None
     frames = None
+    heading = None
 
     def log_message(self, fmt, *args):
         return
@@ -1735,6 +1866,8 @@ class Handler(BaseHTTPRequestHandler):
                     body["switches"] = events["switches"]
                 if events.get("nearcap"):
                     body["nearcap"] = events["nearcap"]
+            if self.heading is not None:
+                body["heading"] = True
             self._send(200, json.dumps(body).encode(), "application/json")
             return
         try:
@@ -1751,6 +1884,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 payload = frames_only_payload(self.frames, episode)
             self._send(200, json.dumps(payload).encode(), "application/json")
+            return
+        if path == "/api/heading":
+            if self.heading is None:
+                self._send(200, b'{"t":[]}', "application/json")
+                return
+            try:
+                pack = self.heading.episode(episode)
+            except Exception as exc:
+                pack = {"t": [], "error": str(exc)}
+            self._send(200, json.dumps(pack).encode(), "application/json")
             return
         if path == "/api/cursor":
             body = json.dumps(cursor_payload(
@@ -1770,6 +1913,10 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
     parser.add_argument("--frames_npz", type=Path, default=None)
+    parser.add_argument("--heading-tilt", action="store_true",
+                        help="Add heading-tilt e100 and causal-foot e199 frames.")
+    parser.add_argument("--heading-ckpt", type=Path, default=None)
+    parser.add_argument("--causal-ckpt", type=Path, default=None)
     args = parser.parse_args()
     export_paths = list(args.export or [])
     for ckpt in args.ckpt or []:
@@ -1797,6 +1944,14 @@ def main() -> None:
         for exp in Handler.exports:
             exp["label"] = f"{exp['label']} [{exp['dir'].name}]"
     Handler.frames = load_frames_npz(args.frames_npz) if args.frames_npz else None
+    Handler.heading = None
+    if args.heading_tilt:
+        from heading_tilt_layer import CAUSAL_CKPT, HEADING_CKPT, HeadingLayer
+        Handler.heading = HeadingLayer(
+            str(args.heading_ckpt) if args.heading_ckpt else HEADING_CKPT,
+            str(args.causal_ckpt) if args.causal_ckpt else CAUSAL_CKPT,
+        )
+        print("[view_openloop] heading-tilt layer on", flush=True)
     if Handler.frames is not None:
         print(f"[view_openloop] frame overlay on episodes {frame_episode_ids(Handler.frames)}", flush=True)
     print(f"[view_openloop] http://{args.host}:{args.port}", flush=True)

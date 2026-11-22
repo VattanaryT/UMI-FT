@@ -425,3 +425,15 @@ def test_saved_export_region_uses_the_label_foot_normal():
     codes = ol.region_code(normal[idx])
     assert names[0] == ol.REGION_NAMES[int(codes[0])]
     assert set(names) <= set(ol.REGION_NAMES)
+
+
+def test_heading_tilt_controls_are_optional():
+    from view_openloop import PAGE
+    from heading_tilt_layer import chart_normal
+
+    assert 'id="headingBar"' in PAGE
+    assert 'id="hStep64"' in PAGE
+    assert 'id="hCausal"' in PAGE
+    eye = np.eye(3)[None]
+    # Tool z is +z and the field normal is +z, so the chart normal flips.
+    assert np.allclose(chart_normal(eye, np.array([[0.0, 0.0, 1.0]])), [[0.0, 0.0, -1.0]])
