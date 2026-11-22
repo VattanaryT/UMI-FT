@@ -251,7 +251,7 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
             if type == "rgb" and not _is_scan_heatmap_key(key):
                 assert image_shape is None or image_shape == shape[1:]
                 image_shape = shape[1:]
-        if vision_encoder_cfg is not None:
+        if vision_encoder_cfg is not None and image_shape is not None:
             if vision_encoder_cfg.transforms is not None and not isinstance(
                 vision_encoder_cfg.transforms[0], torch.nn.Module
             ):
@@ -266,6 +266,10 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
                 if vision_encoder_cfg.transforms is None
                 else torch.nn.Sequential(*vision_encoder_cfg.transforms)
             )
+        elif vision_encoder_cfg is not None:
+            # No wrist RGB in obs. The force tokens still use v_feature_dim as
+            # their width, so the vision cfg stays and only the image crop is skipped.
+            vision_transform = nn.Identity()
 
         for key, attr in obs_shape_meta.items():
             shape = tuple(attr["shape"])
@@ -351,7 +355,7 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
         self.key_shape_map = key_shape_map
         self.position_encoding = position_encoding
 
-        if vision_encoder_cfg is not None:
+        if vision_encoder_cfg is not None and image_shape is not None:
             feature_map_shape = [
                 x // vision_encoder_cfg.downsample_ratio for x in image_shape
             ]
@@ -430,11 +434,14 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
                 )
 
                 # the rgb key can either be rgb or ultrawide. Horizon-wise, rgb, ultrawide, and depth are treated the same.
-                first_rgb_key = rgb_keys[0]
-                n_v_features = (
-                    len(rgb_keys)
-                    * shape_meta["sample"]["obs"]["sparse"][first_rgb_key]["horizon"]
-                )
+                if rgb_keys:
+                    first_rgb_key = rgb_keys[0]
+                    n_v_features = (
+                        len(rgb_keys)
+                        * shape_meta["sample"]["obs"]["sparse"][first_rgb_key]["horizon"]
+                    )
+                else:
+                    n_v_features = 0
                 n_f_features = len(wrench_keys)
 
                 n_features = n_v_features + n_f_features
