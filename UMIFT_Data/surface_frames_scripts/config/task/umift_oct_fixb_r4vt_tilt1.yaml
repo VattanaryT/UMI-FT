@@ -1,0 +1,22 @@
+# 1-tilt: v1, v2, δn, stiffness, a. Same causal-foot zarr and horizons.
+# Heading is R_zero snapped to 0° or 180° by the side. It holds until n·Z crosses ±0.4.
+# b = 0. a is the lean in that frame. The network does not predict the snap.
+# Episodes 35 and 44 stay excluded.
+defaults:
+  - umift_oct_fixb_r4vt_h4s
+  - _self_
+
+name: OCT-V35-FIXB-R4VT-TILT1-5
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_causal_foot/acp_replay_buffer.zarr
+
+dataset:
+  _target_: fixb_tilt1_dataset.UmiFTDatasetTilt1
+  reduced_r4: false
+  mask_delta_R_after_field_jumps: false
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_tilt1.pkl
+  action_normalizer_sha256: f491603f645bbc1f819efd814f72c31f8e09fe4f6f6f8ee80776d0c3181b0769
+
+shape_meta:
+  action:
+    shape: [5]
