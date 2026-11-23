@@ -216,26 +216,18 @@ def _align(new, prev):
     return new
 
 
-def rollout_tool(field, action, foot0, frame0, start_p, dts):
-    """Tool point of one chunk, starting at the query pose.
-
-    v1/v2 walk the foot on the field. The action's δn is the clearance along
-    the carried normal. The query TCP's tangent offset is kept, so step 0 is
-    that pose when δn matches it. Later demonstrated feet are not read. A
-    closest point on the opposite face is rejected.
-    """
+def _walked_frames(field, action, foot0, frame0, dts):
+    """Field frames along v. Used when the caller has no label frames."""
     velocity = np.asarray(action[:, 0:2], dtype=np.float64)
-    clearance = np.asarray(action[:, 2], dtype=np.float64).reshape(-1)
     foot = np.asarray(foot0, dtype=np.float64).reshape(3).copy()
     frame = np.asarray(frame0, dtype=np.float64).reshape(3, 3).copy()
     _landed, n0, _t1 = _hit(field, foot)
     sign = 1.0 if float(np.dot(n0, frame[:, 2])) >= 0.0 else -1.0
-    tangent = frame[:, :2].T @ (np.asarray(start_p, dtype=np.float64).reshape(3) - foot)
     dts = np.asarray(dts, dtype=np.float64).reshape(-1)
-    pos = np.zeros((len(clearance), 3))
-    for k in range(len(clearance)):
-        pos[k] = foot + float(clearance[k]) * frame[:, 2] + frame[:, :2] @ tangent
-        if k + 1 == len(clearance):
+    frames = np.empty((len(velocity), 3, 3))
+    for k in range(len(velocity)):
+        frames[k] = frame
+        if k + 1 == len(velocity):
             break
         guess = foot + frame[:, :2] @ velocity[k] * float(dts[k])
         landed, n, t1 = _hit(field, guess)
@@ -244,15 +236,29 @@ def rollout_tool(field, action, foot0, frame0, start_p, dts):
             continue
         foot = landed
         frame = _align(orthonormal_frames(t1, sign * n), frame)
-    return pos
+    return frames
+
+
+def rollout_tool(field, action, foot0, frame0, start_p, dts, frames=None):
+    """Tool point of one chunk. v integrates from the query TCP. δn is not added.
+
+    Pass the label frames when they are known. Otherwise the foot is walked so
+    each step has a tangent basis. dt must be the label builder's control step.
+    """
+    from r4vt_horizon import integrate_tangent
+
+    if frames is None:
+        frames = _walked_frames(field, action, foot0, frame0, dts)
+    return integrate_tangent(np.asarray(action[:, 0:2], dtype=np.float64), frames, dts, start_p)
 
 
 def causal_pose(field, action, anchor_p, feet, frames, dts):
     """Open-loop tool position, rotation in the demonstrated mold frame."""
-    pos = rollout_tool(field, action, feet[0], frames[0], anchor_p, dts)
-    delta = rot6d_rows_to_R(np.asarray(action[:, 4:10], dtype=np.float64))
-    rot = np.einsum("nij,njk->nik", np.asarray(frames, dtype=np.float64), delta)
-    return pos, rot
+    frames = np.asarray(frames, dtype=np.float64)
+    pos = rollout_tool(field, action, feet[0], frames[0], anchor_p, dts, frames=frames)
+    from r4vt_horizon import compose_field_delta
+
+    return pos, compose_field_delta(frames, action[:, 4:10])
 
 
 def r1rel_pose(action, anchor_p, anchor_R):

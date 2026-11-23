@@ -21,7 +21,7 @@ import score_sign_flip as sc  # noqa: E402
 import heldout  # noqa: E402
 import contact_wall as cw  # noqa: E402
 
-FV = Path("/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts")
+FV = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(FV))
 import field_v2  # noqa: E402
 from field_v2_dataset import mold_local  # noqa: E402

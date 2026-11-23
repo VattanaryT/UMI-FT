@@ -15,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-ROOT = Path("/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames")
+ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS = ROOT / "UMIFT_Data/surface_frames_scripts"
 sys.path[:0] = [str(SCRIPTS), str(ROOT / "PyriteML"), str(ROOT / "PyriteConfig"), str(ROOT / "PyriteUtility"), str(ROOT)]
 
@@ -49,9 +49,7 @@ THIN_FIELD = Path(
 SRC = DATA / "r4vt_smooth_tcp_track_clean/acp_replay_buffer.zarr"
 OUT = DATA / "r4vt_field_v2_k3000"
 NORM = SCRIPTS / "assets/oct_v35_h4s_r4vt_action_normalizer_minmax_field_v2_k3000.pkl"
-HELD = Path(
-    "/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/eval/thin_heldout"
-)
+HELD = SCRIPTS / "eval/thin_heldout"
 SNAP = SCRIPTS / "eval/thin_frames"
 K = 3000.0
 CARRY_DEG = 30.0

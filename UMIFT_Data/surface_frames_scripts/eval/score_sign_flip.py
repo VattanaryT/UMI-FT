@@ -12,11 +12,8 @@ import json
 import sys
 from pathlib import Path
 
-HELD = Path(
-    "/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/"
-    "UMIFT_Data/surface_frames_scripts/eval/thin_heldout"
-)
-TILT = Path("/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts")
+HELD = Path(__file__).resolve().parent / "thin_heldout"
+TILT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(HELD), str(HELD.parent / "viewer"), str(TILT)]
 
 import numpy as np  # noqa: E402
@@ -43,10 +40,7 @@ from tilt1 import heading_half, rotation_from_tilt1  # noqa: E402
 TRAIN = Path("/mnt/data/umidata/ft/training_outputs")
 DATA = Path("/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr")
 TILT_NORM = TILT / "assets/oct_v35_h4s_r4vt_action_normalizer_minmax_tilt1.pkl"
-K3000_NORM = Path(
-    "/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/"
-    "surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_causal_foot_carry_k3000.pkl"
-)
+K3000_NORM = TILT / "assets/oct_v35_h4s_r4vt_action_normalizer_minmax_causal_foot_carry_k3000.pkl"
 # Horizon table is score_sign_flip_v2.json and is not rewritten here.
 OUT = Path(__file__).resolve().parent / "score_sign_flip_onestep.json"
 STEPS = (1, 6, 16, 64)
@@ -168,6 +162,20 @@ def pose_error(kind, action, demo, index, axis=None):
         else:
             raise RuntimeError(f"unknown action {kind}")
     return pos, geodesic_deg(got_R, tool_R), xyz
+
+
+def horizon_pose(kind, action, demo, index, axis=None):
+    """Integrated v and R_field @ ΔR at every step. δn is not a position."""
+    del axis
+    if kind != "causal":
+        raise RuntimeError(f"horizon walk is r4vt, not {kind}")
+    sys.path.insert(0, str(TILT))
+    from r4vt_horizon import control_dts, decode_horizon
+
+    index = np.asarray(index, dtype=np.int64)
+    frames = np.asarray(demo["frame"], dtype=np.float64)[index]
+    dts = control_dts(demo["robot_t"], demo["rgb_t"], index)
+    return decode_horizon(action, demo["tool_p"][int(index[0])], frames, dts)
 
 
 def _score(kind, policy, dataset, field, demo, rows, device, axis):
