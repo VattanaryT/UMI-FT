@@ -1821,9 +1821,13 @@ def main():
                     f"(x{wrench_corr:.2f})"
                 )
 
+    from mold_aware_runtime import align_obs_slack_samples
+
+    _align_slack = align_obs_slack_samples()
     ts_pose_query_size = (
         shape_meta["sample"]["obs"]["sparse"]["robot0_eef_pos"]["horizon"] - 1
     ) * shape_meta["sample"]["obs"]["sparse"]["robot0_eef_pos"]["down_sample_steps"] + 1
+    ts_pose_query_size += _align_slack
 
     if "robot0_eef_wrench_left" in shape_meta["sample"]["obs"]["sparse"]:
         wrench_query_size = (
@@ -1832,6 +1836,7 @@ def main():
         ) * shape_meta["sample"]["obs"]["sparse"]["robot0_eef_wrench_left"][
             "down_sample_steps"
         ] + 1
+        wrench_query_size += _align_slack
     else:
         wrench_query_size = 0
 
@@ -2604,10 +2609,25 @@ def main():
                     obs_raw[f"rgb_time_stamps_{id}"] = obs_raw[
                         f"ultrawide_time_stamps_{id}"
                     ]
-            if mold_runtime is not None:
-                from mold_aware_runtime import align_obs_to_image
+            from mold_aware_runtime import align_obs_to_image
 
-                align_obs_to_image(obs_raw, id_list)
+            align_report = align_obs_to_image(
+                obs_raw,
+                id_list,
+                hardware_now_s=env.current_hardware_time_s,
+                wall_now_s=time.time(),
+            )
+            if align_report is not None and align_report.get("pose_ms") is not None:
+                wrench_ms = align_report["wrench_ms"]
+                wrench_txt = "n/a" if wrench_ms is None else f"{wrench_ms:.1f} ms"
+                align_line = (
+                    f"[align] |t_pose-t_rgb| {align_report['pose_ms']:.1f} ms"
+                    f" |t_wrench-t_rgb| {wrench_txt}"
+                )
+                if align_report["warn"]:
+                    print_red(align_line + "  warn: over 10 ms")
+                else:
+                    print(align_line)
             # import pdb; pdb.set_trace()
 
             # Mold-aware: fill mold_* from tip in *fixture* frame (field frame).
@@ -2975,6 +2995,14 @@ def main():
                     ep_seam_deg.append(ang)
                 prev_seam_x = decoded["x_d"][exe_h_preview - 1].copy()
                 prev_seam_R = decoded["R_d"][exe_h_preview - 1].copy()
+                if decoded.get("v_par") is not None and "R_field" in decoded:
+                    v0 = np.asarray(decoded["v_par"][0], dtype=np.float64).reshape(-1)[:2]
+                    rel = np.asarray(decoded["R_field"][0]).T @ np.asarray(decoded["R_d"][0])
+                    twist = float(np.degrees(Rotation.from_matrix(rel).as_rotvec()[2]))
+                    print(
+                        f"[query] |v| {float(np.linalg.norm(v0)):.3f} m/s "
+                        f"v {v0[0]:+.3f} {v0[1]:+.3f} twist {twist:+.1f} deg"
+                    )
                 tgt, vt = mold_runtime.decoded_to_action_mats(decoded)
                 action_sparse_target_mats = [tgt]
                 action_sparse_vt_mats = [vt]

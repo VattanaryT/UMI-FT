@@ -151,6 +151,8 @@ if [[ "$arm" == "r4vt" ]]; then
   echo "max_duration_s=${UMIFT_MAX_DURATION_S:-480}"
 fi
 
+export UMIFT_ALIGN_OBS_TO_IMAGE="${UMIFT_ALIGN_OBS_TO_IMAGE:-1}"
+export UMIFT_FOOT_WALK="${UMIFT_FOOT_WALK:-geodesic}"
 source /home/boeing/umi_ft_ws/worktrees/activate.sh UMI-FT-surface_frames \
   || die "could not source activate.sh"
 # shellcheck disable=SC1091
