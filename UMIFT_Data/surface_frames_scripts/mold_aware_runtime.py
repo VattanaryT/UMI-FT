@@ -717,6 +717,11 @@ def foot_walk_mode() -> str:
 
 LEAD_IN_SPEED_MPS = 0.12
 OBS_IMAGE_LAG_S = 0.050
+OBS_IMAGE_WARN_S = 0.010
+# Pose and wrench are read at the 500 Hz server rate. Extra history so a
+# ~100 ms camera lag can be trimmed off and the policy window is still full.
+ALIGN_OBS_SLACK_S = 0.30
+ALIGN_BUFFER_HZ = 500.0
 
 
 def lead_in_seconds() -> float:
@@ -775,25 +780,65 @@ def lead_in_poses(
 
 
 def align_obs_enabled() -> bool:
-    """Pose and wrench windows end at the newest image time when this is on."""
-    return os.environ.get("UMIFT_ALIGN_OBS_TO_IMAGE", "").strip().lower() in (
-        "1",
-        "true",
-        "on",
-        "yes",
-    )
+    """Pose and wrench windows end at the newest image time. Default on.
+
+    ``UMIFT_ALIGN_OBS_TO_IMAGE=0`` turns it off.
+    """
+    raw = os.environ.get("UMIFT_ALIGN_OBS_TO_IMAGE", "1").strip().lower()
+    return raw in ("1", "true", "on", "yes")
 
 
-def align_obs_to_image(obs_raw: dict, id_list=(0,)) -> None:
-    """Trim pose and wrench so the newest sample is the image time.
+def align_obs_slack_samples() -> int:
+    if not align_obs_enabled():
+        return 0
+    return int(round(ALIGN_OBS_SLACK_S * ALIGN_BUFFER_HZ))
 
-    The index is ``searchsorted`` on that stream, the same call the training
-    sampler uses. A sample more than 50 ms from the image raises. Unset, this
-    returns without reading the buffers.
+
+def _on_hardware_clock(times, hardware_now_s, wall_now_s):
+    """RealSense global time is unix seconds. The server timer is not.
+
+    Same clock (within 5 s) is left alone, so tests and training-style stamps
+    do not move. A unix stamp is shifted by ``wall_now - hardware_now``.
+    """
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    if hardware_now_s is None or len(times) == 0:
+        return times
+    if abs(float(times[-1]) - float(hardware_now_s)) < 5.0:
+        return times
+    if wall_now_s is None:
+        return times
+    return times - float(wall_now_s) + float(hardware_now_s)
+
+
+def _searchsorted_lag(times, queries):
+    """Max |t_found - t_query| using the training sampler's searchsorted."""
+    times = np.asarray(times, dtype=np.float64).reshape(-1)
+    queries = np.asarray(queries, dtype=np.float64).reshape(-1)
+    if len(times) == 0 or len(queries) == 0:
+        return None
+    idx = np.clip(np.searchsorted(times, queries), 0, len(times) - 1)
+    return float(np.max(np.abs(times[idx] - queries)))
+
+
+def align_obs_to_image(obs_raw: dict, id_list=(0,), hardware_now_s=None, wall_now_s=None):
+    """Trim pose and wrench so each image time hits that stream.
+
+    RGB timestamps are moved onto the server clock first. The index is
+    ``searchsorted``, the same call the training sampler uses. The newest
+    image more than 50 ms from the stream raises. The return value is the
+    max residual over the RGB window, in milliseconds.
     """
     if not align_obs_enabled():
-        return
+        return None
+    report = {"pose_ms": None, "wrench_ms": None, "warn": False}
     for rid in id_list:
+        for key in (
+            f"rgb_time_stamps_{rid}",
+            f"depth_time_stamps_{rid}",
+            f"ultrawide_time_stamps_{rid}",
+        ):
+            if key in obs_raw:
+                obs_raw[key] = _on_hardware_clock(obs_raw[key], hardware_now_s, wall_now_s)
         rgb_key = f"rgb_time_stamps_{rid}"
         if rgb_key not in obs_raw:
             continue
@@ -802,12 +847,12 @@ def align_obs_to_image(obs_raw: dict, id_list=(0,)) -> None:
             continue
         query = float(rgb_t[-1])
         pairs = (
-            (f"ts_pose_fb_{rid}", f"robot_time_stamps_{rid}"),
-            (f"wrench_left_{rid}", f"wrench_time_stamps_{rid}"),
-            (f"wrench_{rid}", f"wrench_time_stamps_{rid}"),
+            (f"ts_pose_fb_{rid}", f"robot_time_stamps_{rid}", "pose_ms"),
+            (f"wrench_left_{rid}", f"wrench_time_stamps_{rid}", "wrench_ms"),
+            (f"wrench_{rid}", f"wrench_time_stamps_{rid}", "wrench_ms"),
         )
         seen = set()
-        for value_key, time_key in pairs:
+        for value_key, time_key, report_key in pairs:
             if value_key not in obs_raw or time_key not in obs_raw or time_key in seen:
                 continue
             times = np.asarray(obs_raw[time_key], dtype=np.float64).reshape(-1)
@@ -825,6 +870,15 @@ def align_obs_to_image(obs_raw: dict, id_list=(0,)) -> None:
             obs_raw[value_key] = values[: idx + 1]
             obs_raw[time_key] = times[: idx + 1]
             seen.add(time_key)
+            kept = obs_raw[time_key]
+            in_window = rgb_t[(rgb_t >= kept[0] - 1e-3) & (rgb_t <= kept[-1] + 1e-3)]
+            window = _searchsorted_lag(kept, in_window if len(in_window) else rgb_t[-1:])
+            if window is None:
+                continue
+            report[report_key] = window * 1e3
+            if window > OBS_IMAGE_WARN_S:
+                report["warn"] = True
+    return report
 
 
 def foot_climb_enabled() -> bool:

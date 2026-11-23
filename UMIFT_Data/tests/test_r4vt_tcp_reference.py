@@ -359,7 +359,7 @@ def test_lead_in_moves_along_t2(monkeypatch):
 def test_align_obs_trims_to_the_image_and_checks_lag(monkeypatch):
     from mold_aware_runtime import align_obs_to_image
 
-    monkeypatch.delenv("UMIFT_ALIGN_OBS_TO_IMAGE", raising=False)
+    monkeypatch.setenv("UMIFT_ALIGN_OBS_TO_IMAGE", "0")
     raw = {
         "rgb_time_stamps_0": np.array([0.0, 0.10]),
         "ts_pose_fb_0": np.arange(6, dtype=np.float64).reshape(3, 2),
