@@ -1,0 +1,16 @@
+# Field v2: causal-foot 10-d action, TCP position in the mold PCA frame.
+# robot0_eef_pos is meters in that frame (origin = body centroid, +x toward
+# the end nearer the right-arm base). Rotation and wrench stay fixture/TCP.
+defaults:
+  - umift_oct_fixb_r4vt_causal_foot
+  - _self_
+
+name: OCT-V35-FIXB-R4VT-FIELD-V2-K3000
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_field_v2_k3000/acp_replay_buffer.zarr
+
+dataset:
+  _target_: field_v2_dataset.UmiFTDatasetFieldV2
+  reduced_r4: true
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_field_v2_k3000.pkl
+  action_normalizer_sha256: 0102d34e92fc1c1e092ed6a4c5727be981915e548ada9eadd9f64bdf87c55b8e
