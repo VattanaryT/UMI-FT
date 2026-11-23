@@ -209,7 +209,7 @@ def test_normal_gap_is_allowed_only_when_the_tcp_was_inside():
 
 def test_runner_checks_before_the_prompt_and_holds_the_lookback():
     src = Path(
-        "/home/boeing/umi_ft_ws/worktrees/UMI-FT-smooth_frame/"
+        "/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/"
         "PyriteEnvSuites/env_runners/umift_env_runner.py"
     ).read_text()
     wait = src.find("                _wait_policy_descent(")
