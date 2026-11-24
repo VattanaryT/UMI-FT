@@ -1,0 +1,14 @@
+# Field v3r: field v2 inputs, position, and δn. Rotation is R_tcp(t).T @ R_tcp(t+k).
+defaults:
+  - umift_oct_fixb_r4vt_causal_foot
+  - _self_
+
+name: OCT-V35-FIXB-R4VT-FIELD-V3R
+
+dataset_path: /mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_field_v3r/acp_replay_buffer.zarr
+
+dataset:
+  _target_: field_v3r_dataset.UmiFTDatasetFieldV3R
+  reduced_r4: true
+  action_normalizer_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-field_v3r/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_field_v3r.pkl
+  action_normalizer_sha256: 55a99fbffed1c47e018a4638e044208021bf833b92c10f98d22c957e5eae9f30

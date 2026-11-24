@@ -2,8 +2,8 @@
 
 Position is the integral of tangential v. dt is the label builder's control
 step (the next RGB sample), not the robot-sample step. δn is the force target
-and is not a position. Rotation at every step is R_field @ ΔR, which is how
-the label builder stored it.
+and is not a position. Field v2 rotation is R_field @ ΔR. Field v3r
+passes the query TCP and uses R_tcp @ ΔR, with ΔR = R_tcp(t).T @ R_tcp(t+k).
 """
 
 from __future__ import annotations
@@ -45,11 +45,24 @@ def compose_field_delta(frames, delta_rot6d) -> np.ndarray:
     return np.einsum("nij,njk->nik", frames, delta)
 
 
-def decode_horizon(action, p0, frames, dts):
-    """xyz (H, 3), R_tool (H, 3, 3) for a 10-d r4vt action."""
+def compose_tcp_delta(R_tcp, delta_rot6d) -> np.ndarray:
+    """R_next = R_tcp @ ΔR. ΔR is relative to the query TCP, as in r1rel."""
+    R0 = np.asarray(R_tcp, dtype=np.float64).reshape(3, 3)
+    delta = rot6d_rows_to_R(np.asarray(delta_rot6d, dtype=np.float64))
+    return np.einsum("ij,njk->nik", R0, delta)
+
+
+def decode_horizon(action, p0, frames, dts, R_tcp=None):
+    """xyz (H, 3), R_tool (H, 3, 3) for a 10-d r4vt action.
+
+    R_tcp=None keeps field_v2: R_field @ ΔR. Passing the query TCP selects
+    field_v3r: R_tcp @ ΔR.
+    """
     action = np.asarray(action, dtype=np.float64)
     if action.ndim != 2 or action.shape[1] < 10:
         raise ValueError(f"r4vt action {action.shape}")
     frames = np.asarray(frames, dtype=np.float64).reshape(len(action), 3, 3)
     xyz = integrate_tangent(action[:, 0:2], frames, dts, p0)
-    return xyz, compose_field_delta(frames, action[:, 4:10])
+    if R_tcp is None:
+        return xyz, compose_field_delta(frames, action[:, 4:10])
+    return xyz, compose_tcp_delta(R_tcp, action[:, 4:10])

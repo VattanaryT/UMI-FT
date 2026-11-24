@@ -70,7 +70,15 @@ from closedloop_sim.api import (  # noqa: E402
     compliance_command,
     load_policy,
 )
-from closedloop_sim.plant import INTEGRATE_DT_S, CartesianSpringPlant  # noqa: E402
+from closedloop_sim.plant import (  # noqa: E402
+    CONTACT_SPLIT_N,
+    INTEGRATE_DT_S,
+    CartesianSpringPlant,
+    contact_masks,
+)
+from closedloop_sim.rollout_view import publish  # noqa: E402
+from closedloop_sim.segments import events, label_segments, run_span  # noqa: E402
+from r4vt_horizon import decode_horizon  # noqa: E402
 from fixb_field import FixBMoldField  # noqa: E402
 from fixb_labels import Rp_to_pose7, pose7_to_Rp  # noqa: E402
 from mold_aware_runtime import (  # noqa: E402
@@ -115,19 +123,27 @@ ZARR = Path(
 )
 OUT = Path(__file__).resolve().parent / "out"
 
+_TRAIN = "/mnt/data/umidata/ft/training_outputs"
 CHECKPOINTS = {
-    "fk60": (
-        "/mnt/data/umidata/ft/training_outputs/fk3000-c/epoch=0060-val_loss=0.071.ckpt"
-    ),
+    "fk60": f"{_TRAIN}/fk3000-c/epoch=0060-val_loss=0.071.ckpt",
     "e40": (
-        "/mnt/data/umidata/ft/training_outputs/oct_v35_h4s_r4vt_causal_foot/"
+        f"{_TRAIN}/oct_v35_h4s_r4vt_causal_foot/"
         "oct-v35-h4s-r4vt-causal-foot_e200_bs64_valtopk_43390127/checkpoints/"
         "epoch=0040-val_loss=0.063.ckpt"
     ),
-    "r1rel": (
-        "/mnt/data/umidata/ft/training_outputs/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt"
+    "r1rel": f"{_TRAIN}/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt",
+    "r1rel_e195": f"{_TRAIN}/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt",
+    "field_v2_e25": (
+        f"{_TRAIN}/oct_v35_h4s_r4vt_field_v2_k3000/checkpoints/epoch=0025-val_loss=0.048.ckpt"
+    ),
+    "field_v2_e140": f"{_TRAIN}/oct_v35_h4s_r4vt_field_v2_k3000/checkpoints/latest_1005.ckpt",
+    "k3000_e199": (
+        f"{_TRAIN}/oct-v35-h4s-r4vt-causal-foot-carry-k3000_e200_bs64_valtopk_43472139/"
+        "checkpoints/e199_final.ckpt"
     ),
 }
+# k3000 e199 was scored with the thin tangent flip t1, t2 = -t1, -t2.
+SIGN_FLIP = {"k3000_e199": np.diag([-1.0, -1.0, 1.0])}
 
 RAW_DT_S = 1.0 / 15.0
 SLOW_DOWN = 2.0
@@ -337,6 +353,49 @@ def _window(trace, mask) -> dict:
     return out
 
 
+def _segments(trace, demo) -> dict:
+    labels = label_segments(trace["force_n"], trace["clearance_m"])
+    out = {}
+    for name in ("contact", "approach", "lift-off", "air-travel"):
+        mask = labels == name
+        if not np.any(mask):
+            out[name] = {"n": 0}
+            continue
+        part = {key: np.asarray(value)[mask] for key, value in trace.items()}
+        block = _window(trace, mask)
+        block["path_vs_demo"] = _path_vs_demo(part, demo)
+        block["clearance_mm"] = _stats(part["clearance_m"] * 1e3)
+        out[name] = block
+    out["events"] = events(
+        demo["t_s"],
+        demo["segment"],
+        demo["clearance_m"],
+        demo["position"],
+        trace["t_s"],
+        trace["clearance_m"],
+        trace["position"],
+    )
+    return out
+
+
+def _by_force(trace, demo, force_world) -> dict:
+    on, off, _force = contact_masks(force_world)
+
+    def one(mask):
+        if not np.any(mask):
+            return {"n": 0}
+        part = {key: np.asarray(value)[mask] for key, value in trace.items()}
+        block = _window(trace, mask)
+        block["path_vs_demo"] = _path_vs_demo(part, demo)
+        return block
+
+    return {
+        "threshold_n": CONTACT_SPLIT_N,
+        "contact": one(on),
+        "non_contact": one(off),
+    }
+
+
 def _tilt_deg(rotation, normal) -> np.ndarray:
     z_axis = np.asarray(rotation, dtype=np.float64)[:, :, 2]
     target = -np.asarray(normal, dtype=np.float64)
@@ -406,6 +465,17 @@ def _demo_episode(episode: int) -> dict:
     query = field.query(position)
     normal = np.asarray(query["R"][:, :, 2], dtype=np.float64)
     normal = normal / np.clip(np.linalg.norm(normal, axis=1, keepdims=True), 1e-12, None)
+    clearance = np.maximum(np.asarray(query["sd"], dtype=np.float64).reshape(-1), 0.0)
+    wrench_t = np.asarray(group["wrench_time_stamps_0"], dtype=np.float64).reshape(-1)
+    wrench = np.asarray(group["wrench_left_0"], dtype=np.float64)
+    nearest = np.clip(np.searchsorted(wrench_t, times), 0, len(wrench) - 1)
+    prev = np.clip(nearest - 1, 0, len(wrench) - 1)
+    use_prev = np.abs(wrench_t[prev] - times) < np.abs(wrench_t[nearest] - times)
+    force = np.linalg.norm(wrench[np.where(use_prev, prev, nearest), :3], axis=1)
+    dt = np.diff(times, prepend=times[0])
+    dt[0] = np.median(dt[1:]) if dt.size > 1 else 1.0
+    step = np.linalg.norm(np.diff(position, axis=0, prepend=position[:1]), axis=1)
+    segment = label_segments(force, clearance)
     return {
         "t_s": times - times[0],
         "position": position,
@@ -415,6 +485,10 @@ def _demo_episode(episode: int) -> dict:
         "duration_s": float(times[-1] - times[0]),
         "pose0": pose[0].copy(),
         "pose7": pose,
+        "force_n": force,
+        "clearance_m": clearance,
+        "speed_mps": step / np.maximum(dt, 1e-6),
+        "segment": segment,
     }
 
 
@@ -492,7 +566,7 @@ def _checkpoint_task_name(path: str) -> str:
     return task_name
 
 
-def rollout(name: str, demo: dict, episode: int = 40) -> dict:
+def rollout(name: str, demo: dict, episode: int = 40, mode: str = "full") -> dict:
     import torch
 
     torch.manual_seed(0)
@@ -534,7 +608,7 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
     pose = np.zeros((cap, 7), dtype=np.float64)
     wrench = np.zeros((cap, 6), dtype=np.float64)
     times = np.zeros(cap, dtype=np.float64)
-    start = demo["pose0"]
+    t_start, t_end, start = run_span(demo, mode)
     start_R, start_p = pose7_to_Rp(start.reshape(1, 7))
     plant = CartesianSpringPlant(FixBMoldField(FIELD), start_p[0], start_R[0])
     snap = plant._forces(plant.x.copy(), np.zeros((3, 3), dtype=np.float64))
@@ -543,7 +617,7 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
     hold_wrench[:3] = plant.R.T @ contact
     pre_dt = 1.0 / POSE_HZ
     for i in range(robot_need):
-        times[i] = -(robot_need - 1 - i) * pre_dt
+        times[i] = t_start - (robot_need - 1 - i) * pre_dt
         pose[i] = start
         wrench[i] = hold_wrench
     count = robot_need
@@ -596,7 +670,7 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
     n_holds = 0
     n_gate = 0
     next_replan = 0.0
-    t = 0.0
+    t = t_start
     schedule = None
     mold_normal = np.asarray(snap["normal"], dtype=np.float64)
 
@@ -618,6 +692,8 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
                 "pose7": np.asarray(pose7, dtype=np.float64).copy(),
                 "virtual_target": np.asarray(virtual_target, dtype=np.float64).reshape(3).copy(),
                 "force": np.asarray(state["contact_world"], dtype=np.float64).reshape(3).copy(),
+                "sd_m": float(state["sd_m"]),
+                "clearance_m": float(max(state["sd_m"], 0.0)),
             }
         )
 
@@ -663,7 +739,7 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
             obs["depth_0"] = np.zeros_like(obs["depth_0"])
         if "elapsed_time_0" in sparse and "elapsed_time_0" not in obs:
             horizon = int(sparse["elapsed_time_0"]["horizon"])
-            obs["elapsed_time_0"] = np.full((horizon, 1), t / SLOW_DOWN, np.float32)
+            obs["elapsed_time_0"] = np.full((horizon, 1), (t - t_start) / SLOW_DOWN, np.float32)
         missing = [
             key
             for key in sparse
@@ -685,6 +761,24 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
             dt = fixb_decode_dt(raw.shape[0], action_ds, RAW_DT_S)
             p0_R, p0 = pose7_to_Rp(measured.reshape(1, 7))
             decoded = runtime.decode_chunk(raw, p0[0], p0_R[0], dt)
+            wide = raw.reshape(-1, raw.shape[-1])
+            if wide.shape[1] == 27:
+                action10 = np.zeros((wide.shape[0], 10), dtype=np.float64)
+                action10[:, 0:3] = wide[:, 0:3]
+                action10[:, 3] = wide[:, 18]
+                action10[:, 4:10] = wide[:, 21:27]
+            elif wide.shape[1] == 10:
+                action10 = wide
+            else:
+                raise RuntimeError(f"{name} r4vt action {wide.shape}")
+            frame = np.asarray(query["R"][0], dtype=np.float64)
+            flip = SIGN_FLIP.get(name)
+            if flip is not None:
+                frame = frame @ flip
+            frames = np.repeat(frame.reshape(1, 3, 3), action10.shape[0], axis=0)
+            xyz, tool_R = decode_horizon(action10[:, :10], p0[0], frames, dt)
+            decoded["x_d"] = xyz
+            decoded["R_d"] = tool_R
             hard = list(runtime.last_hard_triggers)
             if hard:
                 return None, "safety:" + ",".join(hard)
@@ -777,7 +871,7 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
 
     last_print = -5.0
     pending_stop = None
-    while t < demo["duration_s"] - 1e-9:
+    while t < t_end - 1e-9:
         if t + 1e-9 >= next_replan:
             if pending_stop is not None:
                 stop = pending_stop
@@ -860,7 +954,11 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
         "speed_mps": _stats(trace["speed_mps"]),
         "n_speed_over_1": int(np.sum(trace["speed_mps"] > 1.0)),
         "after_start_pad": _window(trace, trace["t_s"] > 5.0),
+        "mode": mode,
+        "t_start_s": float(t_start),
+        "t_end_s": float(t_end),
         "path_vs_demo": _path_vs_demo(trace, demo),
+        "by_force": _by_force(trace, demo, np.asarray([row["force"] for row in rows])),
         "plant": {
             "spring_force_limit_n": float(plant.spring_force_limit_n),
             "spring_force_config": str(plant.spring_force_config),
@@ -872,9 +970,23 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
         },
     }
     OUT.mkdir(parents=True, exist_ok=True)
-    tag = f"policy_{name}_fixb_ep{episode}"
+    tag = f"policy_{name}_{mode}_fixb_ep{episode}"
     trace["virtual_target"] = np.asarray([row["virtual_target"] for row in rows])
     trace["force"] = np.asarray([row["force"] for row in rows])
+    trace["force_n"] = np.linalg.norm(trace["force"], axis=1)
+    trace["sd_m"] = np.asarray([row["sd_m"] for row in rows])
+    trace["clearance_m"] = np.asarray([row["clearance_m"] for row in rows])
+    report["segment_force"] = {
+        "demo": "wrist wrench",
+        "rollout": "plant contact",
+        "contact_above_n": 5.0,
+        "air_below_n": 2.0,
+        "air_clearance_mm": 10.0,
+    }
+    report["segments"] = _segments(trace, demo)
+    report["demo_segments"] = {
+        name: int(np.sum(demo["segment"] == name)) for name in ("contact", "approach", "lift-off", "air-travel")
+    }
     np.savez_compressed(
         OUT / f"{tag}.npz",
         **{
@@ -882,6 +994,16 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
             for key in list(scalar) + ["position", "normal", "pose7", "virtual_target", "force"]
         },
     )
+    view = publish(
+        OUT,
+        tag,
+        plant.field,
+        trace["position"],
+        demo["position"],
+        trace["normal"],
+        trace["force"],
+    )
+    report["view"] = view
     (OUT / f"{tag}.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"[{name}] stopped={stop} duration={report['duration_s']:.2f}s", flush=True)
     del policy
@@ -892,7 +1014,7 @@ def rollout(name: str, demo: dict, episode: int = 40) -> dict:
 
 def main() -> None:
     require_worktree()
-    names = sys.argv[1:] or ["fk60", "e40", "r1rel"]
+    names = [arg for arg in sys.argv[1:] if not arg.startswith("-")] or ["fk60", "e40", "r1rel"]
     demo = _demo_episode(40)
     OUT.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
@@ -900,11 +1022,23 @@ def main() -> None:
         t_s=demo["t_s"],
         position=demo["position"],
         pose7=demo["pose7"],
+        segment=np.asarray(demo["segment"]),
     )
     print(f"episode 40 length {demo['duration_s']:.3f}s", flush=True)
-    reports = [rollout(name, demo) for name in names]
+    print(
+        "demo segments "
+        + " ".join(
+            f"{name}={int(np.sum(demo['segment'] == name))}"
+            for name in ("contact", "approach", "lift-off", "air-travel")
+        ),
+        flush=True,
+    )
+    reports = []
+    for name in names:
+        reports.append(rollout(name, demo, mode="full"))
+        reports.append(rollout(name, demo, mode="contact"))
     OUT.mkdir(parents=True, exist_ok=True)
-    (OUT / "policy_fixb_ep40.json").write_text(json.dumps(reports, indent=2) + "\n")
+    (OUT / "policy_agreed_ep40.json").write_text(json.dumps(reports, indent=2) + "\n")
     print(json.dumps(reports, indent=2))
 
 
