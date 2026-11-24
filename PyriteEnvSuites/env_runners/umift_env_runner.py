@@ -44,7 +44,6 @@ from PyriteEnvSuites.env_runners.policy_start_pose import (
     allow_normal_gap,
     arrival_error,
     descent_alpha_at_surface,
-    first_frame_pose7,
     position_accepted,
     position_parts,
     movej_path,
@@ -52,7 +51,9 @@ from PyriteEnvSuites.env_runners.policy_start_pose import (
     pose7_to_ur_rotvec,
     pose_rotation_deg,
     query_wrist_ik,
+    frame_pose7,
     read_policy_start_episode,
+    read_policy_start_index,
     rotation_capped_waypoints,
     wrist3_seeds,
     zarr_for_policy_start,
@@ -1176,6 +1177,11 @@ if "PYRITE_CONTROL_LOG_FOLDERS" not in os.environ:
 checkpoint_folder_path = os.environ.get("PYRITE_CHECKPOINT_FOLDERS")
 hardware_config_folder_path = os.environ.get("PYRITE_HARDWARE_CONFIG_FOLDERS")
 control_log_folder_path = os.environ.get("PYRITE_CONTROL_LOG_FOLDERS")
+# One run directory, when scripts/run_rollout.sh --out_dir (or UMIFT_RUN_DIR) is set.
+# Unset keeps logs under PYRITE_CONTROL_LOG_FOLDERS.
+_run_dir = os.environ.get("UMIFT_RUN_DIR", "").strip()
+if _run_dir:
+    control_log_folder_path = _run_dir
 
 
 def resolve_realsense_serial(hardware_config_path: str) -> Optional[str]:
@@ -1387,6 +1393,26 @@ def print_loaded_action_normalizer(policy) -> None:
     )
 
 
+def _write_run_meta_if_requested(start_pose, pose_note, control_para, pipeline_para, mode):
+    """Refresh meta.json when this process was given one run directory."""
+    run_dir = os.environ.get("UMIFT_RUN_DIR", "").strip()
+    if not run_dir:
+        return
+    from PyriteEnvSuites.env_runners.run_meta import write_run_meta
+
+    write_run_meta(
+        run_dir,
+        mode=mode,
+        ckpt_path=str(pipeline_para.get("ckpt_path", "")),
+        normalizer_sha=os.environ.get("UMIFT_ACTION_NORMALIZER_SHA", ""),
+        start_pose=np.asarray(start_pose, dtype=np.float64).reshape(7),
+        start_note=pose_note + ", right_base",
+        stiffness_floor=read_press_stiffness_floor(),
+        slow_down_factor=float(control_para["slow_down_factor"]),
+        command=os.environ.get("UMIFT_RUN_COMMAND", ""),
+    )
+
+
 def main():
     control_para = {
         # Training policy rate = 10 Hz; iPhone/GoPro legacy path uses 0.0167 (~60 Hz).
@@ -1547,10 +1573,13 @@ def main():
     vbs_h2 = verbose  # verbosity for sub-header
     # vbs_p = verbose - 1  # verbosity for paragraph
 
-    # load policy
-    ckpt_full_path = Path(
-        checkpoint_folder_path + pipeline_para["ckpt_path"]
-    )
+    # load policy. A leading-slash path under PYRITE_CHECKPOINT_FOLDERS stays
+    # relative to that folder. An absolute path that already exists is used as-is.
+    raw_ckpt = str(pipeline_para["ckpt_path"])
+    if raw_ckpt.startswith("/") and Path(raw_ckpt).is_file():
+        ckpt_full_path = Path(raw_ckpt)
+    else:
+        ckpt_full_path = Path(checkpoint_folder_path + raw_ckpt)
     print("Loading policy: ", ckpt_full_path)
     print(f"[rollout] max_duration_s={control_para['max_duration_s']}")
     device = torch.device(control_para["device"])
@@ -2270,14 +2299,19 @@ def main():
                         raise RuntimeError(
                             "[policy-start] No fixture extrinsics. Not moving."
                         )
-                    pose_fix = first_frame_pose7(zpath, policy_episode)
+                    start_index = read_policy_start_index()
+                    pose_fix = frame_pose7(zpath, policy_episode, start_index)
                     if dataset_poses_are_fixture(zpath):
                         start_base = pose7_change_frame(
                             pose_fix, np.linalg.inv(mold_T_fixture_from_base)
                         )
                     else:
                         start_base = np.asarray(pose_fix, dtype=np.float64).reshape(7)
-                    pose_note = f"episode {policy_episode} first frame"
+                    pose_note = (
+                        f"episode {policy_episode} first frame"
+                        if start_index == 0
+                        else f"episode {policy_episode} index {start_index}"
+                    )
                 else:
                     start_base = np.asarray(
                         env.get_observation_from_buffer()["ts_pose_fb_0"][-1],
@@ -2286,6 +2320,13 @@ def main():
                     pose_note = "current TCP"
             pose_txt = " ".join(f"{float(v):.5f}" for v in np.asarray(start_base).reshape(7))
             print(f"[r4vt] start pose (right_base, {pose_note}): {pose_txt}")
+            _write_run_meta_if_requested(
+                start_base,
+                pose_note,
+                control_para,
+                pipeline_para,
+                mode="replay" if gt_replay is not None else "policy",
+            )
             approached = False
             approach_logged = False
             rot_cap = MAX_ROT_STEP_DEG if policy_episode is not None else None
@@ -2380,7 +2421,10 @@ def main():
             rollout_id = make_rollout_id(
                 pipeline_para["ckpt_path"], episode_id, ts=episode_ts
             )
-        episode_log_path = os.path.join(control_log_folder_path, rollout_id)
+        if os.environ.get("UMIFT_RUN_DIR", "").strip():
+            episode_log_path = control_log_folder_path
+        else:
+            episode_log_path = os.path.join(control_log_folder_path, rollout_id)
         # Per-episode mold metrics (filled when mold_runtime is on).
         ep_sd: List[float] = []
         ep_force: List[float] = []

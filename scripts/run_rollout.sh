@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Start the layup runner for one arm. The checkpoint is passed in UMIFT_CKPT_PATH.
-# Usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--extrinsics PATH] [--ckpt PATH] [--bench] [--bench-lift M]
+# Usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--extrinsics PATH] [--ckpt PATH] [--bench] [--bench-lift M] [--out_dir PATH] [--start-episode N] [--start-index I] [--dry-run]
 set -euo pipefail
+_orig=("$@")
 
 usage() {
-  echo "usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--extrinsics PATH] [--ckpt PATH] [--bench] [--bench-lift M]"
+  echo "usage: scripts/run_rollout.sh {r4vt|r1rel} [--replay-episode N] [--extrinsics PATH] [--ckpt PATH] [--bench] [--bench-lift M] [--out_dir PATH] [--name NAME] [--start-episode N] [--start-index I] [--dry-run]"
   echo "  r4vt   track_clean epoch 55, unless UMIFT_CKPT_PATH or --ckpt is set."
   echo "         UMIFT_MAX_DURATION_S overrides the 8 min cap."
   echo "  r1rel  UMIFT_CKPT_PATH=/oct_v35_h4s_odom_r1rel/checkpoints/latest.ckpt"
@@ -24,8 +25,16 @@ usage() {
   echo "  r4vt, before the episode: moveL at <= 5 cm/s to 5 cm back along the tool axis,"
   echo "    Enter, then straight down that axis. The episode log includes the move."
   echo "    Replay uses the recorded pose."
+  echo "  --out_dir PATH       write this run's logs, video, meta.json, and notes.md there."
+  echo "  --name NAME          with UMIFT_RESULTS_ROOT, use \$ROOT/rollouts/<today>_NAME."
+  echo "    Without either, logs stay in \$PYRITE_CONTROL_LOG_FOLDERS (\$HOME/data/control_log)."
+  echo "  --start-episode N    policy only. Approach episode N. Replay ignores this and"
+  echo "    refuses the flag, because replay uses the recorded pose."
+  echo "  --start-index I      policy only. Row of ts_pose_fb_0. Default 0 (first frame)."
+  echo "  --dry-run            parse, write meta.json if --out_dir/--name is set, then exit."
+  echo "    Does not call kill_ports.py or the runner."
   echo "    Policy uses the current TCP, unless UMIFT_POLICY_START_EPISODE=N."
-  echo "    That approaches episode N's first TCP pose, full orientation, and"
+  echo "    That approaches episode N's TCP pose (index UMIFT_POLICY_START_INDEX, default 0), and"
   echo "    holds 8 s before the first query. If that TCP is inside the mold,"
   echo "    the descent stops at the surface and the normal gap is allowed."
   echo "    Ignored for a GT replay."
@@ -44,6 +53,11 @@ extrinsics=""
 ckpt=""
 bench=0
 bench_lift=""
+out_dir=""
+run_name=""
+start_episode=""
+start_index=""
+dry=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --replay-episode)
@@ -69,6 +83,30 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 && -n "${2:-}" ]] || die "--bench-lift needs a distance in metres"
       bench_lift="$2"
       shift 2
+      ;;
+    --out_dir)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--out_dir needs a directory"
+      out_dir="$2"
+      shift 2
+      ;;
+    --name)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--name needs a run name"
+      run_name="$2"
+      shift 2
+      ;;
+    --start-episode)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--start-episode needs an episode id"
+      start_episode="$2"
+      shift 2
+      ;;
+    --start-index)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--start-index needs a frame index"
+      start_index="$2"
+      shift 2
+      ;;
+    --dry-run)
+      dry=1
+      shift
       ;;
     *)
       usage
@@ -103,6 +141,23 @@ if [[ -n "$replay_episode" ]]; then
   export UMIFT_REPLAY_EPISODE="$replay_episode"
 else
   unset UMIFT_REPLAY_EPISODE
+fi
+
+if [[ -n "$replay_episode" && -n "$start_episode" ]]; then
+  die "--start-episode is for a policy run. Replay uses the recorded pose."
+fi
+if [[ -n "$start_index" && -z "$start_episode" ]]; then
+  die "--start-index needs --start-episode"
+fi
+if [[ -n "$start_episode" ]]; then
+  export UMIFT_POLICY_START_EPISODE="$start_episode"
+else
+  unset UMIFT_POLICY_START_EPISODE
+fi
+if [[ -n "$start_index" ]]; then
+  export UMIFT_POLICY_START_INDEX="$start_index"
+else
+  unset UMIFT_POLICY_START_INDEX
 fi
 
 # Policy labels stay track_clean. A replay reads the causal-foot 10-d labels.
@@ -166,8 +221,30 @@ fi
 set -u
 export PYRITE_CHECKPOINT_FOLDERS=/mnt/data/umidata/ft/training_outputs
 export PYRITE_HARDWARE_CONFIG_FOLDERS=/home/boeing/umi_ft_ws/hardware_interfaces/workcell/table_top_manip/config
-export PYRITE_CONTROL_LOG_FOLDERS="${HOME}/data/control_log"
+export UMIFT_SLOW_DOWN_FACTOR="${UMIFT_SLOW_DOWN_FACTOR:-2}"
+if [[ -n "$run_name" && -z "$out_dir" ]]; then
+  [[ -n "${UMIFT_RESULTS_ROOT:-}" ]] || die "--name needs UMIFT_RESULTS_ROOT"
+  out_dir="${UMIFT_RESULTS_ROOT}/rollouts/$(TZ=America/Los_Angeles date +%F)_${run_name}"
+fi
+if [[ -n "$out_dir" ]]; then
+  mkdir -p "$out_dir"
+  export UMIFT_RUN_DIR="$(realpath "$out_dir")"
+  export PYRITE_CONTROL_LOG_FOLDERS="$UMIFT_RUN_DIR"
+else
+  unset UMIFT_RUN_DIR
+  export PYRITE_CONTROL_LOG_FOLDERS="${HOME}/data/control_log"
+fi
 export PYTHONPATH="$UMIFT_ROOT/UMIFT_Data/surface_frames_scripts:${PYTHONPATH}"
+export UMIFT_RUN_COMMAND="$(printf '%q ' "$0" "${_orig[@]}")"
+
+if [[ -n "${UMIFT_RUN_DIR:-}" ]]; then
+  python -m PyriteEnvSuites.env_runners.run_meta \
+    || die "could not write meta.json"
+fi
+if [[ "$dry" -eq 1 ]]; then
+  echo "dry-run: parsed. not starting the robot."
+  exit 0
+fi
 
 python "$UMIFT_ROOT/PyriteEnvSuites/scripts/kill_ports.py" \
   || die "kill_ports.py failed"

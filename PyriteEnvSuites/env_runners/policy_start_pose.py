@@ -25,6 +25,7 @@ from scipy.spatial.transform import Rotation
 from PyriteUtility.spatial_math import spatial_utilities as su
 
 POLICY_START_ENV = "UMIFT_POLICY_START_EPISODE"
+POLICY_START_INDEX_ENV = "UMIFT_POLICY_START_INDEX"
 POLICY_LOOKBACK_S = 8.0
 MAX_ROT_STEP_DEG = 5.0
 POS_TOL_M = 0.005
@@ -62,14 +63,39 @@ def read_policy_start_episode(environ=None) -> Optional[int]:
     return episode
 
 
-def first_frame_pose7(zarr_path, episode: int) -> np.ndarray:
-    """First ``ts_pose_fb_0`` row of ``episode_<n>``, dataset frame."""
+def read_policy_start_index(environ=None) -> int:
+    """Row inside the start episode. Unset means the first frame."""
+    environ = os.environ if environ is None else environ
+    raw = str(environ.get(POLICY_START_INDEX_ENV, "")).strip()
+    if raw == "":
+        return 0
+    try:
+        index = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{POLICY_START_INDEX_ENV}={raw!r} is not a frame index."
+        ) from exc
+    if index < 0:
+        raise ValueError(f"{POLICY_START_INDEX_ENV}={index} is negative.")
+    return index
+
+
+def frame_pose7(zarr_path, episode: int, index: int = 0) -> np.ndarray:
+    """``ts_pose_fb_0[index]`` of ``episode_<n>``, dataset frame."""
     root = zarr.open(str(zarr_path), mode="r")
     name = f"episode_{int(episode)}"
     if name not in root["data"]:
         raise ValueError(f"{name} is not in {zarr_path}")
-    pose = np.asarray(root["data"][name]["ts_pose_fb_0"][0], dtype=np.float64)
-    return pose.reshape(7).copy()
+    pose = np.asarray(root["data"][name]["ts_pose_fb_0"], dtype=np.float64)
+    index = int(index)
+    if index >= len(pose):
+        raise ValueError(f"{name} has {len(pose)} poses, index {index}")
+    return pose[index].reshape(7).copy()
+
+
+def first_frame_pose7(zarr_path, episode: int) -> np.ndarray:
+    """First ``ts_pose_fb_0`` row of ``episode_<n>``, dataset frame."""
+    return frame_pose7(zarr_path, episode, 0)
 
 
 def pose_rotation_deg(pose_a, pose_b) -> float:

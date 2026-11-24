@@ -76,10 +76,16 @@ def test_first_frame_is_episode_40(tmp_path):
         pose = np.zeros((3, 7))
         pose[:, 0] = x
         pose[:, 3] = 1.0
+        if name == "episode_40":
+            pose[2, 0] = 0.9
         data.create_dataset(name + "/ts_pose_fb_0", data=pose)
     got = first_frame_pose7(path, 40)
     assert got.shape == (7,)
     assert got[0] == 0.4
+    from PyriteEnvSuites.env_runners.policy_start_pose import frame_pose7
+
+    later = frame_pose7(path, 40, 2)
+    assert later[0] == 0.9
 
 
 def test_rotation_steps_stay_under_5_deg_and_under_the_servo_limit():
