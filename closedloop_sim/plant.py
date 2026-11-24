@@ -15,8 +15,9 @@ _DEFAULT_HARDWARE_CONFIG = Path(
 
 # Environment stand-in for the wrist FT. Not a controller gain.
 CONTACT_N_PER_M = 3000.0
-# C++ admittance has no tangential contact damper. The 5 N·s/m term is gone.
-TANGENT_DAMPING_NS_PER_M = 0.0
+# Golden replay and the older closed-loop scripts use 5 N·s/m. field_v3r
+# closed loop passes tangent_damping=0 because the C++ admittance has none.
+TANGENT_DAMPING_NS_PER_M = 5.0
 CONTACT_SPLIT_N = 2.0
 
 
@@ -76,11 +77,20 @@ class CartesianSpringPlant:
     outside the mold. The contact force is along the outward normal.
     """
 
-    def __init__(self, field: FixBMoldField, position: np.ndarray, rotation: np.ndarray):
+    def __init__(
+        self,
+        field: FixBMoldField,
+        position: np.ndarray,
+        rotation: np.ndarray,
+        tangent_damping: float | None = None,
+    ):
         self.field = field
         self.x = np.asarray(position, dtype=np.float64).reshape(3).copy()
         self.R = np.asarray(rotation, dtype=np.float64).reshape(3, 3).copy()
         self.v = np.zeros(3, dtype=np.float64)
+        self.tangent_damping_ns_per_m = (
+            TANGENT_DAMPING_NS_PER_M if tangent_damping is None else float(tangent_damping)
+        )
         self.spring_force_limit_n, self.spring_force_config = spring_force_limit_n()
 
     def step(self, x_cmd: np.ndarray, rotation: np.ndarray, stiffness_6: np.ndarray, dt: float) -> dict:
@@ -103,7 +113,10 @@ class CartesianSpringPlant:
         sd = float(query["sd"][0])
         penetration = max(-sd, 0.0)
         tangent_v = self.v - normal * float(np.dot(normal, self.v))
-        contact = normal * (CONTACT_N_PER_M * penetration) - TANGENT_DAMPING_NS_PER_M * tangent_v
+        contact = (
+            normal * (CONTACT_N_PER_M * penetration)
+            - self.tangent_damping_ns_per_m * tangent_v
+        )
         error_tool = self.R.T @ (command - self.x)
         spring_tool = gain @ error_tool
         limit = self.spring_force_limit_n
@@ -130,7 +143,7 @@ def _check() -> None:
     assert gains["damping_ns_per_m"] == 15.0
     assert gains["dt_s"] == 0.002
     assert gains["spring_force_limit_n"] == 40.0
-    assert TANGENT_DAMPING_NS_PER_M == 0.0
+    assert TANGENT_DAMPING_NS_PER_M == 5.0
     on, off, force = contact_masks([[0.0, 0.0, 1.0], [0.0, 3.0, 0.0]])
     assert force.tolist() == [1.0, 3.0]
     assert on.tolist() == [False, True]

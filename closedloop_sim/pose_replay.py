@@ -50,7 +50,7 @@ def replay(episode: int = 40) -> dict:
     rotation, position = pose7_to_Rp(pose)
     dt = np.diff(times, append=times[-1] + float(np.median(np.diff(times))))
     field = FixBMoldField(FIELD)
-    plant = CartesianSpringPlant(field, position[0], rotation[0])
+    plant = CartesianSpringPlant(field, position[0], rotation[0], tangent_damping=0.0)
     gains = controller_gains()
     rows_x, rows_f = [], []
     for i in range(len(position)):

@@ -610,7 +610,15 @@ def rollout(name: str, demo: dict, episode: int = 40, mode: str = "full") -> dic
     times = np.zeros(cap, dtype=np.float64)
     t_start, t_end, start = run_span(demo, mode)
     start_R, start_p = pose7_to_Rp(start.reshape(1, 7))
-    plant = CartesianSpringPlant(FixBMoldField(FIELD), start_p[0], start_R[0])
+    # field_v3r closed loop drops the tangential damper. Every other checkpoint
+    # keeps the 5 N·s/m golden default.
+    v3r_plant = "field_v3r" in str(ckpt) or "v3r" in name.lower()
+    plant = CartesianSpringPlant(
+        FixBMoldField(FIELD),
+        start_p[0],
+        start_R[0],
+        tangent_damping=0.0 if v3r_plant else None,
+    )
     snap = plant._forces(plant.x.copy(), np.zeros((3, 3), dtype=np.float64))
     contact = np.asarray(snap["contact_world"], dtype=np.float64)
     hold_wrench = np.zeros(6, dtype=np.float64)
