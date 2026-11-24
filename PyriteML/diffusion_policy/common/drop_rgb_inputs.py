@@ -2,8 +2,8 @@
 
 The sampler still requires ``rgb_0`` in ``sample.obs.sparse`` as the query
 clock, and ``raw.rgb_0`` so the episode store can be built. Deleting those
-would change which timesteps are trained or crash the sampler. This only
-removes ``rgb_*`` from ``shape_meta.obs``, which is the policy observation.
+would change which timesteps are trained. This removes ``rgb_<id>`` and
+``rgb_time_stamps_<id>`` from ``shape_meta.obs`` only.
 """
 
 from omegaconf import OmegaConf, open_dict
@@ -24,6 +24,11 @@ def _is_wrist_rgb_obs_key(key: str) -> bool:
     return suffix.isdigit()
 
 
+def _is_rgb_timestamp_obs_key(key: str) -> bool:
+    prefix = "rgb_time_stamps_"
+    return key.startswith(prefix) and key[len(prefix):].isdigit()
+
+
 def drop_rgb_inputs(shape_meta) -> list:
     """Delete wrist RGB keys from shape_meta.obs. Returns removed names."""
     if shape_meta is None or not OmegaConf.is_config(shape_meta):
@@ -35,7 +40,7 @@ def drop_rgb_inputs(shape_meta) -> list:
         block = shape_meta["obs"]
         with open_dict(block):
             for key in list(block.keys()):
-                if _is_wrist_rgb_obs_key(key):
+                if _is_wrist_rgb_obs_key(key) or _is_rgb_timestamp_obs_key(key):
                     del block[key]
                     removed.append(f"obs.{key}")
     return removed
