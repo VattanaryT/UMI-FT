@@ -293,6 +293,8 @@ class UmiFTDataset(BaseImageDataset):
         for batch in tqdm(dataloader, desc="iterating dataset to get normalization"):
             # sparse obs
             for key in self.shape_meta["sample"]["obs"]["sparse"].keys():
+                if key not in self.shape_meta["obs"]:
+                    continue
                 if self.shape_meta["obs"][key]["type"] == "low_dim":
                     if key not in data_cache_sparse.keys():
                         data_cache_sparse[key] = []
@@ -443,6 +445,8 @@ class UmiFTDataset(BaseImageDataset):
 
         # sparse: compute normalizer for obs
         for key in self.shape_meta["sample"]["obs"]["sparse"].keys():
+            if key not in self.shape_meta["obs"]:
+                continue
             type = self.shape_meta["obs"][key]["type"]
             if type == "low_dim":
                 stat = array_to_stats(data_cache_sparse[key])

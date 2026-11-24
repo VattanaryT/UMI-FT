@@ -44,7 +44,7 @@ def test_flag_removes_policy_rgb_and_keeps_the_sampler_clock():
         cfg.policy.obs_encoder.shape_meta,
     ):
         assert "rgb_0" not in shape_meta.obs
-        assert "rgb_time_stamps_0" in shape_meta.obs
+        assert "rgb_time_stamps_0" not in shape_meta.obs
         assert "robot0_eef_wrench_left" in shape_meta.obs
         assert "robot0_mold_geom" in shape_meta.obs
         assert "rgb_0" in shape_meta.raw

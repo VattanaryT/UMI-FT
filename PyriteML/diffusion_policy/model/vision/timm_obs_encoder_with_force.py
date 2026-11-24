@@ -156,7 +156,27 @@ class TimmObsEncoderWithForce(ModuleAttrMixin):
         elif vision_encoder_cfg is None:
             config_lists = [force_encoder_cfg]
 
+        has_image_encoder = any(
+            attr.get("type", "low_dim") == "rgb" and not _is_scan_heatmap_key(key)
+            for key, attr in shape_meta["obs"].items()
+        )
         for cfg in config_lists:
+            if (
+                vision_encoder_cfg is not None
+                and cfg is vision_encoder_cfg
+                and not has_image_encoder
+            ):
+                # Force tokens are 768 wide. Keep that width and do not build CLIP.
+                name = str(cfg.model_name)
+                if name.startswith("resnet"):
+                    feature_dim = 512 if cfg.downsample_ratio == 32 else 256
+                elif name.startswith("convnext"):
+                    feature_dim = 1024
+                else:
+                    feature_dim = 768
+                feature_dim_list.append(feature_dim)
+                model_list.append(None)
+                continue
             if cfg.model_name == "causalconv":
                 model = ForceEncoder(cfg.feature_dim)
             else:
