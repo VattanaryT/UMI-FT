@@ -25,7 +25,17 @@ from closedloop_sim.api import (  # noqa: E402
     compliance_command,
     load_policy,
 )
-from closedloop_sim.plant import CartesianSpringPlant  # noqa: E402
+from closedloop_sim.plant import (
+    CONTACT_N_PER_M,
+    CONTACT_SPLIT_N,
+    DAMPING_NS_PER_M,
+    MASS_KG,
+    TANGENT_DAMPING_NS_PER_M,
+    CartesianSpringPlant,
+    contact_masks,
+)
+from closedloop_sim.rollout_view import publish
+from closedloop_sim.segments import events, label_segments  # noqa: E402
 from fixb_field import FixBMoldField  # noqa: E402
 from fixb_labels import Rp_to_pose7, pose7_to_Rp  # noqa: E402
 
@@ -78,7 +88,7 @@ def _unstable(row: dict, fast_s: float) -> tuple[str | None, float]:
     return None, fast_s
 
 
-def replay(episode: int = 40, seconds: float | None = None) -> dict:
+def replay(episode: int = 40, seconds: float | None = None, tag: str | None = None) -> dict:
     import zarr
 
     group = zarr.open_group(str(ZARR), mode="r")["data"][f"episode_{episode}"]
@@ -136,6 +146,7 @@ def replay(episode: int = 40, seconds: float | None = None) -> dict:
             stiffness[:, :6],
             float(dt[i]),
         )
+        state["position"] = plant.x.copy()
         state["t_s"] = float(times[i] - times[0])
         state["delta_n_m"] = float(np.asarray(decoded["delta_n"]).reshape(-1)[0])
         state["k_npm"] = float(np.asarray(decoded["stiffness"]).reshape(-1)[0])
@@ -145,7 +156,12 @@ def replay(episode: int = 40, seconds: float | None = None) -> dict:
         if stop is not None:
             break
 
-    trace = {key: np.asarray([row[key] for row in rows]) for key in rows[0] if key != "normal"}
+    normals = np.asarray([row["normal"] for row in rows])
+    trace = {
+        key: np.asarray([row[key] for row in rows])
+        for key in rows[0]
+        if key != "normal"
+    }
     commanded_inside = trace["delta_n_m"] < -0.001
     lost = commanded_inside & (trace["penetration_m"] <= 0.0)
     contact = trace["penetration_m"] > 0.0
@@ -166,16 +182,76 @@ def replay(episode: int = 40, seconds: float | None = None) -> dict:
         "after_start_pad": _window(trace, trace["t_s"] > 5.0),
         "n_speed_over_1": int(np.sum(trace["speed_mps"] > 1.0)),
         "plant": {
-            "mass_kg": 0.2,
-            "damping_ns_per_m": 15.0,
-            "contact_n_per_m": 3000.0,
-            "tangent_damping_ns_per_m": 5.0,
+            "mass_kg": MASS_KG,
+            "damping_ns_per_m": DAMPING_NS_PER_M,
+            "contact_n_per_m": CONTACT_N_PER_M,
+            "tangent_damping_ns_per_m": TANGENT_DAMPING_NS_PER_M,
             "spring_force_limit_n": plant.spring_force_limit_n,
             "spring_force_config": str(plant.spring_force_config),
         },
     }
+    on, off, _force = contact_masks(trace["contact_world"])
+    report["by_force"] = {
+        "threshold_n": CONTACT_SPLIT_N,
+        "contact": _window(trace, on),
+        "non_contact": _window(trace, off),
+    }
+    sim_clear = np.maximum(trace["sd_m"], 0.0)
+    sim_labels = label_segments(np.linalg.norm(trace["contact_world"], axis=1), sim_clear)
+    report["segments"] = {
+        name: _window(trace, sim_labels == name)
+        for name in ("contact", "approach", "lift-off", "air-travel")
+    }
+    demo_sd = np.asarray(contact_field.query(position)["sd"], dtype=np.float64).reshape(-1)
+    demo_clear = np.maximum(demo_sd, 0.0)
+    wrench_t = np.asarray(group["wrench_time_stamps_0"], dtype=np.float64).reshape(-1)
+    wrench = np.asarray(group["wrench_left_0"], dtype=np.float64)
+    nearest = np.clip(np.searchsorted(wrench_t, times), 0, len(wrench) - 1)
+    prev = np.clip(nearest - 1, 0, len(wrench) - 1)
+    use_prev = np.abs(wrench_t[prev] - times) < np.abs(wrench_t[nearest] - times)
+    demo_force = np.linalg.norm(wrench[np.where(use_prev, prev, nearest), :3], axis=1)
+    demo_labels = label_segments(demo_force, demo_clear)
+    report["demo_segments"] = {
+        name: int(np.sum(demo_labels == name))
+        for name in ("contact", "approach", "lift-off", "air-travel")
+    }
+    n = int(trace["t_s"].size)
+    path_mm = np.linalg.norm(trace["position"] - position[:n], axis=1) * 1e3
+    force_err_n = np.abs(np.linalg.norm(trace["contact_world"], axis=1) - demo_force[:n])
+    vs_demo = {}
+    for name in ("contact", "air-travel"):
+        mask = demo_labels[:n] == name
+        taken = path_mm[mask]
+        ferr = force_err_n[mask]
+        vs_demo[name] = {
+            "n": int(mask.sum()),
+            "path_mm": None if taken.size == 0 else float(np.median(taken)),
+            "force_error_n": None if ferr.size == 0 else float(np.median(ferr)),
+        }
+    vs_demo["target_path_mm"] = 5.0
+    vs_demo["target_force_n"] = 5.0
+    report["vs_demo"] = vs_demo
+    report["events"] = events(
+        times - times[0],
+        demo_labels,
+        demo_clear,
+        position,
+        trace["t_s"],
+        sim_clear,
+        trace["position"],
+    )
     OUT.mkdir(parents=True, exist_ok=True)
-    tag = f"gt_fixb_ep{episode}_springclip"
+    tag = tag or f"gt_fixb_ep{episode}_springclip"
+    view = publish(
+        OUT,
+        tag,
+        contact_field,
+        trace["position"],
+        position[: trace["position"].shape[0]],
+        normals,
+        trace["contact_world"],
+    )
+    report["view"] = view
     np.savez_compressed(OUT / f"{tag}.npz", **trace)
     (OUT / f"{tag}.json").write_text(json.dumps(report, indent=2))
     return report
@@ -235,7 +311,10 @@ def main() -> None:
         seconds = float(args[args.index("--seconds") + 1])
     if "--episode" in args:
         episode = int(args[args.index("--episode") + 1])
-    report = replay(episode, seconds)
+    tag = None
+    if "--tag" in args:
+        tag = args[args.index("--tag") + 1]
+    report = replay(episode, seconds, tag)
     print(json.dumps(report, indent=2))
 
 
