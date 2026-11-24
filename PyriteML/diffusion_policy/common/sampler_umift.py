@@ -938,6 +938,9 @@ class SequenceSamplerUmiFT:
         sparse_obs_unprocessed = dict()
         sparse_action_unprocessed = []
         for key, attr in self.shape_meta["sample"]["obs"]["sparse"].items():
+            # rgb_0 stays in sample as the query clock after drop_rgb_inputs.
+            if key not in self.shape_meta["obs"]:
+                continue
             input_arr = data_episode["obs"][key]
             this_horizon = attr["horizon"]
             this_downsample_steps = attr["down_sample_steps"]
