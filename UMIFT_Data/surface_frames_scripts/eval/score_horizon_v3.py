@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Horizon rescore. Writes score_horizon_v3.json and .md. Does not touch v2 or onestep.
 
-r4vt position is the integrated tangent path against the demo's tangent path.
-tcp is that same absolute decode against the demo TCP (normal and start included).
-δn is not a coordinate. Rotation is R_field @ ΔR at every step. r1rel tcp matches
-its position, which is already the TCP error.
+r4vt step k is the pose after k actions. Position is integrated tangent v.
+tcp compares that pose with the demo TCP where the action lands.
+δn is not a coordinate. Rotation is R_field @ ΔR at the action sample.
+r1rel step k is the pose that action encodes. Its first action is the query TCP.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ sc = _load("score_sign_flip", EVAL / "score_sign_flip.py")
 fv = _load("score_field_v2_add", EVAL / "score_field_v2_add.py")
 import heldout  # noqa: E402
 from fixb_labels import delta_R_from_field_tool, so3_to_rot6d_rows  # noqa: E402
+from r4vt_horizon import arrival_frame, arrival_tcp  # noqa: E402
 from fixb_tcp_track import project_tcp_velocity  # noqa: E402
 from heading_tilt import geodesic_deg  # noqa: E402
 from replay_gt import _action_rows  # noqa: E402
@@ -57,16 +58,37 @@ def _fmt(block, key) -> str:
     return "/".join(f"{block[key][str(step)]:.1f}" for step in STEPS)
 
 
-def _tangent_demo(tool_p, frames, index):
+def _tangent_demo(demo, frames, index):
+    """Tangent arrival of each action. The normal part of the TCP step is removed."""
+    tool_p = np.asarray(demo["tool_p"], dtype=np.float64)
+    arrived = arrival_tcp(tool_p, demo["robot_t"], demo["rgb_t"], index)
     p = np.asarray(tool_p[int(index[0])], dtype=np.float64).copy()
     out = np.empty((len(index), 3))
-    for k, i in enumerate(index):
-        out[k] = p
-        if k + 1 == len(index):
-            break
-        delta = tool_p[int(index[k + 1])] - tool_p[int(i)]
+    for k in range(len(index)):
+        delta = arrived[k] - tool_p[int(index[k])]
         normal = frames[k, :, 2]
         p = p + delta - normal * np.dot(delta, normal)
+        out[k] = p
+    return out
+
+
+def _fraction(err, frames) -> dict:
+    """Median |normal| / ||error|| and tangent / ||error|| at steps 6/16/64."""
+    normal_axis = frames[:, :, :, 2]
+    along = np.einsum("nhi,nhi->nh", err, normal_axis)
+    tangent = err - along[..., None] * normal_axis
+    mag = np.linalg.norm(err, axis=-1)
+    ok = mag > 1e-9
+    normal_frac = np.divide(np.abs(along), mag, out=np.full_like(mag, np.nan), where=ok)
+    tangent_frac = np.divide(
+        np.linalg.norm(tangent, axis=-1), mag, out=np.full_like(mag, np.nan), where=ok
+    )
+    out = {}
+    for step in (6, 16, 64):
+        out[str(step)] = {
+            "normal": round(float(np.nanmedian(normal_frac[:, step - 1])), 3),
+            "tangent": round(float(np.nanmedian(tangent_frac[:, step - 1])), 3),
+        }
     return out
 
 
@@ -109,21 +131,24 @@ def _gt_action(demo, index):
 
 
 def _r4vt(action, demo, index):
-    """Tangent miss, full TCP miss, rotation. xyz starts at the measured TCP."""
+    """Tangent miss, full TCP miss, rotation. xyz[k] is the pose after action k."""
     xyz, got_R = sc.horizon_pose("causal", action, demo, index)
     index = np.asarray(index, dtype=np.int64)
     frames = np.asarray(demo["frame"], dtype=np.float64)[index]
-    tool = np.asarray(demo["tool_p"], dtype=np.float64)[index]
-    ref = _tangent_demo(demo["tool_p"], frames, index)
+    arrived = arrival_tcp(demo["tool_p"], demo["robot_t"], demo["rgb_t"], index)
+    ref = _tangent_demo(demo, frames, index)
     pos = np.linalg.norm(xyz - ref, axis=1) * 1e3
-    tcp = np.linalg.norm(xyz - tool, axis=1) * 1e3
+    err = xyz - arrived
+    tcp = np.linalg.norm(err, axis=1) * 1e3
     rot = geodesic_deg(got_R, demo["tool_R"][index])
-    return pos, rot, tcp
+    landed = arrival_frame(demo["frame"], demo["robot_t"], demo["rgb_t"], index)
+    return pos, rot, tcp, err, landed
 
 
 def _rows_errors(kind, rows, demo, predict):
     pos, rot, tcp = [], [], []
     gt_pos, gt_rot, gt_tcp = [], [], []
+    gt_err, gt_frame = [], []
     for idx, _rgb, index in rows:
         pred = predict(idx)
         if kind == "r1rel":
@@ -131,15 +156,20 @@ def _rows_errors(kind, rows, demo, predict):
             g_mm, g_deg, _g = sc.pose_error("r1rel", _r1rel_label(demo, index), demo, index)
             t_mm, gt_t = p_mm, g_mm
         else:
-            p_mm, r_deg, t_mm = _r4vt(pred, demo, index)
-            g_mm, g_deg, gt_t = _r4vt(_gt_action(demo, index), demo, index)
+            p_mm, r_deg, t_mm, _err, _frame = _r4vt(pred, demo, index)
+            g_mm, g_deg, gt_t, err, frame = _r4vt(_gt_action(demo, index), demo, index)
+            gt_err.append(err)
+            gt_frame.append(frame)
         pos.append(p_mm)
         rot.append(r_deg)
         tcp.append(t_mm)
         gt_pos.append(g_mm)
         gt_rot.append(g_deg)
         gt_tcp.append(gt_t)
-    return _stats(pos, rot, tcp), _stats(gt_pos, gt_rot, gt_tcp)
+    gt = _stats(gt_pos, gt_rot, gt_tcp)
+    if gt_err:
+        gt["tcp_normal_fraction"] = _fraction(np.stack(gt_err), np.stack(gt_frame))
+    return _stats(pos, rot, tcp), gt
 
 
 def _r1rel_label(demo, index):
@@ -168,8 +198,17 @@ def _print(name, letter, block, gt):
         f"pos {_fmt(block, 'pos_median_mm')} tcp {_fmt(block, 'tcp_median_mm')} "
         f"rot {_fmt(block, 'rot_median_deg')} "
         f"gt pos {_fmt(gt, 'pos_median_mm')} tcp {_fmt(gt, 'tcp_median_mm')} "
-        f"rot {_fmt(gt, 'rot_median_deg')}",
+        f"rot {_fmt(gt, 'rot_median_deg')}"
+        + ("" if "tcp_normal_fraction" not in gt else " gt n/t " + _frac(gt)),
         flush=True,
+    )
+
+
+def _frac(block) -> str:
+    part = block["tcp_normal_fraction"]
+    return " ".join(
+        f"{step}:{part[str(step)]['normal']:.2f}/{part[str(step)]['tangent']:.2f}"
+        for step in (6, 16, 64)
     )
 
 
@@ -187,7 +226,7 @@ def _train_block(kind, policy, dataset, demos, grouped, device):
     for epi, rows in grouped.items():
         demo = demos[epi]
         pos, rot, tcp = [], [], []
-        gpos, grot, gtcp = [], [], []
+        gpos, grot, gtcp, gerr, gframe = [], [], [], [], []
         for idx, _rgb, index in rows:
             pred = predict(idx)
             if kind == "r1rel":
@@ -195,8 +234,10 @@ def _train_block(kind, policy, dataset, demos, grouped, device):
                 g_mm, g_deg, _g = sc.pose_error("r1rel", _r1rel_label(demo, index), demo, index)
                 t_mm, gt_t = p_mm, g_mm
             else:
-                p_mm, r_deg, t_mm = _r4vt(pred, demo, index)
-                g_mm, g_deg, gt_t = _r4vt(_gt_action(demo, index), demo, index)
+                p_mm, r_deg, t_mm, _err, _frame = _r4vt(pred, demo, index)
+                g_mm, g_deg, gt_t, err, frame = _r4vt(_gt_action(demo, index), demo, index)
+                gerr.append(err)
+                gframe.append(frame)
             pos.append(p_mm)
             rot.append(r_deg)
             tcp.append(t_mm)
@@ -207,18 +248,24 @@ def _train_block(kind, policy, dataset, demos, grouped, device):
             if done % 40 == 0:
                 print(f"[h3] {kind} train {done}", flush=True)
         pred_parts.append((pos, rot, tcp))
-        gt_parts.append((gpos, grot, gtcp))
-    return _pool(pred_parts), _pool(gt_parts)
+        gt_parts.append((gpos, grot, gtcp, gerr, gframe))
+    gt = _pool([(part[0], part[1], part[2]) for part in gt_parts])
+    errs = [row for part in gt_parts for row in part[3]]
+    if errs:
+        frames = [row for part in gt_parts for row in part[4]]
+        gt["tcp_normal_fraction"] = _fraction(np.stack(errs), np.stack(frames))
+    return _pool(pred_parts), gt
 
 
 def _md(report) -> str:
     lines = [
         "# Horizon v3",
         "",
-        "Median mm and degrees at steps 1/6/16/64.",
-        "r4vt pos is integrated v against the demo tangent path. δn is not added.",
-        "tcp is that absolute path, started at the measured TCP, against the demo TCP.",
-        "r1rel pos is already the TCP error, so its tcp column matches pos.",
+        "Median mm and degrees at steps 1/6/16/64. Step k is the pose after k r4vt actions.",
+        "r4vt pos is integrated v against the demo tangent arrival. δn is not added.",
+        "tcp is that pose against the demo TCP at the landing time.",
+        "r1rel step 1 is the query TCP. Its tcp column matches pos.",
+        "gt n/t is the median fraction of the ground-truth TCP error along the surface normal / tangent.",
         "",
         "| run | set | n | pos median | tcp median | rot median | gt pos | gt tcp | gt rot |",
         "|---|---|---:|---|---|---|---|---|---|",
@@ -239,6 +286,23 @@ def _md(report) -> str:
                     grot=_fmt(gt, "rot_median_deg"),
                 )
             )
+    lines += [
+        "",
+        "Ground-truth TCP error, median fraction along the surface normal / tangent at steps 6/16/64.",
+        "",
+        "| run | set | step 6 | step 16 | step 64 |",
+        "|---|---|---|---|---|",
+    ]
+    for row in report:
+        for key in ("C", "A", "train"):
+            part = row[f"{key}_gt"].get("tcp_normal_fraction")
+            if not part:
+                continue
+            cells = " | ".join(
+                f"{part[str(step)]['normal']:.2f}/{part[str(step)]['tangent']:.2f}"
+                for step in (6, 16, 64)
+            )
+            lines.append(f"| {row['name']} | {key} | {cells} |")
     lines.append("")
     return "\n".join(lines)
 

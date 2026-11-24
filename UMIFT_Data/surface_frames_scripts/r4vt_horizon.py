@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from fixb_labels import next_control_times
+from fixb_labels import interp_rows, next_control_times
 from mold_aware_runtime import rot6d_rows_to_R
 
 
@@ -21,8 +21,25 @@ def control_dts(robot_t, rgb_t, index) -> np.ndarray:
     return dt[np.asarray(index, dtype=np.int64)]
 
 
+def arrival_tcp(tool_p, robot_t, rgb_t, index) -> np.ndarray:
+    """Demo TCP where each action lands. Action k covers [t_k, t_k+]."""
+    robot_t = np.asarray(robot_t, dtype=np.float64).reshape(-1)
+    index = np.asarray(index, dtype=np.int64)
+    t_next = next_control_times(robot_t, np.asarray(rgb_t, dtype=np.float64))[index]
+    return interp_rows(t_next, robot_t, np.asarray(tool_p, dtype=np.float64))
+
+
+def arrival_frame(frames, robot_t, rgb_t, index) -> np.ndarray:
+    """Field frame at the robot sample each action lands on."""
+    robot_t = np.asarray(robot_t, dtype=np.float64).reshape(-1)
+    index = np.asarray(index, dtype=np.int64)
+    t_next = next_control_times(robot_t, np.asarray(rgb_t, dtype=np.float64))[index]
+    landed = np.clip(np.searchsorted(robot_t, t_next), 0, len(robot_t) - 1)
+    return np.asarray(frames, dtype=np.float64)[landed]
+
+
 def integrate_tangent(v, frames, dts, p0) -> np.ndarray:
-    """Tool position. xyz[0] is p0. Later steps add B(v dt). δn is ignored."""
+    """xyz[k] is the pose after action k. δn is ignored."""
     v = np.asarray(v, dtype=np.float64).reshape(-1, 2)
     frames = np.asarray(frames, dtype=np.float64).reshape(len(v), 3, 3)
     dts = np.asarray(dts, dtype=np.float64).reshape(-1)
@@ -31,8 +48,8 @@ def integrate_tangent(v, frames, dts, p0) -> np.ndarray:
     p = np.asarray(p0, dtype=np.float64).reshape(3).copy()
     xyz = np.empty((len(v), 3), dtype=np.float64)
     for k in range(len(v)):
-        xyz[k] = p
         p = p + frames[k, :, :2] @ (v[k] * float(dts[k]))
+        xyz[k] = p
     return xyz
 
 

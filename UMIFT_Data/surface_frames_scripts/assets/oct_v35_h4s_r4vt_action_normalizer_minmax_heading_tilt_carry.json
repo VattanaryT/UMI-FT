@@ -1,0 +1,271 @@
+{
+  "source": "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_heading_tilt/acp_replay_buffer.zarr",
+  "zarr": "/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_heading_tilt_carry/acp_replay_buffer.zarr",
+  "crown_flip": false,
+  "masked_samples": 181,
+  "kept_normalizer_rows": 33906,
+  "decode_deg": {
+    "0": {
+      "median_deg": 6.402131725920531e-15,
+      "max_deg": 3.464279123341976e-14,
+      "masked": 0
+    },
+    "1": {
+      "median_deg": 6.411630131885123e-15,
+      "max_deg": 3.3685140073919085e-14,
+      "masked": 0
+    },
+    "2": {
+      "median_deg": 4.886695102857684e-15,
+      "max_deg": 3.817963258584106e-14,
+      "masked": 0
+    },
+    "3": {
+      "median_deg": 5.742864217481301e-15,
+      "max_deg": 3.4035854516020034e-14,
+      "masked": 0
+    },
+    "4": {
+      "median_deg": 5.652488424504344e-15,
+      "max_deg": 3.669371262027663e-14,
+      "masked": 0
+    },
+    "5": {
+      "median_deg": 8.116047454396864e-15,
+      "max_deg": 3.5380748056177064e-14,
+      "masked": 0
+    },
+    "6": {
+      "median_deg": 7.262147306819266e-15,
+      "max_deg": 4.7747336465806466e-14,
+      "masked": 0
+    },
+    "7": {
+      "median_deg": 1.0348503139721077e-14,
+      "max_deg": 1.7637168847892715e-12,
+      "masked": 63
+    },
+    "8": {
+      "median_deg": 5.0913716923398895e-15,
+      "max_deg": 3.1858809121511574e-14,
+      "masked": 0
+    },
+    "9": {
+      "median_deg": 5.587076504080461e-15,
+      "max_deg": 3.260613948612413e-14,
+      "masked": 0
+    },
+    "10": {
+      "median_deg": 4.839345648871417e-15,
+      "max_deg": 3.6661724620929966e-14,
+      "masked": 0
+    },
+    "11": {
+      "median_deg": 5.029880618907977e-15,
+      "max_deg": 3.2318254507997986e-14,
+      "masked": 0
+    },
+    "12": {
+      "median_deg": 4.779107539294628e-15,
+      "max_deg": 3.3490349745371443e-14,
+      "masked": 0
+    },
+    "13": {
+      "median_deg": 4.818478426828005e-15,
+      "max_deg": 3.3426574292137686e-14,
+      "masked": 0
+    },
+    "14": {
+      "median_deg": 1.3039361763342364e-14,
+      "max_deg": 3.7872715504835963e-13,
+      "masked": 62
+    },
+    "15": {
+      "median_deg": 4.860732771176085e-15,
+      "max_deg": 3.155859204600937e-14,
+      "masked": 0
+    },
+    "16": {
+      "median_deg": 4.827071986024765e-15,
+      "max_deg": 3.993345997114162e-14,
+      "masked": 0
+    },
+    "17": {
+      "median_deg": 5.983385473703222e-15,
+      "max_deg": 3.261685782220022e-14,
+      "masked": 0
+    },
+    "18": {
+      "median_deg": 4.79175172701544e-15,
+      "max_deg": 3.343603018321571e-14,
+      "masked": 0
+    },
+    "19": {
+      "median_deg": 6.7574460305508175e-15,
+      "max_deg": 3.780101621126643e-14,
+      "masked": 0
+    },
+    "20": {
+      "median_deg": 6.7075559154825955e-15,
+      "max_deg": 3.591392761604494e-14,
+      "masked": 0
+    },
+    "21": {
+      "median_deg": 4.858038621242084e-15,
+      "max_deg": 3.50790964489683e-14,
+      "masked": 0
+    },
+    "22": {
+      "median_deg": 5.064134506613523e-15,
+      "max_deg": 3.3408393736868956e-14,
+      "masked": 0
+    },
+    "23": {
+      "median_deg": 4.836767363365949e-15,
+      "max_deg": 3.1859012612025216e-14,
+      "masked": 0
+    },
+    "24": {
+      "median_deg": 5.1261782846663666e-15,
+      "max_deg": 4.134748151409692e-14,
+      "masked": 0
+    },
+    "25": {
+      "median_deg": 8.6927105494666e-15,
+      "max_deg": 5.891855233881966e-14,
+      "masked": 0
+    },
+    "26": {
+      "median_deg": 6.384990521676831e-15,
+      "max_deg": 3.8305408044334396e-14,
+      "masked": 0
+    },
+    "27": {
+      "median_deg": 4.889456325811485e-15,
+      "max_deg": 3.269392186305672e-14,
+      "masked": 0
+    },
+    "28": {
+      "median_deg": 4.348946988042011e-15,
+      "max_deg": 3.423139831299263e-14,
+      "masked": 0
+    },
+    "29": {
+      "median_deg": 4.981777372045007e-15,
+      "max_deg": 3.1841556151262094e-14,
+      "masked": 0
+    },
+    "30": {
+      "median_deg": 4.796645607550961e-15,
+      "max_deg": 3.976003940740602e-14,
+      "masked": 0
+    },
+    "31": {
+      "median_deg": 3.386639723406993e-15,
+      "max_deg": 2.7536141690131053e-14,
+      "masked": 0
+    },
+    "32": {
+      "median_deg": 5.4280978112996085e-15,
+      "max_deg": 4.2150113840220673e-14,
+      "masked": 0
+    },
+    "33": {
+      "median_deg": 4.90156395390556e-15,
+      "max_deg": 3.354929299514738e-14,
+      "masked": 0
+    },
+    "34": {
+      "median_deg": 4.966261051610098e-15,
+      "max_deg": 3.0310913996228713e-14,
+      "masked": 0
+    },
+    "35": {
+      "median_deg": 5.819334142968561e-15,
+      "max_deg": 3.6580000050509243e-14,
+      "masked": 0
+    },
+    "36": {
+      "median_deg": 5.548416237009151e-15,
+      "max_deg": 3.5140984732531145e-14,
+      "masked": 0
+    },
+    "37": {
+      "median_deg": 5.40550039989493e-15,
+      "max_deg": 3.3962667330810405e-14,
+      "masked": 0
+    },
+    "38": {
+      "median_deg": 8.07283600765817e-15,
+      "max_deg": 4.342230527355993e-12,
+      "masked": 56
+    },
+    "39": {
+      "median_deg": 4.875546037807376e-15,
+      "max_deg": 3.340543661378066e-14,
+      "masked": 0
+    },
+    "40": {
+      "median_deg": 4.772902246646016e-15,
+      "max_deg": 3.984978797720307e-14,
+      "masked": 0
+    },
+    "41": {
+      "median_deg": 4.780140971578153e-15,
+      "max_deg": 3.746919614087724e-14,
+      "masked": 0
+    },
+    "42": {
+      "median_deg": 4.941271156712937e-15,
+      "max_deg": 3.665893256026372e-14,
+      "masked": 0
+    },
+    "43": {
+      "median_deg": 8.290178657471317e-15,
+      "max_deg": 6.047008677151705e-14,
+      "masked": 0
+    },
+    "44": {
+      "median_deg": 5.248301108493279e-15,
+      "max_deg": 3.445116651827677e-14,
+      "masked": 0
+    },
+    "45": {
+      "median_deg": 6.54353516156588e-15,
+      "max_deg": 2.613089067741809e-14,
+      "masked": 0
+    },
+    "46": {
+      "median_deg": 5.176995471806524e-15,
+      "max_deg": 3.500826009886873e-14,
+      "masked": 0
+    },
+    "47": {
+      "median_deg": 4.910925646157694e-15,
+      "max_deg": 3.025333499256973e-14,
+      "masked": 0
+    },
+    "48": {
+      "median_deg": 4.865420348070488e-15,
+      "max_deg": 3.0216881823223607e-14,
+      "masked": 0
+    },
+    "49": {
+      "median_deg": 5.274353251811411e-15,
+      "max_deg": 3.824074834834495e-14,
+      "masked": 0
+    }
+  },
+  "normalizer": "/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/oct_v35_h4s_r4vt_action_normalizer_minmax_heading_tilt_carry.pkl",
+  "sha256": "496ef9f3b343048b8d3b8e29882eed9b3c32715e4c20972238decd3548afe219",
+  "columns": [
+    "v1",
+    "v2",
+    "delta_n",
+    "stiffness",
+    "sin_psi",
+    "cos_psi",
+    "a",
+    "b"
+  ]
+}

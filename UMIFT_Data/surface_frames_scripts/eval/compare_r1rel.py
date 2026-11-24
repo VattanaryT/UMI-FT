@@ -240,10 +240,11 @@ def _walked_frames(field, action, foot0, frame0, dts):
 
 
 def rollout_tool(field, action, foot0, frame0, start_p, dts, frames=None):
-    """Tool point of one chunk. v integrates from the query TCP. δn is not added.
+    """Tool point after each action. v integrates from the query TCP. δn is not added.
 
-    Pass the label frames when they are known. Otherwise the foot is walked so
-    each step has a tangent basis. dt must be the label builder's control step.
+    xyz[k] is the pose after action k, not the query pose. Pass the label frames
+    when they are known. Otherwise the foot is walked so each step has a tangent
+    basis. dt must be the label builder's control step.
     """
     from r4vt_horizon import integrate_tangent
 
