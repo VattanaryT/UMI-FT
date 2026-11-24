@@ -1,9 +1,10 @@
 """r4vt horizon decode. The closed-loop sim runner imports this.
 
 Position is the integral of tangential v. dt is the label builder's control
-step (the next RGB sample), not the robot-sample step. δn is the force target
-and is not a position. Rotation at every step is R_field @ ΔR, which is how
-the label builder stored it.
+step (the next RGB sample), not the robot-sample step. In contact, δn is the
+force target and is not a position. Out of contact, pass air=True and the foot:
+the arrival TCP's offset along the outward frame normal is δn. Rotation at
+every step is R_field @ ΔR, which is how the label builder stored it.
 """
 
 from __future__ import annotations
@@ -62,11 +63,40 @@ def compose_field_delta(frames, delta_rot6d) -> np.ndarray:
     return np.einsum("nij,njk->nik", frames, delta)
 
 
-def decode_horizon(action, p0, frames, dts):
-    """xyz (H, 3), R_tool (H, 3, 3) for a 10-d r4vt action."""
+def set_clearance(point, foot, frame, clearance) -> np.ndarray:
+    """Move point along the outward normal. Frame z is inward. Positive is away."""
+    outward = -np.asarray(frame, dtype=np.float64).reshape(3, 3)[:, 2]
+    point = np.asarray(point, dtype=np.float64).reshape(3)
+    foot = np.asarray(foot, dtype=np.float64).reshape(3)
+    gap = float(np.dot(point - foot, outward))
+    return point + outward * (float(clearance) - gap)
+
+
+def decode_horizon(action, p0, frames, dts, air=None, feet=None):
+    """xyz (H, 3), R_tool (H, 3, 3) for a 10-d r4vt action.
+
+    air is None: xyz[k] is the TCP at the start of step k, and δn is ignored.
+    air is set: xyz[k] is the TCP after step k. Air steps sit at clearance δn.
+    Contact steps keep the tangent integral and leave the normal alone.
+    """
     action = np.asarray(action, dtype=np.float64)
     if action.ndim != 2 or action.shape[1] < 10:
         raise ValueError(f"r4vt action {action.shape}")
     frames = np.asarray(frames, dtype=np.float64).reshape(len(action), 3, 3)
-    xyz = integrate_tangent(action[:, 0:2], frames, dts, p0)
-    return xyz, compose_field_delta(frames, action[:, 4:10])
+    rotation = compose_field_delta(frames, action[:, 4:10])
+    if air is None:
+        return integrate_tangent(action[:, 0:2], frames, dts, p0), rotation
+    air = np.asarray(air, dtype=bool).reshape(-1)
+    if feet is None or len(air) != len(action):
+        raise ValueError(f"air decode needs one foot per step ({len(air)} vs {len(action)})")
+    feet = np.asarray(feet, dtype=np.float64).reshape(len(action), 3)
+    v = action[:, 0:2]
+    dts = np.asarray(dts, dtype=np.float64).reshape(-1)
+    p = np.asarray(p0, dtype=np.float64).reshape(3).copy()
+    xyz = np.empty((len(v), 3), dtype=np.float64)
+    for k in range(len(v)):
+        p = p + frames[k, :, :2] @ (v[k] * float(dts[k]))
+        if air[k]:
+            p = set_clearance(p, feet[k], frames[k], action[k, 2])
+        xyz[k] = p
+    return xyz, rotation
