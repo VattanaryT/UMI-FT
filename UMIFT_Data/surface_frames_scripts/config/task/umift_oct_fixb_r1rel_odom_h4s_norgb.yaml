@@ -1,0 +1,10 @@
+# r1rel without wrist RGB. Same zarr, labels, and normalizer as
+# OCT-V35-FIXB-R1REL-ODOM-H4S. drop_rgb_inputs removes rgb_0 and
+# rgb_time_stamps_0 from shape_meta.obs. sample.obs.sparse.rgb_0 stays
+# the query clock. No image encoder is built.
+defaults:
+  - umift_oct_fixb_r1rel_odom_h4s
+  - _self_
+
+name: OCT-V35-FIXB-R1REL-ODOM-H4S-NORGB
+drop_rgb_inputs: true
