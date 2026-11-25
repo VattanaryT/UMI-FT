@@ -214,6 +214,24 @@ class PoseChunkEnsembler:
                 out[key] = buf
         return out
 
+    def pose_at(self, step: int, key: str = "pose7") -> Optional[np.ndarray]:
+        """Blended pose7 at an absolute step, without removing it."""
+        step = int(step)
+        if step not in self._weights or step not in self._pose_sums.get(key, {}):
+            return None
+        weight = self._weights[step]
+        if weight <= 0.0:
+            return None
+        acc = self._pose_sums[key][step]
+        pos = acc[:3] / weight
+        quat = acc[3:7].copy()
+        norm = float(np.linalg.norm(quat))
+        if norm > 0.0:
+            quat /= norm
+        else:
+            quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        return np.concatenate([pos, quat])
+
     @property
     def buffered_steps(self) -> int:
         return len(self._weights)

@@ -264,6 +264,10 @@ class ModelPredictiveController:
             ignore_rgb=ignore_rgb,
             SE3_fixture_from_world=self.SE3_fixture_from_world,
         )
+        if "robot0_eef_pos" in obs_policy:
+            from mold_aware_runtime import apply_mold_local_pos
+
+            obs_policy = apply_mold_local_pos(obs_policy)
         return obs_policy, se3_w_base
 
     def compute_one_horizon_action(self, obs_task, device):
