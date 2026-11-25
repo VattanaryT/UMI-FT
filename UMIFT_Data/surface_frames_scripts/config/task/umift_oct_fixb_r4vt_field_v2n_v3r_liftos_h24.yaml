@@ -1,0 +1,14 @@
+# Same liftos labels, obs, and normalizer. Action chunk is 24 steps (1.6 s),
+# and the loss upweights v2 and δn. v2 is the tangent that climbs onto the flange.
+defaults:
+  - umift_oct_fixb_r4vt_field_v2n_v3r_liftos
+  - _self_
+
+name: OCT-V35-FIXB-R4VT-FIELD-V2N-V3R-LIFTOS-H24
+
+sparse_action_horizon: 24
+
+dataset:
+  _target_: climb_h24_dataset.UmiFTDatasetLiftOSH24
+  v2_loss_weight: 4.0
+  dn_loss_weight: 4.0
