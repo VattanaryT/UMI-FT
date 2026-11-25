@@ -1,0 +1,15 @@
+# Same sv4b data, normalizer, and horizon 64. δn loss is x4. v2 stays at 1.
+# Lift chunks are 30% of each epoch, from the stringer_v4 isolated releases.
+# The October liftos end file is loaded and counted. Its episode ids belong to
+# the October zarr, so they are not applied onto stringer_v4 rows.
+defaults:
+  - umift_oct_fixb_r4vt_field_v2n_v3r_liftos_sv4b
+  - _self_
+
+name: OCT-V35-FIXB-R4VT-FIELD-V2N-V3R-LIFTOS-SV4B-LIFT
+
+dataset:
+  _target_: sv4b_lift_dataset.UmiFTDatasetSv4bLift
+  lift_batch_fraction: 0.30
+  dn_loss_weight: 4.0
+  extra_lift_index_path: /home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/UMIFT_Data/surface_frames_scripts/assets/lift_isolated_ends.npz

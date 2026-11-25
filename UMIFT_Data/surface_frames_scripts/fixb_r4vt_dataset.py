@@ -18,7 +18,12 @@ from diffusion_policy.common.sampler_umift import sparse_action_indices_from_rgb
 from fixb_dataset import UmiFTDatasetOctR4
 
 
-def _robot_masks(dataset_path: str, long_dt_mask_path: str, n_action: dict[int, int]):
+def _robot_masks(
+    dataset_path: str,
+    long_dt_mask_path: str,
+    n_action: dict[int, int],
+    max_episode: int = 49,
+):
     root = zarr.open(dataset_path, "r")["data"]
     blob = np.load(long_dt_mask_path)
     long_idx: dict[int, set[int]] = {}
@@ -30,8 +35,8 @@ def _robot_masks(dataset_path: str, long_dt_mask_path: str, n_action: dict[int, 
         if not key.startswith("episode_"):
             continue
         ep = int(key.split("_")[-1])
-        if ep < 0 or ep > 49:
-            raise RuntimeError(f"{key} is outside October episodes 0-49")
+        if ep < 0 or ep > int(max_episode):
+            raise RuntimeError(f"{key} is outside episodes 0-{int(max_episode)}")
         if ep not in n_action:
             continue
         n = int(n_action[ep])
@@ -56,6 +61,7 @@ def drop_excluded_queries(
     exclude_episodes,
     long_dt_mask_path: str,
     tag: str = "r4vt-exclude",
+    max_episode: int = 49,
 ) -> dict:
     shape = sampler.shape_meta
     horizon = int(shape["sample"]["action"]["sparse"]["horizon"])
@@ -71,7 +77,12 @@ def drop_excluded_queries(
         n_action.setdefault(ep, 0)
     # Lengths for episodes that never entered this split still need a mask entry
     # only if a query references them. Queries do not.
-    span, long = _robot_masks(dataset_path, long_dt_mask_path, {k: v for k, v in n_action.items() if v})
+    span, long = _robot_masks(
+        dataset_path,
+        long_dt_mask_path,
+        {k: v for k, v in n_action.items() if v},
+        max_episode=max_episode,
+    )
     kept = []
     n_ep = n_span = n_dt = n_both = 0
     for epi_id, rgb_id in sampler.indices:
@@ -145,9 +156,11 @@ class UmiFTDatasetR4VT(UmiFTDatasetOctR4):
         long_dt_mask_path: str,
         exclusion_stats_path: str | None = None,
         reduced_r4: bool = False,
+        max_episode: int = 49,
         **kwargs,
     ):
         self._exclude = [int(ep) for ep in exclude_episodes]
+        self._max_episode = int(max_episode)
         self._long_dt_mask_path = str(long_dt_mask_path)
         self._exclusion_stats_path = exclusion_stats_path
         self._dataset_path = dataset_path
@@ -172,6 +185,7 @@ class UmiFTDatasetR4VT(UmiFTDatasetOctR4):
             self._dataset_path,
             self._exclude,
             self._long_dt_mask_path,
+            max_episode=self._max_episode,
         )
         stats["split"] = split
         if self._exclusion_stats_path:
@@ -193,6 +207,7 @@ class UmiFTDatasetR4VT(UmiFTDatasetOctR4):
         val_set._long_dt_mask_path = self._long_dt_mask_path
         val_set._dataset_path = self._dataset_path
         val_set._exclusion_stats_path = self._exclusion_stats_path
+        val_set._max_episode = self._max_episode
         stats = val_set._apply("val")
         self._exclusion_stats["val"] = stats
         return val_set
