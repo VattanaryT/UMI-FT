@@ -73,6 +73,9 @@ def write_run_meta(
     slow_down_factor: float,
     command: str,
     repo_root: str | None = None,
+    mold_geom_train_frame: bool | None = None,
+    orientation_file: str = "",
+    orientation_sha: str = "",
 ) -> Path:
     """Write ``<run_dir>/meta.json``. Create empty ``notes.md`` if it is absent."""
     run_dir = Path(run_dir)
@@ -98,6 +101,11 @@ def write_run_meta(
             None if stiffness_floor is None else float(stiffness_floor)
         ),
         "slow_down_factor": float(slow_down_factor),
+        "mold_geom_train_frame": (
+            bool(mold_geom_train_frame) if mold_geom_train_frame is not None else None
+        ),
+        "orientation_file": orientation_file,
+        "orientation_sha": orientation_sha,
         "override": dict(_OVERRIDE_THRESHOLDS),
         "command": command,
     }
@@ -139,6 +147,9 @@ def write_from_env() -> Path:
         mode = "policy"
     floor_raw = os.environ.get("UMIFT_STIFFNESS_FLOOR", "").strip()
     floor = float(floor_raw) if floor_raw else None
+    from mold_geom_train_frame import orientation_info
+
+    orient = orientation_info()
     return write_run_meta(
         run_dir,
         mode=mode,
@@ -149,6 +160,9 @@ def write_from_env() -> Path:
         stiffness_floor=floor,
         slow_down_factor=float(os.environ.get("UMIFT_SLOW_DOWN_FACTOR", "2")),
         command=os.environ.get("UMIFT_RUN_COMMAND", ""),
+        mold_geom_train_frame=bool(orient["enabled"]),
+        orientation_file=orient["file"],
+        orientation_sha=orient["sha"],
     )
 
 

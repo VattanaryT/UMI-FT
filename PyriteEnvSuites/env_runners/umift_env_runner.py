@@ -1399,7 +1399,9 @@ def _write_run_meta_if_requested(start_pose, pose_note, control_para, pipeline_p
     if not run_dir:
         return
     from PyriteEnvSuites.env_runners.run_meta import write_run_meta
+    from mold_geom_train_frame import orientation_info
 
+    orient = orientation_info()
     write_run_meta(
         run_dir,
         mode=mode,
@@ -1410,6 +1412,9 @@ def _write_run_meta_if_requested(start_pose, pose_note, control_para, pipeline_p
         stiffness_floor=read_press_stiffness_floor(),
         slow_down_factor=float(control_para["slow_down_factor"]),
         command=os.environ.get("UMIFT_RUN_COMMAND", ""),
+        mold_geom_train_frame=bool(orient["enabled"]),
+        orientation_file=orient["file"],
+        orientation_sha=orient["sha"],
     )
 
 
@@ -1498,6 +1503,28 @@ def main():
     }
     if os.environ.get("UMIFT_MAX_DURATION_S", "").strip():
         control_para["max_duration_s"] = float(os.environ["UMIFT_MAX_DURATION_S"])
+    # Default stays 6. --exec-horizon N sets this for one run.
+    _slow_env = os.environ.get("UMIFT_SLOW_DOWN_FACTOR", "").strip()
+    if _slow_env:
+        _slow_v = float(_slow_env)
+        if not _slow_v > 0.0:
+            raise ValueError(f"UMIFT_SLOW_DOWN_FACTOR={_slow_env} must be > 0")
+        control_para["slow_down_factor"] = _slow_v
+    _step_wall = (
+        float(control_para["raw_time_step_s"]) * float(control_para["slow_down_factor"])
+    )
+    print(
+        f"[horizon] slow_down_factor={float(control_para['slow_down_factor']):g} "
+        f"one action step is {_step_wall:.3f} s wall",
+        flush=True,
+    )
+    _exec_env = os.environ.get("UMIFT_EXEC_HORIZON", "").strip()
+    if _exec_env:
+        _exec_n = int(_exec_env)
+        if _exec_n < 1:
+            raise ValueError(f"UMIFT_EXEC_HORIZON={_exec_n} must be >= 1")
+        control_para["sparse_execution_horizon"] = _exec_n
+        print(f"[horizon] sparse_execution_horizon={_exec_n} from UMIFT_EXEC_HORIZON")
     pipeline_para = {
         # Layup: D405 rgb (manip_server) + depth (pyrealsense2) + UR5e wrist FT.
         "use_layup_env": True,
@@ -1588,6 +1615,7 @@ def main():
 
     # Mold-aware / Fix B: detect run type from checkpoint task name.
     mold_runtime = None
+    _mold_train_frame = False
     mold_run_type = "none"
     bench_lift_m = 0.0
     r4vt = False
@@ -1673,6 +1701,15 @@ def main():
             f"[mold] field_class={type(_field).__name__} "
             f"orientation_z_inward={bool(getattr(_field, 'orientation_z_inward', False))} "
             f"sidecar={_side} exists={_side.is_file()}"
+        )
+        from mold_geom_train_frame import enabled as _train_frame_enabled
+        from mold_geom_train_frame import orientation_info
+
+        _train_info = orientation_info()
+        _mold_train_frame = bool(_train_frame_enabled())
+        print(
+            f"[mold] train_frame={'on' if _mold_train_frame else 'off'} "
+            f"orientation={_train_info['file']} sha={_train_info['sha']}"
         )
         if r4vt:
             from jump_guard import MAX_CONSECUTIVE_HOLDS, MAX_STEP_DEG, MAX_STEP_MM, TargetJumpGuard
@@ -2144,6 +2181,13 @@ def main():
         if r4vt
         else None
     )
+    r4_pose_ensemblers = None
+    from dn_bias import millimeters as _dn_bias_mm
+    from tcp_offset import millimeters as _tcp_offset_mm
+    from tcp_offset import shift_pose7 as _shift_pose7
+
+    tcp_offset_mm = _tcp_offset_mm()
+    dn_bias_mm = _dn_bias_mm()
 
     printOrNot(vbs_h2, "Calibrating robot wrench.")
     env.calibrate_robot_wrench(NSamples=100)
@@ -2255,6 +2299,71 @@ def main():
             raise RuntimeError(
                 "UMIFT_POLICY_START_EPISODE is for policy rollouts. "
                 "Unset it for a GT replay."
+            )
+
+    raw_pose = None
+    if os.environ.get("UMIFT_RAW_POSE_REPLAY", "").strip():
+        if gt_replay is not None:
+            raise RuntimeError("UMIFT_RAW_POSE_REPLAY cannot be combined with a label replay.")
+        from raw_pose_mode import from_env as _raw_from_env
+
+        raw_pose = _raw_from_env(
+            int(control_para["sparse_execution_horizon"]),
+            mold_T_fixture_from_base,
+        )
+        control_para["enable_control_log"] = True
+        print(
+            f"[raw-pose] episode {raw_pose.episode} from index {raw_pose.start_index}: "
+            f"{raw_pose.n} poses, press={raw_pose.stiffness is not None}"
+        )
+
+    if mold_runtime is not None:
+        # v3r and liftos train ΔR against the query TCP. Causal replay does not.
+        _tcp_rot = gt_replay is None and any(
+            token in f"{_task_name} {_dataset_path_cfg}"
+            for token in ("field_v3r", "liftos")
+        )
+        mold_runtime.tcp_relative_rotation = _tcp_rot
+        from mold_aware_runtime import tcp_rot_newest_enabled
+        from pose_ensemble import DECAY_M as _pose_decay
+        from pose_ensemble import enabled as pose_ensemble_enabled
+
+        mold_runtime.tcp_rot_newest = bool(_tcp_rot and tcp_rot_newest_enabled())
+        if pose_ensemble_enabled() and tcp_rot_newest_enabled():
+            raise RuntimeError(
+                "UMIFT_POSE_ENSEMBLE and UMIFT_TCP_ROT_NEWEST cannot both be set"
+            )
+        if _tcp_rot:
+            print(f"[mold] rotation is R_tcp @ ΔR ({_task_name})")
+        if mold_runtime.tcp_rot_newest:
+            print("[mold] TCP-relative ΔR executes the newest chunk only")
+        elif tcp_rot_newest_enabled():
+            print("[mold] newest-chunk flag ignored: this run is not TCP-relative")
+        if pose_ensemble_enabled():
+            if r4vt:
+                r4_pose_ensemblers = make_action_chunk_ensemblers(
+                    id_list, _pose_decay
+                )
+                print(
+                    "[mold] pose ensemble on: integrate the chunk, then average "
+                    f"overlapping SE3 targets, decay {_pose_decay:g}"
+                )
+                print(
+                    "[mold] jump guard checks the executed blended steps "
+                    "and the next blended target"
+                )
+            else:
+                print("[mold] pose-ensemble flag ignored: not an r4vt run")
+        if tcp_offset_mm:
+            print(
+                f"[mold] tcp offset {tcp_offset_mm:+.1f} mm along tool z. "
+                "Foot and delta_n use that point. Commands are shifted back "
+                "onto the pendant TCP."
+            )
+        if dn_bias_mm:
+            print(
+                f"[mold] δn bias {dn_bias_mm:+.1f} mm when |F·n| ≥ 2 N "
+                "or signed distance < 3 mm"
             )
 
     #########################################
@@ -2463,6 +2572,9 @@ def main():
             mold_runtime.reset()
         if r4vt:
             r4_action_ensembler.reset()
+        if r4_pose_ensemblers is not None:
+            for _ensembler in r4_pose_ensemblers.values():
+                _ensembler.reset()
         if control_para["enable_control_log"]:
             log_store = zarr.DirectoryStore(path=episode_log_path)
             log = zarr.open(store=log_store, mode="w")
@@ -2472,10 +2584,16 @@ def main():
             log.attrs["enable_ensemble_chunking"] = bool(
                 control_para.get("enable_ensemble_chunking", False)
             )
-            log.attrs["ensemble_decay_m"] = float(
-                control_para.get("ensemble_decay_m", 0.0)
+            log.attrs["ensemble_decay_m"] = (
+                0.005
+                if r4_pose_ensemblers is not None
+                else float(control_para.get("ensemble_decay_m", 0.0))
             )
-            log.attrs["ensemble_mode"] = "action_blend" if r4vt else "pose"
+            log.attrs["ensemble_mode"] = (
+                "pose"
+                if r4_pose_ensemblers is not None
+                else ("action_blend" if r4vt else "pose")
+            )
             log.attrs["decode_dt_s"] = float(
                 sparse_action_down_sample_steps
                 * p_timestep_s
@@ -2571,8 +2689,12 @@ def main():
             gt_meas_pose = None
             r4_keep_len = None
             r4_jump_abort = False
+            horizon_dn_contact = False
             if gt_replay is not None and not gt_replay.remaining():
                 print("[gt-replay] recorded labels are finished")
+                break
+            if raw_pose is not None and not raw_pose.remaining():
+                print("[raw-pose] recorded poses are finished")
                 break
 
             # Periodic mid-episode laser scan interrupt: pauses RTDE control,
@@ -2612,6 +2734,10 @@ def main():
                 last_scan_time_s = horizon_initial_time_s
 
             obs_raw = env.get_observation_from_buffer()
+            if tcp_offset_mm and "ts_pose_fb_0" in obs_raw:
+                obs_raw["ts_pose_fb_0"] = _shift_pose7(
+                    obs_raw["ts_pose_fb_0"], tcp_offset_mm
+                )
 
             # # plot the rgb image
             # if len(id_list) == 1:
@@ -2684,7 +2810,9 @@ def main():
                 obs_raw["ts_pose_fb_0"] = pose7_batch_to_fixture(
                     pose_base, mold_T_fixture_from_base
                 )
-                mold_fill = mold_runtime.fill_obs_raw(obs_raw, robot_id=0)
+                mold_fill = mold_runtime.fill_obs_raw(
+                    obs_raw, robot_id=0, train_frame=_mold_train_frame
+                )
                 pose_fix = np.asarray(obs_raw["ts_pose_fb_0"], dtype=np.float64)
                 obs_raw["ts_pose_fb_0"] = pose_base
                 if gt_replay is not None and len(pose_fix):
@@ -2720,6 +2848,17 @@ def main():
                 if wkey is not None:
                     w = np.asarray(obs_raw[wkey][-1], dtype=np.float64).reshape(-1)
                     ep_force.append(float(np.linalg.norm(w[:3])))
+                    if mold_fill:
+                        from dn_bias import in_contact as _dn_in_contact
+                        from fixb_labels import pose7_to_Rp as _pose7_fn
+
+                        tool_R, _ = _pose7_fn(pose_fix[-1].reshape(1, 7))
+                        fn_now = abs(
+                            float(np.dot(tool_R[0] @ w[:3], mold_fill["normal"][-1]))
+                        )
+                        horizon_dn_contact = _dn_in_contact(
+                            fn_now, float(mold_fill["sd"][-1])
+                        )
                     if r4vt:
                         decision = mold_runtime.wrench_hold_update(ep_force[-1])
                         if decision == "abort":
@@ -2739,6 +2878,10 @@ def main():
                             )
                             time.sleep(max(0.0, execution_duration_s))
                             continue
+                elif mold_fill:
+                    from dn_bias import in_contact as _dn_in_contact
+
+                    horizon_dn_contact = _dn_in_contact(0.0, float(mold_fill["sd"][-1]))
 
             raw_to_obs_inference(obs_raw, obs_task, shape_meta)
 
@@ -2807,6 +2950,13 @@ def main():
                         controller.id_list,
                         controller.fix_orientation,
                     )
+            elif raw_pose is not None:
+                nom, vt, stiff = raw_pose.chunk()
+                action_sparse_target_mats = [nom]
+                action_sparse_vt_mats = [vt]
+                action_stiffnesses = None if stiff is None else [stiff]
+                action_eoat = [np.zeros((nom.shape[0], 2), dtype=np.float64)]
+                controller.last_raw_action = None
             elif action_type == "pose9":
                 action_sparse_target_mats = controller.compute_one_horizon_action(
                     obs_task["obs"], device
@@ -2853,10 +3003,18 @@ def main():
                 )
                 R0, p0 = _pose7_to_Rp(pose7_fix.reshape(1, 7))
                 raw_a = np.asarray(controller.last_raw_action, dtype=np.float64)
+                carry_snap = None
                 if r4vt:
                     exec_now = int(control_para["sparse_execution_horizon"])
-                    r4_action_ensembler.push(horizon_count * exec_now, raw_a)
-                    raw_a = r4_action_ensembler.pop(exec_now)
+                    if r4_pose_ensemblers is not None:
+                        from pose_ensemble import snapshot_carry
+
+                        carry_snap = snapshot_carry(mold_runtime)
+                    elif getattr(mold_runtime, "tcp_rot_newest", False):
+                        raw_a = raw_a[:exec_now]
+                    else:
+                        r4_action_ensembler.push(horizon_count * exec_now, raw_a)
+                        raw_a = r4_action_ensembler.pop(exec_now)
                     dt = fixb_decode_dt(
                         raw_a.shape[0], sparse_action_down_sample_steps, p_timestep_s
                     )
@@ -2879,6 +3037,29 @@ def main():
                     # Replay only. The internal TCP follows the demo step.
                     # A policy chunk leaves _tcp_step unset and follows the command.
                     mold_runtime._tcp_step = gt_replay.tcp_step(raw_a.shape[0])
+                    if os.environ.get("UMIFT_FOOT_FACE_HYST", "").strip().lower() in (
+                        "1",
+                        "true",
+                        "yes",
+                    ):
+                        if not hasattr(gt_replay, "mold_x"):
+                            import replay_gt as _replay_gt
+
+                            _grp = _replay_gt._open_episode(
+                                _replay_gt.R4VT_ZARR, gt_replay.episode
+                            )
+                            gt_replay.mold_x = np.asarray(
+                                _grp["mold_x_s_0"], dtype=np.float64
+                            )
+                        mold_runtime._demo_feet = gt_replay.mold_x[label_idx]
+                        if not hasattr(gt_replay, "mold_R"):
+                            gt_replay.mold_R = np.asarray(
+                                _grp["mold_R_field_0"], dtype=np.float64
+                            ).reshape(-1, 3, 3)
+                        mold_runtime._demo_frames = gt_replay.mold_R[label_idx]
+                else:
+                    mold_runtime._demo_feet = None
+                    mold_runtime._demo_frames = None
                 decoded = mold_runtime.decode_chunk(
                     raw_a, p0[0], R0[0], dt, label_R=label_R
                 )
@@ -2961,7 +3142,10 @@ def main():
                     if control_para["mold_aware_abort_on_safety"]:
                         print_red("[mold] aborting episode due to safety trigger")
                         break
-                if r4vt and r4_jump_guard is not None:
+                # Pose ensemble integrates the whole chunk, then blends. A later
+                # integrated step can exceed the guard even when the poses that
+                # will be sent do not. That path checks the blended targets below.
+                if r4vt and r4_jump_guard is not None and r4_pose_ensemblers is None:
                     label_idx = None
                     if gt_replay is not None:
                         label_idx = np.asarray(
@@ -3018,27 +3202,51 @@ def main():
                     decoded["x_d"] = x_g
                     decoded["R_d"] = R_g
                     decoded["R_field"] = field_g
-                    mold_runtime.note_commanded_rd(R_d_fixture[n_keep - 1])
+                    if r4_pose_ensemblers is None:
+                        mold_runtime.note_commanded_rd(R_d_fixture[n_keep - 1])
                     exe_h_preview = n_keep
                     r4_keep_len = n_keep
                     if aborted:
                         r4_jump_abort = True
                         ep_jump_aborted = True
+                # The full chunk was integrated for the pose blend. Advance the
+                # foot tracker by the executed prefix only; the blend below
+                # then anchors the next slew on the scheduled pose.
+                if carry_snap is not None:
+                    from pose_ensemble import restore_carry
+
+                    restore_carry(mold_runtime, carry_snap)
+                    prefix = min(int(exec_now), int(raw_a.shape[0]))
+                    dt_prefix = np.asarray(dt, dtype=np.float64).reshape(-1)[:prefix]
+                    label_prefix = (
+                        None
+                        if label_R is None
+                        else np.asarray(label_R)[:prefix]
+                    )
+                    mold_runtime.decode_chunk(
+                        raw_a[:prefix],
+                        p0[0],
+                        R0[0],
+                        dt_prefix,
+                        label_R=label_prefix,
+                    )
                 # Chunk-seam jump vs previous executed endpoint.
-                if prev_seam_x is not None:
-                    dx = float(np.linalg.norm(decoded["x_d"][0] - prev_seam_x) * 1e3)
-                    rel = prev_seam_R.T @ decoded["R_d"][0]
-                    ang = float(
-                        np.degrees(
-                            np.linalg.norm(
-                                Rotation.from_matrix(rel).as_rotvec()
+                # Pose ensemble measures the seam on the blended command below.
+                if r4_pose_ensemblers is None:
+                    if prev_seam_x is not None:
+                        dx = float(
+                            np.linalg.norm(decoded["x_d"][0] - prev_seam_x) * 1e3
+                        )
+                        rel = prev_seam_R.T @ decoded["R_d"][0]
+                        ang = float(
+                            np.degrees(
+                                np.linalg.norm(Rotation.from_matrix(rel).as_rotvec())
                             )
                         )
-                    )
-                    ep_seam_mm.append(dx)
-                    ep_seam_deg.append(ang)
-                prev_seam_x = decoded["x_d"][exe_h_preview - 1].copy()
-                prev_seam_R = decoded["R_d"][exe_h_preview - 1].copy()
+                        ep_seam_mm.append(dx)
+                        ep_seam_deg.append(ang)
+                    prev_seam_x = decoded["x_d"][exe_h_preview - 1].copy()
+                    prev_seam_R = decoded["R_d"][exe_h_preview - 1].copy()
                 if decoded.get("v_par") is not None and "R_field" in decoded:
                     v0 = np.asarray(decoded["v_par"][0], dtype=np.float64).reshape(-1)[:2]
                     rel = np.asarray(decoded["R_field"][0]).T @ np.asarray(decoded["R_d"][0])
@@ -3046,6 +3254,19 @@ def main():
                     print(
                         f"[query] |v| {float(np.linalg.norm(v0)):.3f} m/s "
                         f"v {v0[0]:+.3f} {v0[1]:+.3f} twist {twist:+.1f} deg"
+                    )
+                if (
+                    dn_bias_mm
+                    and horizon_dn_contact
+                    and decoded.get("n_out") is not None
+                    and decoded.get("delta_n") is not None
+                ):
+                    from dn_bias import apply_bias
+
+                    apply_bias(decoded, dn_bias_mm)
+                    print(
+                        f"[mold] δn bias {dn_bias_mm:+.1f} mm "
+                        f"on {len(np.asarray(decoded['delta_n']).reshape(-1))} steps"
                     )
                 tgt, vt = mold_runtime.decoded_to_action_mats(decoded)
                 action_sparse_target_mats = [tgt]
@@ -3260,7 +3481,10 @@ def main():
             exec_h = int(control_para["sparse_execution_horizon"])
             if r4_keep_len is not None:
                 exec_h = min(exec_h, int(r4_keep_len))
-            if action_ensemblers is not None and not r4vt:
+            pose_ensemblers = r4_pose_ensemblers
+            if pose_ensemblers is None and action_ensemblers is not None and not r4vt:
+                pose_ensemblers = action_ensemblers
+            if pose_ensemblers is not None:
                 start_step = horizon_count * exec_h
                 for id in id_list:
                     chunk_len = int(np.asarray(outputs_ts_targets[id]).shape[0])
@@ -3283,7 +3507,7 @@ def main():
                         ),
                     }
                     blended = blend_pose_chunk(
-                        action_ensemblers[id], start_step, fields, exec_h
+                        pose_ensemblers[id], start_step, fields, exec_h
                     )
                     outputs_ts_targets[id] = blended["pose7"]
                     outputs_ts_nominal_targets[id] = blended["nominal_pose7"]
@@ -3292,6 +3516,76 @@ def main():
                     )
                     if outputs_eoat is not None and "eoat" in blended:
                         outputs_eoat[id] = blended["eoat"]
+                if r4_pose_ensemblers is not None and mold_runtime is not None:
+                    from fixb_labels import Rp_to_pose7 as _Rp_to_pose7
+                    from fixb_labels import pose7_to_Rp as _pose7_to_Rp
+                    from pose_ensemble import apply_blended_carry
+
+                    if r4_jump_guard is not None:
+                        sent = np.asarray(outputs_ts_targets[0], dtype=np.float64).reshape(-1, 7)
+                        nxt = r4_pose_ensemblers[0].pose_at(start_step + len(sent))
+                        rows = sent if nxt is None else np.vstack([sent, np.asarray(nxt, dtype=np.float64)])
+                        rot, pos = _pose7_to_Rp(rows)
+                        n_before = len(r4_jump_guard.holds)
+                        x_g, R_g, _, aborted = r4_jump_guard.apply(pos, rot)
+                        for row in r4_jump_guard.holds[n_before:]:
+                            ep_jump_holds.append(row)
+                            text = (
+                                f"[jump-guard] {'ABORT' if row['abort'] else 'hold'} "
+                                f"h={horizon_count} blended step {row['step']} "
+                                f"pos {row['pos_mm']:.1f} mm rot {row['rot_deg']:.1f} deg "
+                                f"run {row['run']}"
+                            )
+                            if row["abort"]:
+                                print_red(text)
+                            else:
+                                print_yellow(text)
+                        n_exec = min(int(x_g.shape[0]), len(sent))
+                        if n_exec == 0:
+                            r4_jump_abort = True
+                            ep_jump_aborted = True
+                            break
+                        guarded = _Rp_to_pose7(R_g[:n_exec], x_g[:n_exec])
+                        nominal = np.asarray(
+                            outputs_ts_nominal_targets[0], dtype=np.float64
+                        ).reshape(-1, 7)[:n_exec]
+                        held = ~np.all(np.isclose(guarded, sent[:n_exec]), axis=1)
+                        if np.any(held):
+                            nominal = np.array(nominal, copy=True)
+                            nominal[held] = guarded[held]
+                        outputs_ts_targets[0] = guarded
+                        outputs_ts_nominal_targets[0] = nominal
+                        outputs_ts_stiffnesses[0] = outputs_ts_stiffnesses[0][:, : 6 * n_exec]
+                        if outputs_eoat is not None:
+                            outputs_eoat[0] = np.asarray(outputs_eoat[0])[:n_exec]
+                        for robot_id in id_list:
+                            raw_k, floored_k = stiffness_trace[robot_id]
+                            stiffness_trace[robot_id] = (raw_k[:n_exec], floored_k[:n_exec])
+                        exec_h = n_exec
+                        if aborted:
+                            r4_jump_abort = True
+                            ep_jump_aborted = True
+                    first = np.asarray(outputs_ts_targets[0][0], dtype=np.float64)
+                    last = np.asarray(outputs_ts_targets[0][-1], dtype=np.float64)
+                    ends, places = _pose7_to_Rp(np.stack([first, last]))
+                    if prev_seam_x is not None:
+                        dx = float(np.linalg.norm(places[0] - prev_seam_x) * 1e3)
+                        rel = prev_seam_R.T @ ends[0]
+                        ang = float(
+                            np.degrees(
+                                np.linalg.norm(Rotation.from_matrix(rel).as_rotvec())
+                            )
+                        )
+                        ep_seam_mm.append(dx)
+                        ep_seam_deg.append(ang)
+                    prev_seam_x = places[1].copy()
+                    prev_seam_R = ends[1].copy()
+                    apply_blended_carry(
+                        mold_runtime,
+                        outputs_ts_targets[0],
+                        outputs_ts_nominal_targets[0],
+                        mold_T_fixture_from_base,
+                    )
             else:
                 for id in id_list:
                     outputs_ts_targets[id] = outputs_ts_targets[id][:exec_h, :]
@@ -3347,6 +3641,13 @@ def main():
 
             action_start_time_s = env.current_hardware_time_s
 
+            if tcp_offset_mm:
+                # The log keeps the blade-frame targets. The arm's TCP is the pendant.
+                outputs_ts_targets[0] = _shift_pose7(outputs_ts_targets[0], -tcp_offset_mm)
+                outputs_ts_nominal_targets[0] = _shift_pose7(
+                    outputs_ts_nominal_targets[0], -tcp_offset_mm
+                )
+
             if len(id_list) == 1:
                 outputs_ts_targets = outputs_ts_targets[0].T  # N x 7 to 7 x N
                 outputs_ts_stiffnesses = outputs_ts_stiffnesses[0]
@@ -3381,6 +3682,8 @@ def main():
                 if gt_meas_pose is not None:
                     gt_replay.note_tcp(gt_meas_pose)
                 gt_replay.advance()
+            if raw_pose is not None:
+                raw_pose.advance()
             horizon_count += 1
             if r4_jump_abort:
                 print_red("[jump-guard] aborting episode")

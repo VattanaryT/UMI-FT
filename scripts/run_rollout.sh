@@ -31,7 +31,34 @@ usage() {
   echo "  --start-episode N    policy only. Approach episode N. Replay ignores this and"
   echo "    refuses the flag, because replay uses the recorded pose."
   echo "  --start-index I      policy only. Row of ts_pose_fb_0. Default 0 (first frame)."
-  echo "  --dry-run            parse, write meta.json if --out_dir/--name is set, then exit."
+  echo "  --foot-hyst          keep the foot face until a new face wins for N steps and is d mm closer."
+  echo "                       N is UMIFT_FOOT_HYST_N (default 1), d is UMIFT_FOOT_HYST_D_MM (default 5)."
+  echo "                       Off unless this flag or UMIFT_FOOT_FACE_HYST=1 is set."
+  echo "  --spring25           load offline_hw/hwconfig_spring25 (max spring 25 N). Off keeps the 40 N yaml."
+  echo "  --limited-vt         schedule the step-limited virtual target. Off rebuilds it from the foot."
+  echo "  --max-step-mm M      cap each scheduled step at M mm. Default 25. The arm reaches ~30 mm/s."
+  echo "  --mold-local         liftos only. robot0_eef_pos uses field_v2_axes. Off keeps fixture xyz."
+  echo "  --no-mold-geom-train-frame"
+  echo "                       publish the live smooth-field mold_geom. Default uses the"
+  echo "                       training frame (frames_pca_r020.npz, PCA t1, 30 deg carry)."
+  echo "  --newest-chunk       TCP-relative ΔR executes the newest chunk only. The 8 deg slew stays."
+  echo "                       Off keeps the action-space blend. Ignored when rotation is not TCP-relative."
+  echo "  --pose-ensemble      Integrate the whole chunk, then average overlapping SE3 targets."
+  echo "                       Positions are averaged. Rotations use the quaternion mean. Decay 0.005."
+  echo "                       The jump guard then checks the executed steps and the next blended target."
+  echo "                       Off keeps the action-space blend and checks the whole decoded chunk."
+  echo "                       Cannot be combined with --newest-chunk."
+  echo "  --tcp-offset-mm N    Shift the tool frame N mm along tool z before foot and delta_n."
+  echo "                       Commands sent to the arm are shifted back. Off leaves the pendant TCP."
+  echo "  --dn-bias-mm N       Add N mm to scheduled δn when |F·n| ≥ 2 N or signed distance < 3 mm."
+  echo "                       Off leaves δn unchanged. In the air the bias stays off."
+  echo "  --exec-horizon N     execute N action steps, then replan. Off keeps 6."
+  echo "  --slow-down N        wall time per action step is N/15 s. Off keeps 2 (0.133 s)."
+  echo "                       N=6 loads offline_hw/hwconfig_spring25_sd6 (24 s history, 20% margin)."
+  echo "  --hwconfig-dir PATH  hardware yaml folder. Off keeps spring25 or the shared yaml."
+  echo "  --raw-replay-episode N  schedule that episode's recorded TCP. No policy and no mold foot."
+  echo "  --raw-press          with --raw-replay-episode, press at -min(|F|, 25 N)/3000 when |F| > 5 N."
+  echo "                       Off, nominal and virtual target are the same pose."
   echo "    Does not call kill_ports.py or the runner."
   echo "    Policy uses the current TCP, unless UMIFT_POLICY_START_EPISODE=N."
   echo "    That approaches episode N's TCP pose (index UMIFT_POLICY_START_INDEX, default 0), and"
@@ -58,6 +85,21 @@ run_name=""
 start_episode=""
 start_index=""
 dry=0
+foot_hyst=0
+spring25=0
+limited_vt=0
+max_step_mm=""
+mold_local=0
+no_train_frame=0
+newest_chunk=0
+pose_ensemble=0
+tcp_offset_mm=""
+dn_bias_mm=""
+exec_horizon=""
+slow_down=""
+hwconfig_dir=""
+raw_episode=""
+raw_press=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --replay-episode)
@@ -108,12 +150,87 @@ while [[ $# -gt 0 ]]; do
       dry=1
       shift
       ;;
+    --foot-hyst)
+      foot_hyst=1
+      shift
+      ;;
+    --spring25)
+      spring25=1
+      shift
+      ;;
+    --limited-vt)
+      limited_vt=1
+      shift
+      ;;
+    --max-step-mm)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--max-step-mm needs a length in mm"
+      max_step_mm="$2"
+      shift 2
+      ;;
+    --mold-local)
+      mold_local=1
+      shift
+      ;;
+    --no-mold-geom-train-frame)
+      no_train_frame=1
+      shift
+      ;;
+    --newest-chunk)
+      newest_chunk=1
+      shift
+      ;;
+    --pose-ensemble)
+      pose_ensemble=1
+      shift
+      ;;
+    --tcp-offset-mm)
+      [[ $# -ge 2 && "${2:-}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || die "--tcp-offset-mm needs a number"
+      tcp_offset_mm="$2"
+      shift 2
+      ;;
+    --dn-bias-mm)
+      [[ $# -ge 2 && "${2:-}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || die "--dn-bias-mm needs a number"
+      dn_bias_mm="$2"
+      shift 2
+      ;;
+    --exec-horizon)
+      [[ $# -ge 2 && "${2:-}" =~ ^[0-9]+$ && "$2" -ge 1 ]] || die "--exec-horizon needs an integer >= 1"
+      exec_horizon="$2"
+      shift 2
+      ;;
+    --slow-down)
+      [[ $# -ge 2 && "${2:-}" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "--slow-down needs a number > 0"
+      slow_down="$2"
+      awk "BEGIN { exit !(${slow_down} > 0) }" || die "--slow-down needs a number > 0"
+      shift 2
+      ;;
+    --hwconfig-dir)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--hwconfig-dir needs a directory"
+      hwconfig_dir="$2"
+      shift 2
+      ;;
+    --raw-replay-episode)
+      [[ $# -ge 2 && -n "${2:-}" ]] || die "--raw-replay-episode needs an episode id"
+      raw_episode="$2"
+      shift 2
+      ;;
+    --raw-press)
+      raw_press=1
+      shift
+      ;;
     *)
       usage
       die "unknown argument: $1"
       ;;
   esac
 done
+
+if [[ "$pose_ensemble" -eq 1 && "$newest_chunk" -eq 1 ]]; then
+  die "--pose-ensemble and --newest-chunk cannot be combined"
+fi
+if [[ "$pose_ensemble" -eq 1 && "$arm" != "r4vt" ]]; then
+  die "--pose-ensemble is only for r4vt"
+fi
 
 case "$arm" in
   r4vt)
@@ -143,14 +260,22 @@ else
   unset UMIFT_REPLAY_EPISODE
 fi
 
+if [[ -n "$replay_episode" && -n "$raw_episode" ]]; then
+  die "--raw-replay-episode cannot be combined with --replay-episode"
+fi
+if [[ -n "$raw_press" && "$raw_press" -eq 1 && -z "$raw_episode" ]]; then
+  die "--raw-press needs --raw-replay-episode"
+fi
 if [[ -n "$replay_episode" && -n "$start_episode" ]]; then
   die "--start-episode is for a policy run. Replay uses the recorded pose."
 fi
-if [[ -n "$start_index" && -z "$start_episode" ]]; then
-  die "--start-index needs --start-episode"
+if [[ -n "$start_index" && -z "$start_episode" && -z "$raw_episode" ]]; then
+  die "--start-index needs --start-episode or --raw-replay-episode"
 fi
 if [[ -n "$start_episode" ]]; then
   export UMIFT_POLICY_START_EPISODE="$start_episode"
+elif [[ -n "$raw_episode" ]]; then
+  export UMIFT_POLICY_START_EPISODE="$raw_episode"
 else
   unset UMIFT_POLICY_START_EPISODE
 fi
@@ -158,6 +283,66 @@ if [[ -n "$start_index" ]]; then
   export UMIFT_POLICY_START_INDEX="$start_index"
 else
   unset UMIFT_POLICY_START_INDEX
+fi
+if [[ -n "$raw_episode" ]]; then
+  export UMIFT_RAW_POSE_REPLAY="$raw_episode"
+  export UMIFT_RAW_POSE_START_INDEX="${start_index:-0}"
+  if [[ "$raw_press" -eq 1 ]]; then
+    export UMIFT_RAW_POSE_PRESS=1
+  else
+    unset UMIFT_RAW_POSE_PRESS
+  fi
+else
+  unset UMIFT_RAW_POSE_REPLAY
+  unset UMIFT_RAW_POSE_PRESS
+  unset UMIFT_RAW_POSE_START_INDEX
+fi
+if [[ "$foot_hyst" -eq 1 ]]; then
+  export UMIFT_FOOT_FACE_HYST=1
+  export UMIFT_FOOT_HYST_N="${UMIFT_FOOT_HYST_N:-1}"
+  export UMIFT_FOOT_HYST_D_MM="${UMIFT_FOOT_HYST_D_MM:-5}"
+fi
+if [[ "$limited_vt" -eq 1 ]]; then
+  export UMIFT_SCHEDULE_LIMITED_VT=1
+fi
+if [[ -n "$max_step_mm" ]]; then
+  export UMIFT_MAX_STEP_MM="$max_step_mm"
+fi
+if [[ "$no_train_frame" -eq 1 ]]; then
+  export UMIFT_MOLD_GEOM_TRAIN_FRAME=0
+else
+  export UMIFT_MOLD_GEOM_TRAIN_FRAME="${UMIFT_MOLD_GEOM_TRAIN_FRAME:-1}"
+fi
+if [[ "$mold_local" -eq 1 ]]; then
+  export UMIFT_MOLD_LOCAL_POS=1
+  export UMIFT_MOLD_LOCAL_ZARR="${UMIFT_MOLD_LOCAL_ZARR:-/mnt/data/umidata/ft/mold_aware_datasets/stringer_v3.5_fixb_odom_corr/r4vt_field_v2n_v3r_liftos/acp_replay_buffer.zarr}"
+else
+  unset UMIFT_MOLD_LOCAL_POS
+fi
+if [[ "$newest_chunk" -eq 1 ]]; then
+  export UMIFT_TCP_ROT_NEWEST=1
+else
+  unset UMIFT_TCP_ROT_NEWEST
+fi
+if [[ "$pose_ensemble" -eq 1 ]]; then
+  export UMIFT_POSE_ENSEMBLE=1
+else
+  unset UMIFT_POSE_ENSEMBLE
+fi
+if [[ -n "$tcp_offset_mm" ]]; then
+  export UMIFT_TCP_OFFSET_MM="$tcp_offset_mm"
+else
+  unset UMIFT_TCP_OFFSET_MM
+fi
+if [[ -n "$dn_bias_mm" ]]; then
+  export UMIFT_DN_BIAS_MM="$dn_bias_mm"
+else
+  unset UMIFT_DN_BIAS_MM
+fi
+if [[ -n "$exec_horizon" ]]; then
+  export UMIFT_EXEC_HORIZON="$exec_horizon"
+else
+  unset UMIFT_EXEC_HORIZON
 fi
 
 # Policy labels stay track_clean. A replay reads the causal-foot 10-d labels.
@@ -221,7 +406,21 @@ fi
 set -u
 export PYRITE_CHECKPOINT_FOLDERS=/mnt/data/umidata/ft/training_outputs
 export PYRITE_HARDWARE_CONFIG_FOLDERS=/home/boeing/umi_ft_ws/hardware_interfaces/workcell/table_top_manip/config
-export UMIFT_SLOW_DOWN_FACTOR="${UMIFT_SLOW_DOWN_FACTOR:-2}"
+_SD6_HW="/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/offline_hw/hwconfig_spring25_sd6"
+if [[ -n "$hwconfig_dir" ]]; then
+  [[ -d "$hwconfig_dir" ]] || die "hwconfig dir not found: $hwconfig_dir"
+  export PYRITE_HARDWARE_CONFIG_FOLDERS="$hwconfig_dir"
+elif [[ -n "$slow_down" ]] && awk "BEGIN { exit !(${slow_down} == 6) }"; then
+  export PYRITE_HARDWARE_CONFIG_FOLDERS="$_SD6_HW"
+elif [[ "$spring25" -eq 1 ]]; then
+  export PYRITE_HARDWARE_CONFIG_FOLDERS="/home/boeing/umi_ft_ws/worktrees/UMI-FT-surface_frames/offline_hw/hwconfig_spring25"
+fi
+echo "hardware config: $PYRITE_HARDWARE_CONFIG_FOLDERS"
+if [[ -n "$slow_down" ]]; then
+  export UMIFT_SLOW_DOWN_FACTOR="$slow_down"
+else
+  export UMIFT_SLOW_DOWN_FACTOR="${UMIFT_SLOW_DOWN_FACTOR:-2}"
+fi
 if [[ -n "$run_name" && -z "$out_dir" ]]; then
   [[ -n "${UMIFT_RESULTS_ROOT:-}" ]] || die "--name needs UMIFT_RESULTS_ROOT"
   out_dir="${UMIFT_RESULTS_ROOT}/rollouts/$(TZ=America/Los_Angeles date +%F)_${run_name}"

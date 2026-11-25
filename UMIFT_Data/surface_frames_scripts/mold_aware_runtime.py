@@ -40,6 +40,64 @@ def rot6d_rows_to_R(r6: np.ndarray) -> np.ndarray:
 _IDENTITY_ROT6 = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64)
 
 
+_MOLD_LOCAL_AXES = None
+
+
+def mold_local_enabled() -> bool:
+    return os.environ.get("UMIFT_MOLD_LOCAL_POS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def tcp_rot_newest_enabled() -> bool:
+    return os.environ.get("UMIFT_TCP_ROT_NEWEST", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def mold_local_axes():
+    """Liftos training frame. None when UMIFT_MOLD_LOCAL_POS is off."""
+    global _MOLD_LOCAL_AXES
+    if not mold_local_enabled():
+        return None
+    if _MOLD_LOCAL_AXES is not None:
+        return _MOLD_LOCAL_AXES
+    path = os.environ.get("UMIFT_MOLD_LOCAL_ZARR", "").strip()
+    if not path:
+        path = (
+            "/mnt/data/umidata/ft/mold_aware_datasets/"
+            "stringer_v3.5_fixb_odom_corr/r4vt_field_v2n_v3r_liftos/"
+            "acp_replay_buffer.zarr"
+        )
+    import zarr
+
+    spec = zarr.open_group(path, mode="r").attrs["field_v2_axes"]
+    origin = np.asarray(spec["origin"], dtype=np.float64).reshape(3)
+    axes = np.asarray(spec["axes"], dtype=np.float64).reshape(3, 3)
+    _MOLD_LOCAL_AXES = (origin, axes)
+    print(f"[mold] robot0_eef_pos is mold-local ({path})")
+    return _MOLD_LOCAL_AXES
+
+
+def apply_mold_local_pos(obs: dict) -> dict:
+    """Fixture xyz → mold PCA frame. No-op unless UMIFT_MOLD_LOCAL_POS is set."""
+    spec = mold_local_axes()
+    if spec is None or "robot0_eef_pos" not in obs:
+        return obs
+    from field_v2_dataset import mold_local
+
+    origin, axes = spec
+    out = dict(obs)
+    out["robot0_eef_pos"] = mold_local(obs["robot0_eef_pos"], origin, axes).astype(
+        np.float32
+    )
+    return out
+
+
 def expand_r4_action(action: np.ndarray) -> np.ndarray:
     """10-d ``[v1, v2, δn, stiffness, ΔR]`` → the 27-d layout.
 
@@ -190,6 +248,8 @@ def r4_safety_limits(
     flag skips the commanded-depth abort and checks the TCP instead.
     ``max_press_depth_m`` is how far the bench floor may press, default 5 mm.
     """
+    step_mm = os.environ.get("UMIFT_MAX_STEP_MM", "").strip()
+    step_m = float(step_mm) / 1000.0 if step_mm else 0.025
     return SafetyLimits(
         max_press_depth_m=float(max_press_depth_m),
         enable_delta_n_floor=bool(enable_delta_n_floor),
@@ -199,6 +259,7 @@ def r4_safety_limits(
         wrench_hold_n=float(wrench_hold_n),
         abort_on_measured_mesh_distance=bool(abort_on_measured_mesh_distance),
         enable_rd_slew=True,
+        max_step_m=step_m,
     )
 
 
@@ -1166,8 +1227,22 @@ def _integrate_causal_tcp(
     commanded = np.zeros((count, 3), dtype=np.float64)
     quiet = np.zeros(count, dtype=bool)
     geodesic = foot_walk_mode() == "geodesic"
+    # Face hysteresis is opt-in. Unset keeps this loop byte-for-byte the same.
+    _hold_foot = None
+    if os.environ.get("UMIFT_FOOT_FACE_HYST", "").strip().lower() in ("1", "true", "yes"):
+        from foot_face_hyst import hold_foot as _hold_foot, reset_episode
+
+        if prev is None:
+            reset_episode()
     for k in range(count):
-        if geodesic and prev is not None:
+        if _hold_foot is not None:
+            # Training obs is the closest point of the TCP. The geodesic walk is
+            # what left the wall. Hysteresis then keeps that face across a flicker.
+            queried = field.query(tcp_state.reshape(1, 3))
+            x = np.asarray(queried["x_s"], dtype=np.float64).reshape(3)
+            rotation = np.asarray(queried["R"], dtype=np.float64).reshape(3, 3)
+            x, rotation = _hold_foot(tcp_state, x, rotation, field)
+        elif geodesic and prev is not None:
             x, rotation = _walk_on_surface(field, prev[0], prev[1], v_par[k], dt[k])
         else:
             x, rotation = tracker.step(tcp_state, prev)
@@ -1583,6 +1658,7 @@ class MoldAwareRuntime:
         self._reject_streak = 0
         self.last_min_table_clearance_m = None
         self.last_triggers = []
+        self._train_geom = None
 
     def release_command_foot(self) -> None:
         """Next decode queries the TCP. Offline windows do this; the live runner does not."""
@@ -1613,7 +1689,9 @@ class MoldAwareRuntime:
     def last_soft_triggers(self) -> list:
         return [t for t in self.last_triggers if t in SOFT_CLAMP_KEYS]
 
-    def fill_obs_raw(self, obs_raw: dict, robot_id: int = 0) -> Dict[str, np.ndarray]:
+    def fill_obs_raw(
+        self, obs_raw: dict, robot_id: int = 0, train_frame: bool = False
+    ) -> Dict[str, np.ndarray]:
         """Write mold_* streams into obs_raw from ts_pose_fb (fixture/tool tip)."""
         self.last_triggers = []
         pose7 = np.asarray(obs_raw[f"ts_pose_fb_{robot_id}"], dtype=np.float64)
@@ -1680,6 +1758,10 @@ class MoldAwareRuntime:
         }
         if times is not None and len(times) == len(pose7):
             out["reason"] = reason
+        if train_frame:
+            from mold_geom_train_frame import apply_train_frame
+
+            apply_train_frame(self, p_meas, R_fb, obs_raw, robot_id)
         return out
 
     def _remember_tail(self, p, R_tool, q) -> None:
@@ -2057,6 +2139,10 @@ class MoldAwareRuntime:
         seed_R = None
         if self._cmd_R is None and frame_seed is not None:
             seed_R = np.asarray(frame_seed, dtype=np.float64).reshape(3, 3)
+        if os.environ.get("UMIFT_FOOT_FACE_HYST", "").strip().lower() in ("1", "true", "yes"):
+            from foot_face_hyst import bind_chunk
+
+            bind_chunk(getattr(self, "_demo_feet", None), getattr(self, "_demo_frames", None))
         dec = integrate_tcp_foot(
             self.field,
             p0,
@@ -2110,7 +2196,13 @@ class MoldAwareRuntime:
                     f"r4 decode needs action dim >= 27, got {raw_action.shape[-1]}"
                 )
             dR = rot6d_rows_to_R(raw_action[:, 21:27])
-            R_d = np.einsum("hij,hjk->hik", R_field, dR)
+            if getattr(self, "tcp_relative_rotation", False):
+                # field_v3r / liftos labels are R_tcp(t).T @ R_tcp(t+k).
+                # Causal-foot replay stays on R_field @ ΔR.
+                R_tcp = np.asarray(R0, dtype=np.float64).reshape(3, 3)
+                R_d = np.einsum("ij,hjk->hik", R_tcp, dR)
+            else:
+                R_d = np.einsum("hij,hjk->hik", R_field, dR)
             # If mesh R_f jumps mid-chunk, hold previous R_d (then rate-clamp).
             if self.limits.enable_mesh_jump_hold and H > 1:
                 from scipy.spatial.transform import Rotation as _Rot
@@ -2269,6 +2361,21 @@ class MoldAwareRuntime:
         else:
             n = np.asarray(decoded["R_field"][..., 2], dtype=np.float64)
         delta_n = np.asarray(decoded["delta_n"], dtype=np.float64).reshape(-1)
+        # Off by default. Rebuilding the pose from the foot throws away the
+        # 25 mm step limit, so a stored-foot snap is scheduled as a teleport.
+        if os.environ.get("UMIFT_SCHEDULE_LIMITED_VT", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            x_d = np.asarray(decoded["x_d"], dtype=np.float64).reshape(-1, 3)
+            if "R_field" in decoded:
+                n = -np.asarray(decoded["R_field"], dtype=np.float64)[..., 2]
+            n = np.asarray(n, dtype=np.float64).reshape(-1, 3)
+            n = n / np.clip(np.linalg.norm(n, axis=-1, keepdims=True), 1e-9, None)
+            target = Rp_to_SE3(r_d, x_d - delta_n[:, None] * n)
+            vt = Rp_to_SE3(r_d, x_d)
+            return target, vt
         target = Rp_to_SE3(r_d, x_s)
         vt = Rp_to_SE3(r_d, x_s + delta_n[:, None] * n)
         return target, vt
