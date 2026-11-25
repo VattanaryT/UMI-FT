@@ -1,0 +1,122 @@
+# UR5e built-in wrist FT for UMI-FT inference/playback (umift_std_v2).
+# Training / policy poses are TCP (+x right, +y down, +z forward).
+#
+# Wall-mount checklist (run before hardware replay):
+#   1. Set UR payload mass + CoG for the mounted tool.
+#   2. Call calibrate_robot_wrench() with the tool unloaded.
+#   3. Install the TCP on the UR controller / RTDE (flange↔TCP lives there only).
+#   4. Keep pose7_offset_TC translation at zero — software must not apply a second TCP offset.
+#
+# Before running: call calibrate_robot_wrench() while the tool is unloaded.
+data_folder: "/home/boeing/umi_ft_ws/UMI-FT/runs"
+mock_hardware: false
+bimanual: false
+use_perturbation_generator: false
+
+# D405 wrist camera (pyrealsense2 color+depth in ManipServerLayupEnv; not V4L).
+# realsense_serial is the pyrealsense2 device serial (rs-enumerate-devices "Serial Number").
+# The V4L by-id path below uses a different ASIC serial in the symlink name.
+# Robot-mounted D405: pyrealsense serial 353322271340 (ASIC 344123071493).
+realsense_serial: "335122272736"
+run_robot_thread: true
+run_wrench_thread: false
+run_rgb_thread: false
+run_eoat_thread: false
+run_key_thread: false
+plot_rgb: false
+
+rgb_buffer_size: 128
+robot_buffer_size: 4800
+eoat_buffer_size: 20
+wrench_buffer_size: 4800
+camera_selection: "GOPRO"
+force_sensing_mode: "FORCE_MODE_UR"
+compliance_control_force_source: "UR"
+low_damping: [2.0, 2.0, 2.0, 0.1, 0.1, 0.1]
+output_rgb_hw: [224, 224]
+wrench_filter_parameters: [5, 0.002, 5] # cutoff frequency, sampling time, order
+check_robot_loop_overrun: false
+keys_to_monitor: [30, 31, 32] # [a, s, d]
+key_event_device: "/dev/input/event17"
+# Identity: UR/RTDE TCP is authoritative (umift_std_v2). Do not reintroduce a software flange↔TCP hop.
+pose7_offset_TC: [0, 0, 0, 1, 0, 0, 0]
+
+ur_rtde0:
+  robot_ip: "192.168.1.2"
+  rtde_frequency: 500.0
+  rt_receive_priority: 90
+  rt_control_priority: 85
+  interface_priority: 80
+  linear_vel: 0.5
+  linear_acc: 0.5
+  servoL_lookahead_time: 0.1
+  servoL_gain: 600
+  robot_interface_config:
+    zone_safety_mode: "SAFETY_MODE_TRUNCATE"
+    incre_safety_mode: "SAFETY_MODE_STOP"
+    operation_mode: "OPERATION_MODE_CARTESIAN"
+    max_incre_m: 0.03
+    max_incre_rad: 0.2
+    max_incre_joint_rad: 0.0628
+    safe_zone: [-0.5, 0.7, -0.9, 0.9, 0.235, 0.8]
+
+# Legacy V4L path (ignored during layup inference when run_rgb_thread: false).
+gopro0:
+  device_name: "/dev/video4"
+  frame_width: 640
+  frame_height: 480
+  crop_rows: [0, 480]
+  crop_cols: [0, 640]
+  fps: 15
+
+wsg_gripper0:
+  robot_ip: "192.168.2.112"
+  port: "1000"
+  velResControl_kp: 15.0
+  velResControl_kf: 15.0
+  PDControl_kp: 10.0
+  PDControl_kd: 0.001
+  accResControl_K: 0.5
+  accResControl_M: 0.02
+  accResControl_D: 0.15
+  js_interface_config:
+    num_joints: 1
+    range_safety_mode: "SAFETY_MODE_TRUNCATE"
+    incre_safety_mode: "SAFETY_MODE_TRUNCATE"
+    max_incre: 110.0 # mm
+    safe_zone: [-1, 110] # mm
+
+admittance_controller0:
+  dt: 0.002
+  log_to_file: false
+  log_file_path: "/tmp/admittance0_controller.log"
+  alert_overrun: false
+  compliance6d:
+    stiffness: [300, 300, 300, 2, 2, 2]
+    # translational damping raised 5 -> 15 (~3x) as a first mitigation for
+    # contact oscillation seen while replaying at low (k_min=200) scheduled
+    # stiffness; not yet re-derived from a validated free-space step response.
+    damping: [15, 15, 15, 0.05, 0.05, 0.05]
+    inertia: [0.2, 0.2, 0.2, 0.001, 0.001, 0.001]
+    stiction: [0, 0, 0, 0, 0, 0]
+  max_spring_force_magnitude: 25
+  max_spring_torque_magnitude: 4
+  direct_force_control_gains:
+    P_trans: 0
+    I_trans: 0
+    D_trans: 0
+    P_rot: 0
+    I_rot: 0
+    D_rot: 0
+  direct_force_control_I_limit: [0, 0, 0, 0, 0, 0]
+
+perturbation_generator0:
+  force_magnitude: 1.0
+  force_stddev: 5
+  torque_magnitude: 1.5
+  torque_stddev: 0.1
+  perturbation_duration_ms: 100
+  interval_duration_ms: 100
+  interval_stddev: 100
+  magnitude_type: "CONSTANT"
+  duration_type: "CONSTANT"
