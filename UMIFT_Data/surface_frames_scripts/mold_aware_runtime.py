@@ -2478,3 +2478,63 @@ def compliance_command(
         np.asarray(raw_steps, dtype=np.float64),
         np.asarray(floored_steps, dtype=np.float64),
     )
+
+
+# Off unless UMIFT_HIST_STIFFNESS=1. The press gain stays the predicted scalar.
+# The two tangential axes drop from 5000 to 3000 N/m, and the stiffness matrix
+# is rebuilt after the pose blend so those axes are not averaged.
+HIST_OFF_AXIS_N_PER_M = 3000.0
+HIST_ROT_NM_PER_RAD = (100.0, 20.0, 20.0)
+
+
+def hist_stiffness_enabled(environ=None) -> bool:
+    source = os.environ if environ is None else environ
+    return str(source.get("UMIFT_HIST_STIFFNESS", "")).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def rebuild_hist_stiffness(
+    nominal_pose7: np.ndarray,
+    virtual_pose7: np.ndarray,
+    compliance_stiffness,
+    scheduled_pose7: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Packed (6, 6*N) stiffness from the blended nominal and virtual targets.
+
+    The soft axis is nominal to virtual, expressed in the commanded target's
+    tool frame. Tangential stiffness is 3000 N/m. Rotation is 100, 20, 20
+    Nm/rad on the tool axes. Averaging the 6x6 matrices is what tilted that
+    axis on the stringer_v4 hist runner.
+    """
+    from PyriteUtility.spatial_math import spatial_utilities as su
+
+    nominal = np.asarray(nominal_pose7, dtype=np.float64).reshape(-1, 7)
+    virtual = np.asarray(virtual_pose7, dtype=np.float64).reshape(-1, 7)
+    k_c = np.asarray(compliance_stiffness, dtype=np.float64).reshape(-1)
+    scheduled = virtual if scheduled_pose7 is None else np.asarray(
+        scheduled_pose7, dtype=np.float64
+    ).reshape(-1, 7)
+    if not (virtual.shape[0] == k_c.shape[0] == scheduled.shape[0] == nominal.shape[0]):
+        raise ValueError(
+            f"length mismatch: nominal {nominal.shape[0]}, virtual {virtual.shape[0]}, "
+            f"stiffness {k_c.shape[0]}, scheduled {scheduled.shape[0]}"
+        )
+    rots = su.pose7_to_SE3(scheduled)[:, :3, :3]
+    n = nominal.shape[0]
+    packed = np.zeros((6, 6 * n), dtype=np.float64)
+    k_rot = np.asarray(HIST_ROT_NM_PER_RAD, dtype=np.float64)
+    for i in range(n):
+        block = np.zeros((6, 6), dtype=np.float64)
+        block[3:, 3:] = np.diag(k_rot)
+        delta = rots[i].T @ (virtual[i, :3] - nominal[i, :3])
+        length = float(np.linalg.norm(delta))
+        axis = delta / length if length >= 1e-3 else np.array([1.0, 0.0, 0.0])
+        block[:3, :3] = HIST_OFF_AXIS_N_PER_M * np.eye(3) + (
+            float(k_c[i]) - HIST_OFF_AXIS_N_PER_M
+        ) * np.outer(axis, axis)
+        packed[:, 6 * i : 6 * i + 6] = block
+    return packed

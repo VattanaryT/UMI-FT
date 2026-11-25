@@ -2173,6 +2173,15 @@ def main():
         print("[stiffness] press-axis floor off")
     else:
         print(f"[stiffness] press-axis floor {stiffness_floor:.0f} N/m")
+    from mold_aware_runtime import hist_stiffness_enabled
+
+    if hist_stiffness_enabled():
+        print(
+            "[stiffness] hist rebuild on: tangential 3000 N/m, "
+            "rot [100, 20, 20] Nm/rad, axis from the blended target"
+        )
+    else:
+        print("[stiffness] hist rebuild off")
     printOrNot(vbs_h2, "Starting main loop.")
     r4_action_ensembler = (
         FixBActionEnsembler(
@@ -2630,6 +2639,7 @@ def main():
             log.attrs["stiffness_floor_enabled"] = stiffness_floor is not None
             if stiffness_floor is not None:
                 log.attrs["stiffness_floor_n_per_m"] = float(stiffness_floor)
+            log.attrs["hist_stiffness"] = bool(hist_stiffness_enabled())
             if gt_replay is not None:
                 log.attrs["mode"] = "gt_replay"
                 log.attrs["gt_replay_episode"] = int(gt_replay.episode)
@@ -3369,8 +3379,9 @@ def main():
             )
             outputs_eoat = action_eoat
             # decode stiffness matrix
-            from mold_aware_runtime import compliance_command
+            from mold_aware_runtime import compliance_command, rebuild_hist_stiffness
 
+            floored_by_id = {}
             for id in id_list:
                 (
                     outputs_ts_nominal_targets[id],
@@ -3390,6 +3401,7 @@ def main():
                     ],
                 )
                 stiffness_trace[id] = (raw_k, floored_k)
+                floored_by_id[id] = floored_k
 
             # the "now" when the observation is taken
             action_start_time_s = obs_raw["robot_time_stamps_0"][-1]
@@ -3484,6 +3496,7 @@ def main():
             pose_ensemblers = r4_pose_ensemblers
             if pose_ensemblers is None and action_ensemblers is not None and not r4vt:
                 pose_ensemblers = action_ensemblers
+            use_hist_stiffness = hist_stiffness_enabled()
             if pose_ensemblers is not None:
                 start_step = horizon_count * exec_h
                 for id in id_list:
@@ -3496,12 +3509,18 @@ def main():
                             f"(loaded ckpt horizon), or retrain with a longer "
                             f"sparse_action_horizon."
                         )
+                    if use_hist_stiffness:
+                        stiff_field = np.asarray(
+                            floored_by_id[id], dtype=np.float64
+                        ).reshape(-1)
+                    else:
+                        stiff_field = _stiffness_6x6n_to_per_step(
+                            outputs_ts_stiffnesses[id]
+                        )
                     fields = {
                         "pose7": outputs_ts_targets[id],
                         "nominal_pose7": outputs_ts_nominal_targets[id],
-                        "stiffness": _stiffness_6x6n_to_per_step(
-                            outputs_ts_stiffnesses[id]
-                        ),
+                        "stiffness": stiff_field,
                         "eoat": (
                             outputs_eoat[id] if outputs_eoat is not None else None
                         ),
@@ -3511,9 +3530,16 @@ def main():
                     )
                     outputs_ts_targets[id] = blended["pose7"]
                     outputs_ts_nominal_targets[id] = blended["nominal_pose7"]
-                    outputs_ts_stiffnesses[id] = _stiffness_per_step_to_6x6n(
-                        blended["stiffness"]
-                    )
+                    if use_hist_stiffness:
+                        outputs_ts_stiffnesses[id] = rebuild_hist_stiffness(
+                            blended["nominal_pose7"],
+                            blended["pose7"],
+                            blended["stiffness"],
+                        )
+                    else:
+                        outputs_ts_stiffnesses[id] = _stiffness_per_step_to_6x6n(
+                            blended["stiffness"]
+                        )
                     if outputs_eoat is not None and "eoat" in blended:
                         outputs_eoat[id] = blended["eoat"]
                 if r4_pose_ensemblers is not None and mold_runtime is not None:
@@ -3597,6 +3623,12 @@ def main():
                     ]
                     if outputs_eoat is not None:
                         outputs_eoat[id] = outputs_eoat[id][:exec_h, :]
+                    if use_hist_stiffness:
+                        outputs_ts_stiffnesses[id] = rebuild_hist_stiffness(
+                            outputs_ts_nominal_targets[id],
+                            outputs_ts_targets[id],
+                            floored_by_id[id][:exec_h],
+                        )
             timestamps = timestamps[:exec_h]
             for id in id_list:
                 raw_k, floored_k = stiffness_trace[id]

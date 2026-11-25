@@ -43,6 +43,10 @@ usage() {
   echo "                       training frame (frames_pca_r020.npz, PCA t1, 30 deg carry)."
   echo "  --newest-chunk       TCP-relative ΔR executes the newest chunk only. The 8 deg slew stays."
   echo "                       Off keeps the action-space blend. Ignored when rotation is not TCP-relative."
+  echo "  --hist-stiffness     Rebuild the 6x6 after the blend. Press gain stays the predicted"
+  echo "                       scalar. Tangential stiffness is 3000 N/m. Rotation is"
+  echo "                       [100, 20, 20] Nm/rad in the commanded tool frame."
+  echo "                       Off keeps 5000 N/m tangential, 100 Nm/rad, and averages the 6x6."
   echo "  --pose-ensemble      Integrate the whole chunk, then average overlapping SE3 targets."
   echo "                       Positions are averaged. Rotations use the quaternion mean. Decay 0.005."
   echo "                       The jump guard then checks the executed steps and the next blended target."
@@ -93,6 +97,7 @@ mold_local=0
 no_train_frame=0
 newest_chunk=0
 pose_ensemble=0
+hist_stiffness=0
 tcp_offset_mm=""
 dn_bias_mm=""
 exec_horizon=""
@@ -183,6 +188,10 @@ while [[ $# -gt 0 ]]; do
       pose_ensemble=1
       shift
       ;;
+    --hist-stiffness)
+      hist_stiffness=1
+      shift
+      ;;
     --tcp-offset-mm)
       [[ $# -ge 2 && "${2:-}" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || die "--tcp-offset-mm needs a number"
       tcp_offset_mm="$2"
@@ -230,6 +239,9 @@ if [[ "$pose_ensemble" -eq 1 && "$newest_chunk" -eq 1 ]]; then
 fi
 if [[ "$pose_ensemble" -eq 1 && "$arm" != "r4vt" ]]; then
   die "--pose-ensemble is only for r4vt"
+fi
+if [[ "$hist_stiffness" -eq 1 && "$arm" != "r4vt" ]]; then
+  die "--hist-stiffness is only for r4vt"
 fi
 
 case "$arm" in
@@ -328,6 +340,11 @@ if [[ "$pose_ensemble" -eq 1 ]]; then
   export UMIFT_POSE_ENSEMBLE=1
 else
   unset UMIFT_POSE_ENSEMBLE
+fi
+if [[ "$hist_stiffness" -eq 1 ]]; then
+  export UMIFT_HIST_STIFFNESS=1
+else
+  unset UMIFT_HIST_STIFFNESS
 fi
 if [[ -n "$tcp_offset_mm" ]]; then
   export UMIFT_TCP_OFFSET_MM="$tcp_offset_mm"
