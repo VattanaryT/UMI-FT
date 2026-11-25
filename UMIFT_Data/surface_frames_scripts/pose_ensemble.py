@@ -24,10 +24,20 @@ def enabled(environ=None) -> bool:
     )
 
 
+def _copy_carry(value):
+    """Copy carry state. The train-frame tracker holds an Open3D scene, which
+    deepcopy cannot pickle. That object is shared; the numpy carry still copies.
+    """
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
 def snapshot_carry(runtime):
     """Copy the runtime state a full-chunk decode would otherwise leave behind."""
     return {
-        name: copy.deepcopy(value)
+        name: _copy_carry(value)
         for name, value in vars(runtime).items()
         if name.startswith("_")
     }
@@ -35,7 +45,7 @@ def snapshot_carry(runtime):
 
 def restore_carry(runtime, snap) -> None:
     for name, value in snap.items():
-        setattr(runtime, name, copy.deepcopy(value))
+        setattr(runtime, name, _copy_carry(value))
 
 
 def pose7_base_to_fixture(pose7, T_fixture_from_base) -> np.ndarray:

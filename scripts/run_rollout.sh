@@ -421,6 +421,10 @@ if [[ -n "$slow_down" ]]; then
 else
   export UMIFT_SLOW_DOWN_FACTOR="${UMIFT_SLOW_DOWN_FACTOR:-2}"
 fi
+if [[ "$arm" == "r4vt" ]]; then
+  bash "$UMIFT_ROOT/scripts/preflight_r4vt.sh" \
+    || die "r4vt preflight failed"
+fi
 if [[ -n "$run_name" && -z "$out_dir" ]]; then
   [[ -n "${UMIFT_RESULTS_ROOT:-}" ]] || die "--name needs UMIFT_RESULTS_ROOT"
   out_dir="${UMIFT_RESULTS_ROOT}/rollouts/$(TZ=America/Los_Angeles date +%F)_${run_name}"
